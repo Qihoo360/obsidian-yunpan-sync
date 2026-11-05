@@ -14,6 +14,10 @@
 
 Desktop、Android 和 iOS 真实设备验收均已通过，记录见本文末尾。移动端自动和低频自动同步仅在 Obsidian 前台运行。首次同步耗时取决于文件数量和网络情况。
 
+## 1.0.1 — 社区目录兼容性修复 / Community directory compatibility fix
+
+将社区目录描述调整为不包含 `Obsidian` 品牌词，并保留与 `1.0.0` 相同的插件功能和 Release 附件格式。
+
 ## 构建与发布 / Build and publish
 
 使用 Node.js 22，在仓库根目录执行：

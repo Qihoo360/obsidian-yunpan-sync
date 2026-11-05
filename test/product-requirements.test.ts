@@ -44,7 +44,7 @@ describe("product requirement helpers", () => {
     expect(source).toContain("360AI 云盘");
     expect(source).not.toMatch(/360\s*云盘/);
     expect(metadata.author).toBe("360AI 云盘");
-    expect(metadata.description).toBe("Sync an Obsidian vault with 360AI Cloud Disk in both directions.");
+    expect(metadata.description).toBe("Sync a vault with 360AI Cloud Disk in both directions.");
     expect(metadata.description).toContain("360AI Cloud Disk");
     expect(manifest).not.toContain("360 Cloud");
   });
