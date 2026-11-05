@@ -53,7 +53,7 @@ describe("product requirement helpers", () => {
     const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
     const engineSource = readFileSync(new URL("../src/sync/engine.ts", import.meta.url), "utf8");
 
-    expect(source).toContain('createEl("h3", { text: "同步遇到问题？" });');
+    expect(source).toContain('new Setting(containerEl).setName("同步遇到问题？").setHeading();');
     expect(source).toContain('setName("一键自动修复")');
     expect(source).toContain('重新检查云端目录和同步记录');
     expect(source).toContain('setButtonText("自动修复")');
@@ -67,7 +67,7 @@ describe("product requirement helpers", () => {
     const modalSource = readFileSync(new URL("../src/ui/filter-rules-modal.ts", import.meta.url), "utf8");
 
     for (const label of ["账号设置", "同步设置", "过滤规则", "同步遇到问题？", "产品与支持"]) {
-      expect(source).toContain(`text: "${label}"`);
+      expect(source).toContain(`setName("${label}").setHeading()`);
     }
     expect(source).toContain('setName("请登录 360AI 云盘账号")');
     expect(source).toContain('setName("同步状态")');

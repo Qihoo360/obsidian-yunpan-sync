@@ -725,10 +725,10 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("插件版本")
       .setDesc(`${this.owner.manifest.version} · ${PLUGIN_BUILD_ID}`);
 
-    containerEl.createEl("h3", { text: "账号设置" });
+    new Setting(containerEl).setName("账号设置").setHeading();
     this.renderAccount();
 
-    containerEl.createEl("h3", { text: "同步设置" });
+    new Setting(containerEl).setName("同步设置").setHeading();
     const remote = new Setting(containerEl).setName("远程目录")
       .setDesc("请选择云端已有的文件夹，或在选择器中创建新文件夹");
     remote.settingEl.addClass("yunpan-sync-remote-root-setting");
@@ -768,7 +768,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       this.renderStatus();
     } else this.statusEl = undefined;
 
-    containerEl.createEl("h3", { text: "过滤规则" });
+    new Setting(containerEl).setName("过滤规则").setHeading();
     new Setting(containerEl).setName("同步 obsidian 配置")
       .setDesc(".obsidian 为笔记仓库的系统配置，默认关闭，开启后迁移笔记时会自动同步笔记软件配置")
       .addToggle((toggle) => toggle.setValue(this.owner.settings.syncObsidianConfig)
@@ -777,7 +777,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       .setDesc("可按文件名、目录或通配符设置不参与同步的内容")
       .addButton((button) => button.setButtonText("编辑规则").onClick(() => this.owner.showFilterRules()));
 
-    containerEl.createEl("h3", { text: "同步遇到问题？" });
+    new Setting(containerEl).setName("同步遇到问题？").setHeading();
     
     new Setting(containerEl).setName("一键自动修复")
       .setDesc("重新检查云端目录和同步记录，用于修复云端文件未显示或同步状态异常。")
@@ -875,7 +875,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
   }
 
   private renderProductLinks(): void {
-    this.containerEl.createEl("h3", { text: "产品与支持" });
+    new Setting(this.containerEl).setName("产品与支持").setHeading();
     new Setting(this.containerEl).setName("360AI 云盘官网")
       .setDesc("任何设备、随时随地，让文件都实时同步")
       .addButton((button) => button.setButtonText("前往体验").setCta()

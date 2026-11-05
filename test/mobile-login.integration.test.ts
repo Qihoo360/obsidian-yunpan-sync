@@ -76,6 +76,7 @@ vi.mock("obsidian", async (importOriginal) => ({
     buttons: ControlStub[] = [];
     constructor() { rows.push(this); }
     setName(name: string) { this.name = name; return this; }
+    setHeading() { return this; }
     setDesc(text: string) { this.descEl.setText(text); return this; }
     addButton(callback: (button: ControlStub) => unknown) {
       const button = new ControlStub(); this.buttons.push(button); callback(button); return this;

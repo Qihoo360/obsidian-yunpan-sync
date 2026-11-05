@@ -18,6 +18,10 @@ Desktop、Android 和 iOS 真实设备验收均已通过，记录见本文末尾
 
 将社区目录描述调整为不包含 `Obsidian` 品牌词，并保留与 `1.0.0` 相同的插件功能和 Release 附件格式。
 
+## 1.0.2 — 设置页标题兼容性修复 / Settings heading compatibility fix
+
+使用 Obsidian `Setting` 组件渲染设置页分组标题，避免社区目录源码检查将直接创建 HTML 标题判定为错误。
+
 ## 构建与发布 / Build and publish
 
 使用 Node.js 22，在仓库根目录执行：
