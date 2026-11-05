@@ -106,6 +106,7 @@
   max-height: min(62vh, 620px);
   margin-top: 18px;
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .yunpan-sync-filter-rule {
@@ -180,8 +181,16 @@
   }
 
   .yunpan-sync-filter-rule .setting-item-control {
-    grid-template-columns: 38px 82px minmax(140px, 1fr) repeat(4, 32px);
+    grid-template-columns: 38px 82px minmax(220px, 1fr) repeat(4, 34px);
+    overflow: visible;
+  }
+
+  .yunpan-sync-filter-list {
     overflow-x: auto;
+  }
+
+  .yunpan-sync-filter-rule {
+    min-width: 620px;
   }
 }
 

@@ -82,6 +82,25 @@ describe("product requirement helpers", () => {
     expect(modalSource).toContain('setTooltip("删除")');
   });
 
+  it("keeps mobile filter editing accessible as one horizontally scrolling list", () => {
+    const modalSource = readFileSync(new URL("../src/ui/filter-rules-modal.ts", import.meta.url), "utf8");
+    const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+    const addPosition = modalSource.indexOf('createDiv({ cls: "yunpan-sync-filter-actions" })');
+    const listPosition = modalSource.indexOf('createDiv({ cls: "yunpan-sync-filter-list" })');
+    const mobileStyles = styles.slice(styles.indexOf("@media (max-width: 680px)"));
+    const mobileListRule = mobileStyles.match(/\.yunpan-sync-filter-list\s*\{([^}]*)\}/)?.[1] ?? "";
+    const mobileRule = mobileStyles.match(/\.yunpan-sync-filter-rule\s*\{([^}]*)\}/)?.[1] ?? "";
+    const mobileControlRule = mobileStyles.match(/\.yunpan-sync-filter-rule \.setting-item-control\s*\{([^}]*)\}/)?.[1] ?? "";
+
+    expect(addPosition).toBeGreaterThanOrEqual(0);
+    expect(addPosition).toBeLessThan(listPosition);
+    expect(modalSource).toContain("this.rules.unshift({ id: crypto.randomUUID()");
+    expect(mobileListRule).toContain("overflow-x: auto");
+    expect(mobileRule).toContain("min-width: 620px");
+    expect(mobileControlRule).toContain("overflow: visible");
+    expect(mobileControlRule).not.toContain("overflow-x: auto");
+  });
+
   it("keeps the remote directory guidance fully visible", () => {
     const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
     const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
