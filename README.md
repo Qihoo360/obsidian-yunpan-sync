@@ -83,7 +83,7 @@
 ### 使用前须知
 
 - Desktop、Android 和 iOS 均支持手动、自动和低频自动同步，默认使用手动模式。移动端自动同步和低频自动仅在 Obsidian 前台运行，离开前台或锁屏后会暂停并保存任务；回到 Obsidian 后会继续按所选模式工作。
-- 移动端 OAuth 登录仍需在真实设备上验证，暂不承诺已支持。
+- 移动端 OAuth 登录已通过真实设备验证，详见 [验证记录](RELEASE.md#真实设备验证记录)。
 - Android 和 iOS 登录通过 MCP 选择移动授权页，未登录云盘时先登录，再确认授权并返回 Obsidian；桌面端沿用原授权页。
 - 首次同步需要扫描本地与云端；文件较多时会比后续增量同步耗时更长。
 - 删除会双向传播。删除前请确认其他设备上的修改已经完成同步。
@@ -164,7 +164,7 @@ When both local and remote content have changed since the same baseline, the plu
 ### Before You Sync
 
 - Desktop, Android, and iOS support manual, automatic, and scheduled synchronization, with manual mode as the default. On mobile, automatic and scheduled synchronization run only while Obsidian is in the foreground; backgrounding or locking the device pauses and saves the queue, then resumes the selected mode when Obsidian returns to the foreground.
-- Mobile OAuth login remains subject to real-device validation and is not yet promised as supported.
+- Mobile OAuth login has passed real-device validation; see the [verification record](RELEASE.md#真实设备验证记录).
 - Android and iOS request the mobile authorization page through MCP. Sign in to Yunpan, approve access, then return to Obsidian. Desktop keeps its existing authorization page.
 - The initial run scans both local and cloud content and may take longer than later incremental runs for a large vault.
 - Deletions propagate in both directions. Make sure changes from other devices have synchronized before deleting important content.
