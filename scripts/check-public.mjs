@@ -19,6 +19,12 @@ function walk(directory, prefix = "") {
 walk(".");
 const read = (file) => JSON.parse(readFileSync(file, "utf8"));
 const manifest = read("manifest.json"), pkg = read("package.json"), lock = read("package-lock.json");
+const requiredManifestFields = ["id", "name", "version", "minAppVersion", "description", "author", "isDesktopOnly"];
+if (requiredManifestFields.some((field) => !(field in manifest))) throw new Error("Manifest is missing a required field");
+if (typeof manifest.isDesktopOnly !== "boolean") throw new Error("Manifest isDesktopOnly must be a boolean");
+if (typeof manifest.description !== "string" || manifest.description.length > 250 || !manifest.description.endsWith(".")) {
+  throw new Error("Manifest description must be at most 250 characters and end with a period");
+}
 if (!/^\d+\.\d+\.\d+$/.test(manifest.version) || [pkg.version, lock.version, lock.packages[""].version].some((v) => v !== manifest.version)) throw new Error("Version files disagree");
 if (read("versions.json")[manifest.version] !== manifest.minAppVersion) throw new Error("Missing compatibility version");
 if (pkg.license !== "MIT" || !readFileSync("LICENSE", "utf8").includes("360AI 云盘")) throw new Error("Missing license metadata");

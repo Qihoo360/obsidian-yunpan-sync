@@ -3,6 +3,7 @@
   "name": "360AI Cloud Sync",
   "version": "1.0.0",
   "minAppVersion": "1.14.4",
-  "description": "在 Obsidian 与 360AI 云盘之间进行双向同步。 / Two-way synchronization between an Obsidian vault and 360AI Cloud Disk.",
-  "author": "360AI 云盘"
+  "description": "Sync an Obsidian vault with 360AI Cloud Disk in both directions.",
+  "author": "360AI 云盘",
+  "isDesktopOnly": false
 }

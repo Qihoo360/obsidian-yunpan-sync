@@ -34,7 +34,7 @@ describe("community release packaging", () => {
     const main = readProjectFile("src/main.ts");
     const store = readProjectFile("src/transfer/store-client.ts");
 
-    expect(manifest.isDesktopOnly).toBeUndefined();
+    expect(manifest.isDesktopOnly).toBe(false);
     expect(build).toContain('platform: "browser"');
     expect(build).toContain('define: { process: "undefined" }');
     expect(main).not.toContain('from "./auth/oauth-desktop.js"');
