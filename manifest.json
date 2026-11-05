@@ -1,0 +1,8 @@
+{
+  "id": "yunpan-sync",
+  "name": "360AI Cloud Sync",
+  "version": "0.1.8",
+  "minAppVersion": "1.14.4",
+  "description": "在 Obsidian 与 360AI 云盘之间进行双向同步。 / Two-way synchronization between an Obsidian vault and 360AI Cloud Disk.",
+  "author": "360AI 云盘"
+}

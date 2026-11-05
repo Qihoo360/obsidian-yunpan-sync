@@ -1,0 +1,26 @@
+name: Verify public plugin
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run verify
+      - run: npm run check:release
+        if: startsWith(github.ref, 'refs/tags/')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yunpan-sync
+          path: |
+            main.js
+            manifest.json
+            styles.css
+            LICENSE
+            THIRD_PARTY_NOTICES.md
