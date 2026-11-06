@@ -12,6 +12,7 @@ import {
   type ButtonComponent,
 } from "obsidian";
 import { exchangeOAuthCode } from "./auth/oauth.js";
+import { loginCancelledError } from "./auth/cancellation.js";
 import { AuthRefreshCoordinator, OAuthCodeUnavailableError, ReloginRequiredError } from "./auth/refresh.js";
 import { SecretStore, type CloudAuth } from "./auth/secrets.js";
 import {
@@ -75,8 +76,10 @@ export default class YunpanSyncPlugin extends Plugin {
   private expiredAuthQid?: string;
   private readonly lifecycle = new PluginLifecycleTimers();
   private mobileLoginWaiter?: { resolve: (auth: CloudAuth) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
-  private mobileCallbackBusy = false;
+  private mobileCallbackState?: string;
   private mobileAuthorizationUrl?: string;
+  private loginAttempt?: AbortController;
+  private loginGeneration = 0;
 
   async onload(): Promise<void> {
     const persisted = await this.loadData() as Partial<PluginSettings> | null;
@@ -142,6 +145,7 @@ export default class YunpanSyncPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    this.endLoginAttempt();
     this.lifecycle.dispose();
     if (this.isMobileDevice) await settleForPause(true, this.engine);
     await this.persistence?.close();
@@ -182,29 +186,61 @@ export default class YunpanSyncPlugin extends Plugin {
     }
   }
 
-  async login(): Promise<void> {
-    if (this.status.phase === "login") return;
+  private endLoginAttempt(): void {
+    const attempt = this.loginAttempt;
+    this.loginAttempt = undefined;
+    this.loginGeneration++;
     this.mobileAuthorizationUrl = undefined;
-    const startedAt = Date.now();
-    
+    this.mobileCallbackState = undefined;
+    this.secrets.clearPendingOAuth();
+    if (this.mobileLoginWaiter) {
+      clearTimeout(this.mobileLoginWaiter.timer);
+      this.mobileLoginWaiter.reject(loginCancelledError());
+      this.mobileLoginWaiter = undefined;
+    }
+    attempt?.abort();
+  }
+
+  cancelLogin(): void {
+    if (!this.loginAttempt && this.status.phase !== "login") return;
+    this.endLoginAttempt();
+    this.updateStatus({ phase: "idle", message: "登录已取消", queued: 0, failed: 0 });
+    this.settingTab?.renderLogin();
+  }
+
+  async relogin(): Promise<void> {
+    this.endLoginAttempt();
+    await this.login();
+  }
+
+  async login(): Promise<void> {
+    if (this.loginAttempt) return;
+    // Also invalidate a restored mobile callback that may still be exchanging tokens.
+    this.endLoginAttempt();
+    const attempt = new AbortController();
+    this.loginAttempt = attempt;
+    const generation = this.loginGeneration;
+    const current = () => this.loginAttempt === attempt && !attempt.signal.aborted;
     try {
       const previousQid = this.auth?.qid ?? this.expiredAuthQid;
       this.updateStatus({ phase: "login", message: "等待浏览器授权", queued: 0, failed: 0 });
       let auth: CloudAuth;
       if (this.isMobileDevice) {
         const { MobileOAuth } = await import("./auth/oauth-mobile.js");
+        if (!current()) return;
         const oauth = new MobileOAuth(this.settings.environment, this.settings.openapiBaseUrl, (message) => {
-          
-          this.updateStatus({ phase: "login", message, queued: 0, failed: 0 });
-        });
+          if (current()) this.updateStatus({ phase: "login", message, queued: 0, failed: 0 });
+        }, attempt.signal);
         let authorizationUrl = "";
         const pending = await oauth.start((url) => { authorizationUrl = url; });
+        if (!current()) return;
         this.secrets.setPendingOAuth(pending);
         this.mobileAuthorizationUrl = authorizationUrl;
         // Install the callback waiter before handing control to the browser.
         const authorization = new Promise<CloudAuth>((resolve, reject) => {
           const timer = setTimeout(() => {
-            if (this.mobileLoginWaiter?.timer === timer) this.mobileLoginWaiter = undefined;
+            if (!current() || this.mobileLoginWaiter?.timer !== timer) return;
+            this.mobileLoginWaiter = undefined;
             this.secrets.clearPendingOAuth();
             reject(new Error("等待云盘 OAuth 授权超时"));
           }, 180_000);
@@ -224,43 +260,44 @@ export default class YunpanSyncPlugin extends Plugin {
         auth = await authorization;
       } else {
         const { DesktopOAuth } = await import("./auth/oauth-desktop.js");
+        if (!current()) return;
         const oauth = new DesktopOAuth(this.settings.environment, this.settings.openapiBaseUrl);
-        auth = await oauth.login((url) => window.open(url, "_blank"));
+        auth = await oauth.login((url) => window.open(url, "_blank"), 180_000, attempt.signal);
       }
+      if (!current()) return;
       if (previousQid && previousQid !== auth.qid) this.persistence?.database.resetSyncState();
       this.secrets.setAuth(auth);
       
       this.expiredAuthQid = undefined;
       await this.configureEngine();
+      if (!current()) return;
       this.updateStatus({ phase: "idle", message: "已登录", queued: 0, failed: 0 });
       this.settingTab?.display();
       new Notice("360AI 云盘登录成功");
       await this.refreshAccountProfile(false);
     } catch (error) {
-      
+      if (!current()) return;
       this.updateStatus({ phase: "error", message: messageOf(error), queued: 0, failed: 0, lastError: messageOf(error) });
       new Notice(`登录失败: ${messageOf(error)}`);
     } finally {
-      this.mobileAuthorizationUrl = undefined;
-      this.settingTab?.renderLogin();
-      try { await this.persistence?.save(); }
-      catch { new Notice("登录状态保存失败，请重试"); }
+      if (current()) {
+        this.loginAttempt = undefined;
+        this.mobileAuthorizationUrl = undefined;
+        this.secrets.clearPendingOAuth();
+        this.settingTab?.renderLogin();
+        try { await this.persistence?.save(); }
+        catch { if (this.loginGeneration === generation) new Notice("登录状态保存失败，请重试"); }
+      }
     }
   }
 
   async logout(): Promise<void> {
-    this.mobileAuthorizationUrl = undefined;
+    this.endLoginAttempt();
     if (this.engine?.isRunning()) {
       this.engine.cancel();
       await this.engine.waitForIdle();
     }
     this.unconfirmCurrentBinding();
-    this.secrets.clearPendingOAuth();
-    if (this.mobileLoginWaiter) {
-      clearTimeout(this.mobileLoginWaiter.timer);
-      this.mobileLoginWaiter.reject(new Error("登录已取消"));
-      this.mobileLoginWaiter = undefined;
-    }
     this.secrets.clearAuth();
     this.expiredAuthQid = undefined;
     this.accountProfile = undefined;
@@ -275,41 +312,49 @@ export default class YunpanSyncPlugin extends Plugin {
   }
 
   private async handleMobileOAuthCallback(params: Record<string, string>): Promise<void> {
-    if (this.mobileCallbackBusy) return;
     const pending = this.secrets.getPendingOAuth();
-    if (!pending) return;
-    this.mobileCallbackBusy = true;
+    // Ignore old browser pages before consuming the current authorization state.
+    if (!pending || params.state !== pending.state || this.mobileCallbackState === pending.state) return;
+    const generation = this.loginGeneration;
+    const attempt = this.loginAttempt;
+    const waiter = this.mobileLoginWaiter;
+    const current = () => this.loginGeneration === generation && !attempt?.signal.aborted;
+    this.mobileCallbackState = pending.state;
     this.mobileAuthorizationUrl = undefined;
     this.settingTab?.renderLogin();
     this.secrets.clearPendingOAuth();
     try {
       const { MobileOAuth } = await import("./auth/oauth-mobile.js");
-      const oauth = new MobileOAuth(this.settings.environment, this.settings.openapiBaseUrl);
+      if (!current()) return;
+      const oauth = new MobileOAuth(this.settings.environment, this.settings.openapiBaseUrl, undefined, attempt?.signal);
       const auth = await oauth.complete(params, pending);
-      if (this.mobileLoginWaiter) {
-        clearTimeout(this.mobileLoginWaiter.timer);
-        const waiter = this.mobileLoginWaiter;
+      if (!current()) return;
+      if (waiter) {
+        if (this.mobileLoginWaiter !== waiter) return;
+        clearTimeout(waiter.timer);
         this.mobileLoginWaiter = undefined;
         waiter.resolve(auth);
       } else {
         this.secrets.setAuth(auth);
         await this.configureEngine();
+        if (!current()) return;
         new Notice("360AI 云盘登录成功");
         this.settingTab?.display();
         await this.refreshAccountProfile(false);
       }
     } catch (error) {
+      if (!current()) return;
       const failure = error instanceof Error ? error : new Error(String(error));
-      if (this.mobileLoginWaiter) {
-        clearTimeout(this.mobileLoginWaiter.timer);
-        const waiter = this.mobileLoginWaiter;
+      if (waiter) {
+        if (this.mobileLoginWaiter !== waiter) return;
+        clearTimeout(waiter.timer);
         this.mobileLoginWaiter = undefined;
         waiter.reject(failure);
       } else {
         new Notice(`登录失败: ${failure.message}`);
       }
     } finally {
-      this.mobileCallbackBusy = false;
+      if (this.mobileCallbackState === pending.state) this.mobileCallbackState = undefined;
     }
   }
 
@@ -712,12 +757,14 @@ class YunpanSyncSettingTab extends PluginSettingTab {
   private loginStatusEl?: HTMLElement;
   private authorizationEl?: HTMLElement;
   private loginButtons: ButtonComponent[] = [];
+  private cancelLoginButton?: ButtonComponent;
   constructor(app: App, private readonly owner: YunpanSyncPlugin) { super(app, owner); }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
     this.loginButtons = [];
+    this.cancelLoginButton = undefined;
     this.loginStatusEl = undefined;
     this.authorizationEl = undefined;
     containerEl.addClass("yunpan-sync-settings-page");
@@ -738,7 +785,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText("选择").onClick(() => void this.owner.chooseRemoteRoot()));
     else remote.addButton((button) => {
       this.loginButtons.push(button);
-      button.setButtonText("登录").setCta().onClick(() => void this.owner.login());
+      button.setButtonText("登录").setCta().onClick(() => void this.startLogin());
     });
 
     new Setting(containerEl).setName("同步模式")
@@ -795,8 +842,9 @@ class YunpanSyncSettingTab extends PluginSettingTab {
   renderLogin(): void {
     const status = this.owner.currentStatus;
     const pending = status.phase === "login";
-    for (const button of this.loginButtons) button.setDisabled(pending).setButtonText(pending ? "登录中…" : "登录");
-    this.loginStatusEl?.setText(pending || status.phase === "error" ? status.message : "");
+    for (const button of this.loginButtons) button.setDisabled(false).setButtonText(pending ? "重新登录" : "登录");
+    if (this.cancelLoginButton) this.cancelLoginButton.buttonEl.hidden = !pending;
+    this.loginStatusEl?.setText(pending || status.phase === "error" || status.message === "登录已取消" ? status.message : "");
     if (this.authorizationEl) this.authorizationEl.hidden = !this.owner.pendingAuthorizationUrl;
   }
 
@@ -820,8 +868,14 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       const account = new Setting(this.containerEl).setName("请登录 360AI 云盘账号")
         .addButton((button) => {
           this.loginButtons.push(button);
-          button.setButtonText("登录").setCta().onClick(() => void this.owner.login());
+          button.setButtonText("登录").setCta().onClick(() => void this.startLogin());
+        })
+        .addButton((button) => {
+          this.cancelLoginButton = button;
+          button.setButtonText("取消登录").onClick(() => this.owner.cancelLogin());
+          button.buttonEl.addClass("yunpan-sync-cancel-login");
         });
+      account.settingEl.addClass("yunpan-sync-login-setting");
       this.loginStatusEl = account.descEl;
       const url = this.owner.pendingAuthorizationUrl;
       if (url) {
@@ -872,6 +926,10 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText("退出登录").onClick(() => void this.owner.logout()));
     account.nameEl.empty();
     account.nameEl.append(identityEl);
+  }
+
+  private startLogin(): Promise<void> {
+    return this.owner.currentStatus.phase === "login" ? this.owner.relogin() : this.owner.login();
   }
 
   private renderProductLinks(): void {

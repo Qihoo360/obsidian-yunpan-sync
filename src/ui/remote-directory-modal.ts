@@ -62,6 +62,23 @@ export class RemoteDirectoryModal extends Modal {
     });
     breadcrumb.createDiv({ text: this.currentPath, cls: "yunpan-sync-directory-path" });
 
+    let folderName = "";
+    new Setting(contentEl).setName("新建文件夹").addText((text) => text
+      .setPlaceholder("文件夹名称").onChange((value) => { folderName = value; }))
+      .addButton((button) => button.setButtonText("新建").onClick(async () => {
+        if (!folderName.trim() || /[\\/]/.test(folderName) || folderName === "." || folderName === "..") {
+          new Notice("请输入有效的文件夹名称"); return;
+        }
+        try {
+          validateWindowsPathSegment(folderName);
+          await this.api.call("File.mkdir", { fname: `${this.currentPath}${folderName}/` });
+          this.currentPath = normalizeRemoteRoot(`${this.currentPath}${folderName}`);
+          await this.load();
+        } catch (error) {
+          new Notice(`新建云端文件夹失败: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }));
+
     const listHeader = contentEl.createDiv({ cls: "yunpan-sync-directory-list-header" });
     listHeader.createSpan({ text: this.loading ? "正在读取文件夹" : `${this.directories.length} 个文件夹` });
     const list = contentEl.createDiv({
@@ -88,23 +105,6 @@ export class RemoteDirectoryModal extends Modal {
         }
       });
     }
-
-    let folderName = "";
-    new Setting(contentEl).setName("新建文件夹").addText((text) => text
-      .setPlaceholder("文件夹名称").onChange((value) => { folderName = value; }))
-      .addButton((button) => button.setButtonText("新建").onClick(async () => {
-        if (!folderName.trim() || /[\\/]/.test(folderName) || folderName === "." || folderName === "..") {
-          new Notice("请输入有效的文件夹名称"); return;
-        }
-        try {
-          validateWindowsPathSegment(folderName);
-          await this.api.call("File.mkdir", { fname: `${this.currentPath}${folderName}/` });
-          this.currentPath = normalizeRemoteRoot(`${this.currentPath}${folderName}`);
-          await this.load();
-        } catch (error) {
-          new Notice(`新建云端文件夹失败: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }));
 
     const footer = contentEl.createDiv({ cls: "yunpan-sync-modal-footer" });
     footer.createEl("button", { text: "取消" }).addEventListener("click", () => this.finish(undefined));

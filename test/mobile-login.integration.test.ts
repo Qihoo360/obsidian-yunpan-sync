@@ -24,6 +24,7 @@ class ElementStub {
 }
 
 class ControlStub {
+  buttonEl = new ElementStub();
   label = "";
   disabled = false;
   click?: () => unknown;
@@ -45,6 +46,7 @@ const harness = vi.hoisted(() => ({
   write: vi.fn(async (_path: string, _contents: string) => {}),
   open: vi.fn(),
   copy: vi.fn(async (_text: string) => {}),
+  desktopLogin: vi.fn(),
   secrets: new Map<string, string>(),
   protocolHandler: undefined as ((params: Record<string, string>) => void) | undefined,
 }));
@@ -124,6 +126,10 @@ vi.mock("../src/storage/persistence.js", () => ({
   },
 }));
 
+vi.mock("../src/auth/oauth-desktop.js", () => ({
+  DesktopOAuth: class { login = harness.desktopLogin; },
+}));
+
 import YunpanSyncPlugin from "../src/main.js";
 
 async function loadPlugin() {
@@ -141,6 +147,8 @@ describe("mobile login settings", () => {
     harness.secrets.clear(); harness.open.mockReset();
     harness.platform.isIosApp = true;
     harness.platform.isAndroidApp = false;
+    harness.platform.isMobileApp = true;
+    harness.desktopLogin.mockReset();
     vi.stubGlobal("window", { open: harness.open });
     vi.stubGlobal("document", {});
     vi.stubGlobal("navigator", { clipboard: { writeText: harness.copy } });
@@ -162,18 +170,133 @@ describe("mobile login settings", () => {
     const account = rows.find((row) => row.name === "请登录 360AI 云盘账号")!;
     const remote = rows.find((row) => row.name === "远程目录")!;
     expect(account.descEl.textContent).toContain("正在读取授权配置");
-    expect(account.buttons[0]!.disabled).toBe(true);
-    expect(remote.buttons[0]!.disabled).toBe(true);
+    expect(account.buttons[0]!.disabled).toBe(false);
+    expect(account.buttons[0]!.label).toBe("重新登录");
+    expect(account.buttons[1]!.buttonEl.hidden).toBe(false);
+    expect(remote.buttons[0]!.disabled).toBe(false);
     await vi.advanceTimersByTimeAsync(15_001);
     await operation;
     expect(account.descEl.textContent).toContain("读取授权配置超时");
     expect(account.buttons[0]!.disabled).toBe(false);
     expect(remote.buttons[0]!.disabled).toBe(false);
+    expect(account.buttons[1]!.buttonEl.hidden).toBe(true);
     expect(harness.save.mock.calls.length).toBeGreaterThan(1);
     harness.request.mockResolvedValueOnce({ status: 503, json: {} });
     await plugin.login();
     expect(harness.request).toHaveBeenCalledTimes(2);
     expect(account.descEl.textContent).toContain("读取授权配置失败（HTTP 503）");
+  });
+
+  it("cancels immediately during configuration loading and ignores its late response", async () => {
+    vi.useFakeTimers();
+    const plugin = await loadPlugin();
+    const existingAuth = JSON.stringify({ accessToken: "existing", qid: "42", token: "token", expiresAt: Date.now() + 60_000 });
+    harness.secrets.set("yunpan-sync-auth", existingAuth);
+    let resolve!: (value: unknown) => void;
+    harness.request.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const operation = plugin.login();
+    await vi.dynamicImportSettled();
+    const account = rows.find(row => row.name === "请登录 360AI 云盘账号")!;
+    await account.buttons[1]!.click!();
+    await operation;
+    expect(plugin.currentStatus).toMatchObject({ phase: "idle", message: "登录已取消" });
+    expect(account.buttons[0]!.label).toBe("登录");
+    expect(account.buttons[1]!.buttonEl.hidden).toBe(true);
+    expect(harness.secrets.get("yunpan-sync-auth")).toBe(existingAuth);
+    expect(vi.getTimerCount()).toBe(0);
+    resolve({ status: 200, json: {} });
+    await vi.dynamicImportSettled();
+    expect(harness.request).toHaveBeenCalledOnce();
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.notice).not.toHaveBeenCalledWith(expect.stringContaining("登录失败"));
+  });
+
+  it("keeps only the latest attempt when restart is clicked repeatedly", async () => {
+    const plugin = await loadPlugin();
+    harness.request.mockImplementation(() => new Promise(() => {}));
+    const attempts = [plugin.login(), plugin.relogin(), plugin.relogin()];
+    await vi.dynamicImportSettled();
+    expect(harness.request).toHaveBeenCalledOnce();
+    plugin.cancelLogin();
+    await Promise.all(attempts);
+    expect(plugin.currentStatus.message).toBe("登录已取消");
+  });
+
+  it("restarts with fresh state and ignores an old callback without consuming the new state", async () => {
+    const plugin = await loadPlugin();
+    harness.request.mockResolvedValue({ status: 200, json: { client_id: "mobile-client" } });
+    const first = plugin.login();
+    await vi.waitFor(() => expect(harness.open).toHaveBeenCalledTimes(1));
+    const oldPending = JSON.parse(harness.secrets.get("yunpan-sync-mobile-oauth-pending")!);
+    const account = rows.filter(row => row.name === "请登录 360AI 云盘账号").at(-1)!;
+    const second = account.buttons[0]!.click!();
+    await vi.waitFor(() => expect(harness.open).toHaveBeenCalledTimes(2));
+    await first;
+    const pending = harness.secrets.get("yunpan-sync-mobile-oauth-pending")!;
+    expect(JSON.parse(pending).state).not.toBe(oldPending.state);
+    harness.protocolHandler!({ code: "old-code", state: oldPending.state });
+    await vi.dynamicImportSettled();
+    expect(harness.secrets.get("yunpan-sync-mobile-oauth-pending")).toBe(pending);
+    expect(plugin.pendingAuthorizationUrl).toBe(harness.open.mock.calls[1]![0]);
+    expect(harness.request).toHaveBeenCalledTimes(4);
+    plugin.cancelLogin();
+    await second;
+    harness.protocolHandler!({ code: "late-code", state: JSON.parse(pending).state });
+    await vi.dynamicImportSettled();
+    expect(harness.request).toHaveBeenCalledTimes(4);
+    expect(plugin.auth).toBeUndefined();
+  });
+
+  it("does not let a cancelled token exchange resolve a new mobile login", async () => {
+    const plugin = await loadPlugin();
+    harness.request.mockResolvedValue({ status: 200, json: { client_id: "mobile-client" } });
+    const first = plugin.login();
+    await vi.waitFor(() => expect(harness.open).toHaveBeenCalledTimes(1));
+    const pending = JSON.parse(harness.secrets.get("yunpan-sync-mobile-oauth-pending")!);
+    let resolve!: (value: unknown) => void;
+    harness.request.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    harness.protocolHandler!({ code: "old-code", state: pending.state });
+    await vi.waitFor(() => expect(harness.request).toHaveBeenCalledTimes(3));
+    const second = plugin.relogin();
+    await first;
+    await vi.waitFor(() => expect(harness.open).toHaveBeenCalledTimes(2));
+    const newPending = harness.secrets.get("yunpan-sync-mobile-oauth-pending");
+    resolve({ status: 200, json: { oauth_code: "cancelled-oauth-code" } });
+    await vi.dynamicImportSettled();
+    expect(harness.request).toHaveBeenCalledTimes(5);
+    expect(plugin.currentStatus.phase).toBe("login");
+    expect(plugin.auth).toBeUndefined();
+    expect(harness.secrets.get("yunpan-sync-mobile-oauth-pending")).toBe(newPending);
+    // The cancelled callback must not block callbacks for the replacement attempt.
+    harness.request.mockResolvedValueOnce({ status: 403, json: {} });
+    harness.protocolHandler!({ code: "new-code", state: JSON.parse(newPending!).state });
+    await second;
+    expect(plugin.currentStatus).toMatchObject({ phase: "error", message: expect.stringContaining("HTTP 403") });
+  });
+
+  it("supports restart and cancel from desktop settings", async () => {
+    harness.platform.isMobileApp = false;
+    const signals: AbortSignal[] = [];
+    harness.desktopLogin.mockImplementation((_open, _timeout, signal: AbortSignal) => {
+      signals.push(signal);
+      return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("登录已取消"))));
+    });
+    const plugin = await loadPlugin();
+    const first = plugin.login();
+    await vi.dynamicImportSettled();
+    const account = rows.find(row => row.name === "请登录 360AI 云盘账号")!;
+    expect(account.buttons[0]!.label).toBe("重新登录");
+    const second = account.buttons[0]!.click!();
+    await vi.dynamicImportSettled();
+    await first;
+    expect(signals).toHaveLength(2);
+    expect(signals[0]!.aborted).toBe(true);
+    expect(signals[1]!.aborted).toBe(false);
+    account.buttons[1]!.click!();
+    await second;
+    expect(signals[1]!.aborted).toBe(true);
+    expect(account.buttons[0]!.label).toBe("登录");
+    expect(plugin.currentStatus.message).toBe("登录已取消");
   });
 
   it.each([["iPhone", "silent"], ["iPhone", "throws"], ["Android", "silent"], ["Android", "throws"]])("provides a mobile authorization link on %s when browser opening %s", async (platform, behavior) => {
@@ -214,6 +337,9 @@ describe("mobile login settings", () => {
     expect(harness.secrets.get("yunpan-sync-mobile-oauth-pending")).toBe("");
     expect(plugin.pendingAuthorizationUrl).toBeUndefined();
     expect(authorization!.settingEl.hidden).toBe(true);
+    harness.request.mockResolvedValueOnce({ status: 503, json: {} });
+    await plugin.login();
+    expect(plugin.currentStatus.message).toContain("HTTP 503");
   });
 
   it("handles an immediate browser callback and removes the fallback link on exchange failure", async () => {

@@ -104,8 +104,10 @@ export function formatBytes(bytes: number | undefined): string {
 
 export function formatStorageCapacity(bytes: number | undefined): string {
   if (bytes === undefined) return "未知";
+  const mebibyte = 1024 ** 2;
   const gibibyte = 1024 ** 3;
   const tebibyte = 1024 ** 4;
+  if (bytes < gibibyte) return `${(bytes / mebibyte).toFixed(2)}MB`;
   const value = bytes >= tebibyte ? bytes / tebibyte : bytes / gibibyte;
   const unit = bytes >= tebibyte ? "TB" : "GB";
   return `${Number(value.toFixed(2))}${unit}`;

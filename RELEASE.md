@@ -22,6 +22,16 @@ Desktop、Android 和 iOS 真实设备验收均已通过，记录见本文末尾
 
 使用 Obsidian `Setting` 组件渲染设置页分组标题，避免社区目录源码检查将直接创建 HTML 标题判定为错误。
 
+## 1.0.3 — 登录重试与移动端界面修复 / Login recovery and mobile layout fixes
+
+- PC 和移动端登录等待期间支持“重新登录”和“取消登录”，无需等待 180 秒超时；取消不清除已有有效凭据。
+- 隔离每次登录尝试，忽略取消后的网络返回与旧授权回调；桌面端取消时关闭本地 OAuth 回调服务。
+- 移动端同步确认表格保留完整四列并支持横向滚动，避免表头被挤到下一行。
+- 云端文件夹选择器将新建区域移到目录列表上方，并支持弹窗纵向滚动。
+- 小于 1 GiB 的存储容量按 MB 显示，保留两位小数。
+
+验证：325 项自动化测试、生产构建、公开内容检查通过。本次改动已提供本地安装包，尚未记录新版 PC、Android 和 iOS 真机验收结果；下方 1.0.0 的真机记录不代表本版已验收。
+
 ## 构建与发布 / Build and publish
 
 使用 Node.js 22，在仓库根目录执行：
@@ -29,17 +39,17 @@ Desktop、Android 和 iOS 真实设备验收均已通过，记录见本文末尾
 ```bash
 npm ci --ignore-scripts
 npm run verify
-npm run check:release -- --tag=1.0.0
+npm run check:release -- --tag=1.0.3
 ```
 
 `npm run verify` 包含公开内容检查、测试和生产构建，成功后会生成 `main.js`。
 
 完成下方发布检查后，将本版本提交推送至仓库默认分支，再打开 [创建 GitHub Release](https://github.com/Qihoo360/obsidian-yunpan-sync/releases/new)：
 
-1. 选择包含本次版本修改的提交，创建标签 `1.0.0`，不要添加 `v` 前缀。
-2. Release 标题填写 `1.0.0`，说明使用上方版本说明，并保留实际验证状态和已知限制。
+1. 选择包含本次版本修改的提交，创建标签 `1.0.3`，不要添加 `v` 前缀。
+2. Release 标题填写 `1.0.3`，说明使用上方版本说明，并保留实际验证状态和已知限制。
 3. 将构建自同一提交的 `main.js`、`manifest.json`、`styles.css` 作为独立附件上传，同时附上 `LICENSE` 和 `THIRD_PARTY_NOTICES.md`。
-4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.0`，附件齐全后发布 Release。
+4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.3`，附件齐全后发布 Release。
 
 Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安装文件，只有源码或自动生成的源码压缩包不能替代上述附件。
 
@@ -49,7 +59,7 @@ Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安�
 2. 在真实 Obsidian Desktop、Android 和 iOS 上分别验收生产账号授权、首次任务确认、双向增删改、冲突、断网恢复和退出登录。模拟测试只验证受控协议；未验证平台不得宣称通过。
 3. 首次使用前备份 Vault。生产迁移会清除旧环境登录态与同步基线，并要求重新登录和确认目录，不删除笔记。
 4. 确认版本更新记录、已知限制和[隐私说明](PRIVACY.md)与本次行为相符，并检查仓库和服务链接可用。
-5. 构建后执行 `npm run check:release -- --tag=1.0.0`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
+5. 构建后执行 `npm run check:release -- --tag=1.0.3`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
 6. GitHub Release 上传 `main.js`、`manifest.json`、`styles.css`，同时提供 [LICENSE](LICENSE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。不上传用户设置、数据库、Token 或构建缓存。
 
 ## 隐私与许可 / Privacy and licensing

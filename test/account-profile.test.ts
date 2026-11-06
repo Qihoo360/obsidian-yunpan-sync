@@ -102,6 +102,9 @@ describe("account profile", () => {
   it("formats account storage with the same compact GB and TB units as the web client", () => {
     expect(formatStorageCapacity(8.62 * 1024 ** 3)).toBe("8.62GB");
     expect(formatStorageCapacity(6 * 1024 ** 4)).toBe("6TB");
+    expect(formatStorageCapacity(0)).toBe("0.00MB");
+    expect(formatStorageCapacity(8.5 * 1024 ** 2)).toBe("8.50MB");
+    expect(formatStorageCapacity(1024 ** 3 - 1)).toMatch(/MB$/);
     expect(formatStorageCapacity(undefined)).toBe("未知");
   });
 

@@ -170,6 +170,30 @@ describe("product requirement helpers", () => {
     expect(rowRule).toContain("border-radius: 0");
   });
 
+  it("keeps the sync task table horizontally scrollable on narrow screens", () => {
+    const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+    const modalSource = readFileSync(new URL("../src/ui/sync-modal.ts", import.meta.url), "utf8");
+    const tableRule = styles.match(/\.yunpan-sync-task-table\s*\{([^}]*)\}/)?.[1] ?? "";
+    const rowRule = styles.match(/\.yunpan-sync-task-row\s*\{([^}]*)\}/)?.[1] ?? "";
+    const headerRule = styles.match(/\.yunpan-sync-task-header span\s*\{([^}]*)\}/)?.[1] ?? "";
+
+    expect(tableRule).toContain("overflow: auto");
+    expect(rowRule).toContain("min-width: 640px");
+    expect(headerRule).toContain("white-space: nowrap");
+    expect(styles).not.toContain(".yunpan-sync-task-remote { grid-column: 3; }");
+    expect(modalSource).toContain('header.createSpan({ text: "远程路径" })');
+  });
+
+  it("places new-folder controls before the remote directory list", () => {
+    const modalSource = readFileSync(new URL("../src/ui/remote-directory-modal.ts", import.meta.url), "utf8");
+    const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+    expect(modalSource.indexOf('new Setting(contentEl).setName("新建文件夹")'))
+      .toBeLessThan(modalSource.indexOf('cls: "yunpan-sync-directory-list"'));
+    const contentRule = styles.match(/\.yunpan-sync-directory-modal \.modal-content\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(contentRule).toContain("overflow-y: auto");
+    expect(contentRule).toContain("100dvh");
+  });
+
   it("categorizes actionable synchronization errors", () => {
     expect(classifySyncError(new Error("ENOSPC: no space left on device"))).toEqual({
       category: "space",

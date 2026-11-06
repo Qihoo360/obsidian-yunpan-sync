@@ -91,6 +91,10 @@
   vertical-align: middle;
 }
 
+.yunpan-sync-login-setting .setting-item-control {
+  flex-wrap: wrap;
+}
+
 .yunpan-sync-welcome {
   margin: 54px 0 12px;
   text-align: center;
@@ -177,6 +181,15 @@
   }
 
   .yunpan-sync-remote-root-setting .setting-item-control input[type="text"] {
+    width: 100%;
+  }
+
+  .yunpan-sync-login-setting .setting-item-control {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .yunpan-sync-login-setting .setting-item-control button {
     width: 100%;
   }
 
@@ -632,13 +645,16 @@
 
 .yunpan-sync-directory-modal {
   width: min(760px, calc(100vw - 32px));
+  max-height: min(760px, calc(100dvh - 48px));
   border-radius: 8px;
 }
 
 .yunpan-sync-directory-modal .modal-content {
   display: flex;
-  min-height: min(560px, calc(100vh - 96px));
+  min-height: min(560px, calc(100dvh - 96px));
+  max-height: calc(100dvh - 48px);
   flex-direction: column;
+  overflow-y: auto;
 }
 
 .yunpan-sync-directory-breadcrumb {
@@ -885,6 +901,7 @@
 .yunpan-sync-task-row {
   display: grid;
   grid-template-columns: 28px 76px minmax(120px, 1fr) minmax(160px, 1.35fr);
+  min-width: 640px;
   align-items: start;
   gap: 10px;
   padding: 10px 12px;
@@ -904,6 +921,10 @@
   font-weight: var(--font-semibold);
 }
 
+.yunpan-sync-task-header span {
+  white-space: nowrap;
+}
+
 .yunpan-sync-task-path,
 .yunpan-sync-task-remote {
   min-width: 0;
@@ -918,8 +939,6 @@
   .yunpan-sync-modal-transfer .yunpan-sync-modal-failure-actions { grid-column: 2 / -1; justify-content: flex-start; }
   .yunpan-sync-modal .modal-content { min-height: 360px; }
   .yunpan-sync-task-modal .modal-content { min-height: 0; }
-  .yunpan-sync-task-row { grid-template-columns: 24px 60px minmax(0, 1fr); }
-  .yunpan-sync-task-remote { grid-column: 3; }
 }
 
 /* Match the reference CTA in both themes, including Obsidian's icon controls. */
@@ -992,4 +1011,21 @@ body :is(
 
 .yunpan-sync-directory-modal .yunpan-sync-directory-row > span {
   color: inherit;
+}
+
+body .yunpan-sync-settings-page button.yunpan-sync-cancel-login {
+  --text-color: var(--text-normal);
+  color: var(--text-normal);
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+
+body .yunpan-sync-settings-page button.yunpan-sync-cancel-login:not(:disabled):not([aria-disabled="true"]):hover,
+body .yunpan-sync-settings-page button.yunpan-sync-cancel-login:not(:disabled):not([aria-disabled="true"]):active,
+body .yunpan-sync-settings-page button.yunpan-sync-cancel-login.mobile-tap:not(:disabled):not([aria-disabled="true"]) {
+  background: var(--background-modifier-hover);
+}
+
+body .yunpan-sync-settings-page button.yunpan-sync-cancel-login[hidden] {
+  display: none;
 }

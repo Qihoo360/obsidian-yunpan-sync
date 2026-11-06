@@ -1,6 +1,7 @@
 import { requestUrl, type RequestUrlParam } from "obsidian";
 import type { CloudAuth } from "./secrets.js";
 import { exchangeOAuthCode } from "./oauth.js";
+import { withLoginCancellation } from "./cancellation.js";
 
 export const MOBILE_REDIRECT_URI = "obsidian://yunpan-sync";
 export const MOBILE_PENDING_MAX_AGE_MS = 10 * 60_000;
@@ -64,7 +65,7 @@ export class MobileOAuth {
   private readonly issuer: string;
 
   constructor(private readonly environment: "production", private readonly openApiUrl: string,
-    private readonly reportProgress?: (message: string) => void) {
+    private readonly reportProgress?: (message: string) => void, private readonly signal?: AbortSignal) {
     this.issuer = mobileIssuer(environment);
   }
 
@@ -84,7 +85,7 @@ export class MobileOAuth {
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error(`${stage}超时，请检查 Obsidian 的网络权限后重试`)), REQUEST_TIMEOUT_MS);
     });
-    try { return await Promise.race([operation(), timeout]); }
+    try { return await withLoginCancellation(() => Promise.race([operation(), timeout]), this.signal); }
     finally { clearTimeout(timer); }
   }
 
@@ -146,16 +147,17 @@ export class MobileOAuth {
     if (!params.state || params.state !== pending.state) throw new Error("OAuth state 校验失败");
     if (params.error) throw new Error("OAuth 授权被取消");
     if (!params.code) throw new Error("OAuth 回调缺少授权码");
-    const response = await requestUrl({
+    const code = params.code;
+    const response = await withLoginCancellation(() => requestUrl({
       url: `${pending.issuer}/oauth/360/mobile-exchange`,
       method: "POST",
       headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
-      body: form({ client_id: pending.clientId, code: params.code, redirect_uri: MOBILE_REDIRECT_URI, code_verifier: pending.verifier }),
+      body: form({ client_id: pending.clientId, code, redirect_uri: MOBILE_REDIRECT_URI, code_verifier: pending.verifier }),
       throw: false,
-    });
+    }), this.signal);
     const exchanged = json(response);
     const oauthCode = typeof exchanged.oauth_code === "string" ? exchanged.oauth_code : "";
     if (!oauthCode) throw new Error("OAuth 授权已失效");
-    return exchangeOAuthCode(this.openApiUrl, oauthCode);
+    return withLoginCancellation(() => exchangeOAuthCode(this.openApiUrl, oauthCode), this.signal);
   }
 }

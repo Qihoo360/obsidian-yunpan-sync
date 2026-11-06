@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { CloudAuth } from "./secrets.js";
 import { exchangeOAuthCode } from "./oauth.js";
+import { loginCancelledError, withLoginCancellation } from "./cancellation.js";
 
 type DesktopHttp = typeof import("node:http");
 
@@ -38,7 +39,8 @@ async function readParams(request: IncomingMessage): Promise<URLSearchParams> {
 export class DesktopOAuth {
   constructor(private readonly environment: "production", private readonly openApiUrl: string) {}
 
-  async login(openBrowser: (url: string) => void, timeoutMs = 180_000): Promise<CloudAuth> {
+  async login(openBrowser: (url: string) => void, timeoutMs = 180_000, signal?: AbortSignal): Promise<CloudAuth> {
+    if (signal?.aborted) throw loginCancelledError();
     const state = randomState();
     const { createServer } = loadNodeHttp();
     const oauthCode = await new Promise<string>((resolve, reject) => {
@@ -49,17 +51,28 @@ export class DesktopOAuth {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener("abort", cancel);
+        server.removeListener("error", onError);
         server.close();
+        if (error) server.closeAllConnections();
         error ? reject(error) : resolve(code!);
       };
+      const cancel = () => finish(loginCancelledError());
+      const onError = (error: Error) => finish(error);
       server = createServer(async (request, response) => {
+        if (settled || signal?.aborted) { response.writeHead(410); response.end(); return; }
         const url = new URL(request.url ?? "/", "http://127.0.0.1");
         if (!((request.method === "POST" && url.pathname === "/authorize/decision") || (request.method === "GET" && url.pathname === "/oauth/callback"))) {
           response.writeHead(404); response.end(); return;
         }
         try {
           const params = await readParams(request);
-          if (params.get("state") !== state) throw new Error("OAuth state 校验失败");
+          if (settled || signal?.aborted) { response.writeHead(410); response.end(); return; }
+          if (params.get("state") !== state) {
+            response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+            response.end("OAuth state 校验失败");
+            return;
+          }
           const code = params.get("oauth_code") ?? params.get("code");
           if (!code) throw new Error(params.get("errmsg") ?? "OAuth 回调缺少 oauth_code");
           callbackPage(response);
@@ -71,18 +84,21 @@ export class DesktopOAuth {
         }
       });
       timer = setTimeout(() => finish(new Error("等待云盘 OAuth 授权超时")), timeoutMs);
-      server.once("error", (error) => finish(error));
+      server.once("error", onError);
+      signal?.addEventListener("abort", cancel, { once: true });
       server.listen(0, "127.0.0.1", () => {
+        if (settled || signal?.aborted) { server.close(); return; }
         const address = server.address();
         if (!address || typeof address === "string") return finish(new Error("无法启动 OAuth 回调服务"));
         const callback = `http://127.0.0.1:${address.port}/authorize/decision`;
         const authorize = new URL("https://yunpan.com/index/oauthCode");
         authorize.searchParams.set("decision_url", callback);
         authorize.searchParams.set("state", state);
-        openBrowser(authorize.toString());
+        try { openBrowser(authorize.toString()); }
+        catch (error) { finish(error instanceof Error ? error : new Error(String(error))); }
       });
     });
-    return exchangeOAuthCode(this.openApiUrl, oauthCode);
+    return withLoginCancellation(() => exchangeOAuthCode(this.openApiUrl, oauthCode), signal);
   }
 
   exchange(oauthCode: string): Promise<CloudAuth> {
