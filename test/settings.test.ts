@@ -10,9 +10,23 @@ describe("plugin settings", () => {
 
   it("allows only the supported scheduled intervals", () => {
     expect(normalizeSettings({ mode: "scheduled", intervalMinutes: 13 })).toMatchObject({ intervalMinutes: 13 });
-    expect(normalizeSettings({ mode: "scheduled", intervalMinutes: 0 })).toMatchObject({ intervalMinutes: 1 });
+    expect(normalizeSettings({ mode: "scheduled", intervalMinutes: 0 })).toMatchObject({ intervalMinutes: 4 });
     expect(normalizeSettings({ mode: "scheduled", intervalMinutes: 5000 })).toMatchObject({ intervalMinutes: 1440 });
-    expect(pollIntervalMs(normalizeSettings({ mode: "automatic" }))).toBe(30_000);
+    expect(pollIntervalMs(normalizeSettings({ mode: "automatic" }))).toBe(180_000);
+  });
+
+  it.each([
+    [1, 4], [3, 4], [4, 4], [13, 13], [1440, 1440], [5000, 1440],
+    [4.6, 5], [undefined, 30], [NaN, 30], [Infinity, 30],
+  ])("normalizes saved scheduled interval %s to %s minutes", (value, expected) => {
+    const settings = normalizeSettings({ mode: "scheduled", intervalMinutes: value });
+    expect(settings.intervalMinutes).toBe(expected);
+    expect(pollIntervalMs(settings)).toBe(expected * 60_000);
+  });
+
+  it("keeps the scheduled default at thirty minutes", () => {
+    expect(DEFAULT_SETTINGS.intervalMinutes).toBe(30);
+    expect(pollIntervalMs(normalizeSettings({ mode: "scheduled" }))).toBe(1_800_000);
   });
 
   it("defaults Obsidian configuration syncing off and accepts extension filters", () => {
@@ -39,7 +53,7 @@ describe("plugin settings", () => {
     ] });
 
     expect(normalized.filterRules).toEqual([
-      { id: "custom", enabled: false, pattern: "**/*.PDF", caseSensitive: true },
+      { id: "custom", enabled: false, pattern: "**/*.PDF", action: "exclude", caseSensitive: true },
     ]);
     expect(normalized.filterRules).not.toBe(DEFAULT_SETTINGS.filterRules);
   });

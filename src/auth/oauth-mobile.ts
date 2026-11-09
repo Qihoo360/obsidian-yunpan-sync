@@ -15,6 +15,11 @@ export interface MobilePendingOAuth {
   issuer: string;
 }
 
+export interface PreparedMobileOAuth {
+  authorizationUrl: string;
+  pending: MobilePendingOAuth;
+}
+
 interface AuthorizationServerMetadata {
   authorization_endpoint?: string;
   registration_endpoint?: string;
@@ -97,7 +102,7 @@ export class MobileOAuth {
     return json(response, stage);
   }
 
-  async start(openBrowser: (url: string) => void): Promise<MobilePendingOAuth> {
+  async prepare(): Promise<PreparedMobileOAuth> {
     const metadata = await this.request("读取授权配置", {
       url: `${this.issuer}/.well-known/oauth-authorization-server`,
       method: "GET",
@@ -135,9 +140,7 @@ export class MobileOAuth {
     authorization.searchParams.set("code_challenge_method", "S256");
     authorization.searchParams.set("scope", "cloud:read cloud:write");
     const pending = { state, verifier, clientId, createdAt: Date.now(), issuer: this.issuer };
-    this.reportProgress?.("正在打开浏览器授权");
-    openBrowser(authorization.toString());
-    return pending;
+    return { authorizationUrl: authorization.toString(), pending };
   }
 
   async complete(params: { action?: string; code?: string; state?: string; error?: string }, pending: MobilePendingOAuth): Promise<CloudAuth> {

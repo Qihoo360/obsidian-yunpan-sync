@@ -19,6 +19,12 @@
   border-radius: 16px;
 }
 
+/* Android's settings sheet can clip the first row beneath its top inset. */
+.yunpan-sync-settings-page.yunpan-sync-android-settings {
+  padding-top: max(32px, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
+  scroll-padding-top: 24px;
+}
+
 .yunpan-sync-settings-page > .setting-item.mod-heading {
   margin: 34px 0 16px;
   margin-left: 0;
@@ -129,6 +135,43 @@
 
 .yunpan-sync-login-setting .setting-item-control {
   flex-wrap: wrap;
+}
+
+.yunpan-sync-settings-group .yunpan-sync-login-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 96px;
+  min-height: var(--input-height, 30px);
+  padding: 0 var(--size-4-3, 12px);
+  border-radius: var(--input-radius, 5px);
+  background: #8a5bf5;
+  color: #fff;
+  font-size: var(--font-ui-small);
+  font-weight: var(--input-font-weight);
+  text-decoration: none;
+  background-image: none;
+  cursor: pointer;
+}
+
+.yunpan-sync-settings-group .yunpan-sync-login-link:hover {
+  background-color: #7948df;
+  color: #fff;
+}
+
+.yunpan-sync-settings-group .yunpan-sync-login-link:active {
+  background-color: #6938cf;
+}
+
+.yunpan-sync-settings-group .yunpan-sync-login-link:focus-visible {
+  outline: 2px solid var(--text-normal);
+  outline-offset: 3px;
+}
+
+.yunpan-sync-settings-group .yunpan-sync-login-link[aria-disabled="true"] {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .yunpan-sync-welcome {

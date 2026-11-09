@@ -14,6 +14,8 @@ import {
 } from "obsidian";
 import { exchangeOAuthCode } from "./auth/oauth.js";
 import { loginCancelledError } from "./auth/cancellation.js";
+import { MobileLoginPreparation } from "./auth/mobile-login-preparation.js";
+import type { PreparedMobileOAuth } from "./auth/oauth-mobile.js";
 import { AuthRefreshCoordinator, OAuthCodeUnavailableError, ReloginRequiredError } from "./auth/refresh.js";
 import { SecretStore, type CloudAuth } from "./auth/secrets.js";
 import {
@@ -24,6 +26,7 @@ import {
 } from "./account/profile.js";
 import { OpenApiClient, type HttpRequest } from "./net/openapi-client.js";
 import { DEFAULT_SETTINGS, ensureDeviceId, normalizeSettings, pollIntervalMs,
+  normalizeScheduledInterval, MIN_SCHEDULED_INTERVAL_MINUTES, MAX_SCHEDULED_INTERVAL_MINUTES,
   type FilterRule, type PluginSettings } from "./settings.js";
 import { DatabasePersistence } from "./storage/persistence.js";
 import { SyncEngine, type EngineStatus } from "./sync/engine.js";
@@ -81,6 +84,12 @@ export default class YunpanSyncPlugin extends Plugin {
   private mobileAuthorizationUrl?: string;
   private loginAttempt?: AbortController;
   private loginGeneration = 0;
+  private unloading = false;
+  readonly mobileLoginPreparation = new MobileLoginPreparation(async (signal, progress) => {
+    const { MobileOAuth } = await import("./auth/oauth-mobile.js");
+    if (signal.aborted) throw loginCancelledError();
+    return new MobileOAuth(this.settings.environment, this.settings.openapiBaseUrl, progress, signal).prepare();
+  }, () => this.settingTab?.renderLogin());
 
   async onload(): Promise<void> {
     if (!requireApiVersion(this.manifest.minAppVersion)) {
@@ -156,6 +165,7 @@ export default class YunpanSyncPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    this.unloading = true;
     this.settingTab?.hide();
     this.endLoginAttempt();
     this.lifecycle.dispose();
@@ -187,6 +197,23 @@ export default class YunpanSyncPlugin extends Plugin {
     return this.status.phase === "login" ? this.mobileAuthorizationUrl : undefined;
   }
 
+  prepareMobileLogin(retry = false): Promise<void> {
+    if (!this.isMobileDevice || this.auth || this.unloading) return Promise.resolve();
+    return this.mobileLoginPreparation.ensure(retry);
+  }
+
+  /** Called on the real link click, before its native default navigation. */
+  activateMobileLogin(url: string | null): boolean {
+    const prepared = this.mobileLoginPreparation.ready;
+    if (this.unloading || !prepared || prepared.authorizationUrl !== url) {
+      void this.prepareMobileLogin(true);
+      return false;
+    }
+    if (this.status.phase === "login") void this.relogin();
+    else void this.login();
+    return this.pendingAuthorizationUrl === url;
+  }
+
   async copyMobileAuthorizationLink(): Promise<void> {
     const url = this.pendingAuthorizationUrl;
     if (!url) return;
@@ -211,6 +238,7 @@ export default class YunpanSyncPlugin extends Plugin {
       this.mobileLoginWaiter = undefined;
     }
     attempt?.abort();
+    this.mobileLoginPreparation.clear();
   }
 
   cancelLogin(): void {
@@ -218,15 +246,19 @@ export default class YunpanSyncPlugin extends Plugin {
     this.endLoginAttempt();
     this.updateStatus({ phase: "idle", message: "登录已取消", queued: 0, failed: 0 });
     this.settingTab?.renderLogin();
+    if (this.settingTab?.isVisible) void this.prepareMobileLogin();
   }
 
   async relogin(): Promise<void> {
+    const prepared = this.mobileLoginPreparation.ready;
+    if (this.isMobileDevice && !prepared) { await this.prepareMobileLogin(true); return; }
     this.endLoginAttempt();
-    await this.login();
+    await this.login(prepared);
   }
 
-  async login(): Promise<void> {
+  async login(prepared: PreparedMobileOAuth | undefined = this.mobileLoginPreparation.ready): Promise<void> {
     if (this.loginAttempt) return;
+    if (this.isMobileDevice && !prepared) { await this.prepareMobileLogin(true); return; }
     // Also invalidate a restored mobile callback that may still be exchanging tokens.
     this.endLoginAttempt();
     const attempt = new AbortController();
@@ -238,17 +270,10 @@ export default class YunpanSyncPlugin extends Plugin {
       this.updateStatus({ phase: "login", message: "等待浏览器授权", queued: 0, failed: 0 });
       let auth: CloudAuth;
       if (this.isMobileDevice) {
-        const { MobileOAuth } = await import("./auth/oauth-mobile.js");
-        if (!current()) return;
-        const oauth = new MobileOAuth(this.settings.environment, this.settings.openapiBaseUrl, (message) => {
-          if (current()) this.updateStatus({ phase: "login", message, queued: 0, failed: 0 });
-        }, attempt.signal);
-        let authorizationUrl = "";
-        const pending = await oauth.start((url) => { authorizationUrl = url; });
-        if (!current()) return;
+        const { pending, authorizationUrl } = prepared!;
         this.secrets.setPendingOAuth(pending);
         this.mobileAuthorizationUrl = authorizationUrl;
-        // Install the callback waiter before handing control to the browser.
+        // No await or browser call here: the trusted link click opens its href.
         const authorization = new Promise<CloudAuth>((resolve, reject) => {
           const timer = setTimeout(() => {
             if (!current() || this.mobileLoginWaiter?.timer !== timer) return;
@@ -258,17 +283,8 @@ export default class YunpanSyncPlugin extends Plugin {
           }, 180_000);
           this.mobileLoginWaiter = { resolve, reject, timer };
         });
-        this.updateStatus({ phase: "login", message: "等待浏览器授权；若未自动打开，请点击下方“打开授权页面”", queued: 0, failed: 0 });
+        this.updateStatus({ phase: "login", message: "等待浏览器授权；若浏览器未打开，可使用下方授权链接", queued: 0, failed: 0 });
         this.settingTab?.display();
-        // Mobile WebViews can silently ignore scripted popups after async work.
-        // Keep a native link in settings so a direct user gesture can navigate.
-        try {
-          window.open(authorizationUrl);
-          
-        } catch {
-          
-          new Notice("请点击“打开授权页面”继续授权");
-        }
         auth = await authorization;
       } else {
         const { DesktopOAuth } = await import("./auth/oauth-desktop.js");
@@ -279,6 +295,7 @@ export default class YunpanSyncPlugin extends Plugin {
       if (!current()) return;
       if (previousQid && previousQid !== auth.qid) this.persistence?.database.resetSyncState();
       this.secrets.setAuth(auth);
+      this.mobileLoginPreparation.clear();
       
       this.expiredAuthQid = undefined;
       await this.configureEngine();
@@ -296,6 +313,8 @@ export default class YunpanSyncPlugin extends Plugin {
         this.loginAttempt = undefined;
         this.mobileAuthorizationUrl = undefined;
         this.secrets.clearPendingOAuth();
+        if (this.mobileLoginWaiter) clearTimeout(this.mobileLoginWaiter.timer);
+        this.mobileLoginWaiter = undefined;
         this.settingTab?.renderLogin();
         try { await this.persistence?.save(); }
         catch { if (this.loginGeneration === generation) new Notice("登录状态保存失败，请重试"); }
@@ -348,6 +367,7 @@ export default class YunpanSyncPlugin extends Plugin {
         waiter.resolve(auth);
       } else {
         this.secrets.setAuth(auth);
+        this.mobileLoginPreparation.clear();
         await this.configureEngine();
         if (!current()) return;
         new Notice("360AI 云盘登录成功");
@@ -770,18 +790,29 @@ class YunpanSyncSettingTab extends PluginSettingTab {
   private loginStatusEl?: HTMLElement;
   private authorizationEl?: HTMLElement;
   private loginButtons: ButtonComponent[] = [];
+  private mobileLoginLinks: HTMLAnchorElement[] = [];
   private cancelLoginButton?: ButtonComponent;
+  private visible = false;
+  private navigationPending = false;
+  private navigationRefresh?: ReturnType<typeof setTimeout>;
+  get isVisible(): boolean { return this.visible; }
   constructor(app: App, private readonly owner: YunpanSyncPlugin) { super(app, owner); }
 
   display(): void {
+    // Preserve the clicked href until the browser has performed its default
+    // action. Replacing this element inside the click handler can cancel it.
+    if (this.navigationPending) return;
     this.hide();
+    this.visible = true;
     const { containerEl } = this;
     containerEl.empty();
     this.loginButtons = [];
+    this.mobileLoginLinks = [];
     this.cancelLoginButton = undefined;
     this.loginStatusEl = undefined;
     this.authorizationEl = undefined;
     containerEl.addClass("yunpan-sync-settings-page");
+    if (Platform.isAndroidApp) containerEl.addClass("yunpan-sync-android-settings");
     
     new Setting(containerEl).setName("账号设置").setHeading();
     this.renderAccount(this.createGroup("账号设置"));
@@ -795,10 +826,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     if (this.owner.auth) remote
       .addText((text) => { text.setValue(this.owner.settings.remoteRoot); text.inputEl.readOnly = true; })
       .addButton((button) => button.setButtonText("选择").onClick(() => void this.owner.chooseRemoteRoot()));
-    else remote.addButton((button) => {
-      this.loginButtons.push(button);
-      button.setButtonText("登录").setCta().onClick(() => void this.startLogin());
-    });
+    else this.addLoginControl(remote);
 
     new Setting(syncGroup).setName("同步模式")
       .setDesc(this.owner.isMobileDevice ? "移动端自动同步仅在前台运行，切到后台会暂停；默认手动" : "建议选择自动同步模式，可以实时自动为您同步")
@@ -812,10 +840,12 @@ class YunpanSyncSettingTab extends PluginSettingTab {
         });
       });
     if (this.owner.settings.mode === "scheduled") new Setting(syncGroup).setName("同步周期（分钟）")
-      .setDesc("1 至 1440 分钟").addText((text) => {
-        text.inputEl.type = "number"; text.inputEl.min = "1"; text.inputEl.max = "1440";
+      .setDesc(`${MIN_SCHEDULED_INTERVAL_MINUTES} 至 ${MAX_SCHEDULED_INTERVAL_MINUTES} 分钟`).addText((text) => {
+        text.inputEl.type = "number";
+        text.inputEl.min = String(MIN_SCHEDULED_INTERVAL_MINUTES);
+        text.inputEl.max = String(MAX_SCHEDULED_INTERVAL_MINUTES);
         text.setValue(String(this.owner.settings.intervalMinutes)).onChange(async (value) => {
-          this.owner.settings.intervalMinutes = Math.min(1440, Math.max(1, Math.round(Number(value) || 1)));
+          this.owner.settings.intervalMinutes = normalizeScheduledInterval(value);
           await this.owner.saveSettings();
         });
       });
@@ -853,19 +883,36 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       text: `插件版本 ${this.owner.manifest.version}` });
     this.renderLogin();
     this.stopDismiss = dismissKeyboardOnBlankTap(containerEl);
+    void this.owner.prepareMobileLogin();
   }
 
   hide(): void {
+    this.visible = false;
+    this.navigationPending = false;
+    clearTimeout(this.navigationRefresh);
+    this.navigationRefresh = undefined;
     this.stopDismiss?.();
     this.stopDismiss = undefined;
   }
 
   renderLogin(): void {
+    if (!this.visible || this.navigationPending) return;
     const status = this.owner.currentStatus;
     const pending = status.phase === "login";
     for (const button of this.loginButtons) button.setDisabled(false).setButtonText(pending ? "重新登录" : "登录");
+    const preparation = this.owner.mobileLoginPreparation;
+    const ready = preparation.ready;
+    for (const link of this.mobileLoginLinks) {
+      link.setText(ready ? (pending ? "重新登录" : "登录") : preparation.error ? "重试准备" : "准备登录…");
+      link.setAttr("aria-disabled", String(!ready && !preparation.error));
+      link.setAttr("tabindex", ready || preparation.error ? "0" : "-1");
+      if (ready) link.setAttr("href", ready.authorizationUrl);
+      else link.removeAttribute("href");
+    }
     if (this.cancelLoginButton) this.cancelLoginButton.buttonEl.hidden = !pending;
-    this.loginStatusEl?.setText(pending || status.phase === "error" || status.message === "登录已取消" ? status.message : "");
+    const loginMessage = pending || status.phase === "error" || status.message === "登录已取消" ? status.message : "";
+    this.loginStatusEl?.setText([loginMessage, this.owner.isMobileDevice
+      ? preparation.error || preparation.progress : ""].filter(Boolean).join("\n"));
     if (this.authorizationEl) this.authorizationEl.hidden = !this.owner.pendingAuthorizationUrl;
   }
 
@@ -891,16 +938,13 @@ class YunpanSyncSettingTab extends PluginSettingTab {
 
   private renderAccount(container: HTMLElement): void {
     if (!this.owner.auth) {
-      const account = new Setting(container).setName("请登录 360AI 云盘账号")
-        .addButton((button) => {
-          this.loginButtons.push(button);
-          button.setButtonText("登录").setCta().onClick(() => void this.startLogin());
-        })
-        .addButton((button) => {
-          this.cancelLoginButton = button;
-          button.setButtonText("取消登录").onClick(() => this.owner.cancelLogin());
-          button.buttonEl.addClass("yunpan-sync-cancel-login");
-        });
+      const account = new Setting(container).setName("请登录 360AI 云盘账号");
+      this.addLoginControl(account);
+      account.addButton((button) => {
+        this.cancelLoginButton = button;
+        button.setButtonText("取消登录").onClick(() => this.owner.cancelLogin());
+        button.buttonEl.addClass("yunpan-sync-cancel-login");
+      });
       account.settingEl.addClass("yunpan-sync-login-setting");
       this.loginStatusEl = account.descEl;
       const url = this.owner.pendingAuthorizationUrl;
@@ -956,6 +1000,44 @@ class YunpanSyncSettingTab extends PluginSettingTab {
 
   private startLogin(): Promise<void> {
     return this.owner.currentStatus.phase === "login" ? this.owner.relogin() : this.owner.login();
+  }
+
+  private addLoginControl(setting: Setting): void {
+    if (!this.owner.isMobileDevice) {
+      setting.addButton((button) => {
+        this.loginButtons.push(button);
+        button.setButtonText("登录").setCta().onClick(() => void this.startLogin());
+      });
+      return;
+    }
+    const link = setting.controlEl.createEl("a", {
+      text: "准备登录…", cls: "external-link yunpan-sync-login-link mod-cta",
+      attr: { target: "_blank", rel: "noopener noreferrer", "aria-disabled": "true", tabindex: "-1" },
+    });
+    this.mobileLoginLinks.push(link);
+    link.addEventListener("click", (event) => {
+      if (event.defaultPrevented) return;
+      this.navigationPending = true;
+      if (!this.owner.activateMobileLogin(link.getAttribute("href"))) {
+        event.preventDefault();
+        this.navigationPending = false;
+        this.renderLogin();
+        return;
+      }
+      // A new task runs after native link navigation, rather than during the
+      // event's microtask checkpoint. Never synthesize another click.
+      this.navigationRefresh = setTimeout(() => {
+        this.navigationRefresh = undefined;
+        this.navigationPending = false;
+        if (this.visible) this.display();
+      }, 0);
+    });
+    link.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !link.hasAttribute("href") && this.owner.mobileLoginPreparation.error) {
+        event.preventDefault();
+        void this.owner.prepareMobileLogin(true);
+      }
+    });
   }
 
   private renderProductLinks(): void {

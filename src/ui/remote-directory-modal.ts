@@ -38,7 +38,7 @@ export class RemoteDirectoryModal extends Modal {
     this.creating = false;
     this.folderName = "";
     this.modalEl.addClass("yunpan-sync-directory-modal");
-    this.stopViewport = trackModalViewport(this.modalEl);
+    this.stopViewport = trackModalViewport(this.modalEl, { preserveLayout: true });
     void this.load();
   }
 

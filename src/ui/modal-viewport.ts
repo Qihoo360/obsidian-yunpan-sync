@@ -1,7 +1,7 @@
 import { dismissKeyboardOnBlankTap } from "./dismiss-keyboard.js";
 
 /** Keep the modal and its action bar inside the keyboard's visible viewport. */
-export function trackModalViewport(modal: HTMLElement): () => void {
+export function trackModalViewport(modal: HTMLElement, options: { preserveLayout?: boolean } = {}): () => void {
   const doc = modal.ownerDocument;
   const win = doc.defaultView;
   if (!win) return () => {};
@@ -33,10 +33,12 @@ export function trackModalViewport(modal: HTMLElement): () => void {
     const bottom = Math.min((viewport?.offsetTop ?? 0) + (viewport?.height ?? win.innerHeight),
       keyboardHeight > 0 ? layoutHeight - keyboardHeight : currentHeight - safeBottom);
     const height = Math.max(0, bottom - offset);
-    modal.style.setProperty("--yunpan-visible-height", `${height}px`);
-    modal.style.setProperty("--yunpan-visible-center", `${offset + height / 2}px`);
-    modal.toggleClass("yunpan-sync-compact-viewport", height <= 480);
-    modal.toggleClass("yunpan-sync-tight-viewport", height <= 320);
+    if (!options.preserveLayout) {
+      modal.style.setProperty("--yunpan-visible-height", `${height}px`);
+      modal.style.setProperty("--yunpan-visible-center", `${offset + height / 2}px`);
+      modal.toggleClass("yunpan-sync-compact-viewport", height <= 480);
+      modal.toggleClass("yunpan-sync-tight-viewport", height <= 320);
+    }
 
     const active = doc.activeElement;
     if (!active || !modal.contains(active)) return;
@@ -58,7 +60,7 @@ export function trackModalViewport(modal: HTMLElement): () => void {
   const observer = new win.MutationObserver(schedule);
   observer.observe(doc.documentElement, { attributes: true, attributeFilter: ["style", "class"] });
   observer.observe(doc.body, { attributes: true, attributeFilter: ["style", "class"] });
-  modal.addClass("yunpan-sync-viewport-modal");
+  if (!options.preserveLayout) modal.addClass("yunpan-sync-viewport-modal");
   viewport?.addEventListener("resize", schedule);
   viewport?.addEventListener("scroll", schedule);
   win.addEventListener("resize", schedule);
@@ -79,10 +81,12 @@ export function trackModalViewport(modal: HTMLElement): () => void {
     insets.remove();
     modal.removeEventListener("focusin", schedule);
     modal.removeEventListener("focusout", schedule);
-    modal.removeClass("yunpan-sync-viewport-modal");
-    modal.removeClass("yunpan-sync-compact-viewport");
-    modal.removeClass("yunpan-sync-tight-viewport");
-    modal.style.removeProperty("--yunpan-visible-height");
-    modal.style.removeProperty("--yunpan-visible-center");
+    if (!options.preserveLayout) {
+      modal.removeClass("yunpan-sync-viewport-modal");
+      modal.removeClass("yunpan-sync-compact-viewport");
+      modal.removeClass("yunpan-sync-tight-viewport");
+      modal.style.removeProperty("--yunpan-visible-height");
+      modal.style.removeProperty("--yunpan-visible-center");
+    }
   };
 }

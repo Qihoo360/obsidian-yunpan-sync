@@ -60,6 +60,10 @@ export interface PathFilterOptions {
   pluginId?: string;
 }
 
+export function filterRuleAction(rule: FilterRule): "exclude" | "include" {
+  return rule.action === "include" ? "include" : "exclude";
+}
+
 export function parseExcludedExtensions(value: string): string[] {
   return [...new Set(value.split(/[\s,;，；]+/)
     .map((item) => item.trim().toLowerCase().replace(/^\*?\.?/, ""))
@@ -115,7 +119,11 @@ export function shouldIgnorePath(path: string, options: PathFilterOptions = {}):
   const name = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
   const excluded = (options.excludedExtensions ?? []).map((item) => item.toLowerCase().replace(/^\*?\.?/, "")).filter(Boolean);
   if (excluded.some((extension) => name.endsWith(`.${extension}`))) return true;
-  if ((options.filterRules ?? []).some((rule) => matchesFilterRule(normalized, rule))) return true;
+  let matched: "exclude" | "include" | undefined;
+  for (const rule of options.filterRules ?? []) {
+    if (matchesFilterRule(normalized, rule)) matched = filterRuleAction(rule);
+  }
+  if (matched === "exclude") return true;
   return TEMP_FILE_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 

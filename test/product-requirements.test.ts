@@ -81,6 +81,9 @@ describe("product requirement helpers", () => {
     expect(modalSource).toContain('setTooltip("上移")');
     expect(modalSource).toContain('setTooltip("下移")');
     expect(modalSource).toContain('setTooltip("删除")');
+    expect(modalSource).toContain('addOption("exclude", "排除")');
+    expect(modalSource).toContain('addOption("include", "包含")');
+    expect(modalSource).toContain("最后命中的规则生效");
   });
 
   it("keeps mobile filter editing accessible as one horizontally scrolling list", () => {
@@ -173,6 +176,13 @@ describe("product requirement helpers", () => {
     expect(rowRule).toContain("border-radius: 0");
   });
 
+  it("keeps directory layout independent from the keyboard viewport while editing a new folder", () => {
+    const source = readFileSync(new URL("../src/ui/remote-directory-modal.ts", import.meta.url), "utf8");
+    const viewport = readFileSync(new URL("../src/ui/modal-viewport.ts", import.meta.url), "utf8");
+    expect(source).toContain('trackModalViewport(this.modalEl, { preserveLayout: true })');
+    expect(viewport).toContain("preserveLayout");
+  });
+
   it("keeps the sync task table horizontally scrollable on narrow screens", () => {
     const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
     const modalSource = readFileSync(new URL("../src/ui/sync-modal.ts", import.meta.url), "utf8");
@@ -242,6 +252,16 @@ describe("product requirement helpers", () => {
     expect(itemRule).not.toContain("background: white");
     expect(itemRule).not.toContain("background: #fff");
     expect(headingRule).toContain("margin: 34px 0 16px");
+  });
+
+  it("reserves the Android top inset before the first settings heading", () => {
+    const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+    expect(source).toContain('containerEl.addClass("yunpan-sync-android-settings")');
+    const androidRule = styles.match(/\.yunpan-sync-settings-page\.yunpan-sync-android-settings\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(androidRule).toContain("padding-top: max(32px");
+    expect(androidRule).toContain("env(safe-area-inset-top");
+    expect(androidRule).toContain("scroll-padding-top: 24px");
   });
 
   it("offers all sync modes on mobile while keeping manual as the default", () => {

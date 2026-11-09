@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 class ElementStub {
+  type = "";
+  min = "";
+  max = "";
   textContent = "";
   hidden = false;
   attributes: Record<string, string> = {};
@@ -12,14 +15,25 @@ class ElementStub {
   append(child: ElementStub) { child.parent = this; this.children.push(child); }
   appendText(text: string) { this.textContent += text; }
   setText(text: string) { this.textContent = text; }
-  setAttr() {}
+  setAttr(name: string, value: string) { this.attributes[name] = value; }
+  getAttribute(name: string) { return this.attributes[name] ?? null; }
+  hasAttribute(name: string) { return name in this.attributes; }
+  removeAttribute(name: string) { delete this.attributes[name]; }
   toggleClass() {}
-  addEventListener() {}
+  listeners: Record<string, ((event: Event) => void)[]> = {};
+  addEventListener(type: string, listener: (event: Event) => void) {
+    (this.listeners[type] ??= []).push(listener);
+  }
+  fire(type: string, options: Record<string, unknown> = {}) {
+    const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...options };
+    for (const listener of this.listeners[type] ?? []) listener(event as unknown as Event);
+    return event;
+  }
   createEl(tag: string, options?: { text?: string; cls?: string; attr?: Record<string, string> }) {
     const element = new ElementStub();
     element.textContent = options?.text ?? "";
     element.attributes = options?.attr ?? {};
-    if (options?.cls) element.addClass(options.cls);
+    if (options?.cls) for (const name of options.cls.split(" ")) element.addClass(name);
     this.append(element);
     if (tag === "a") links.push(element);
     return element;
@@ -34,13 +48,15 @@ class ControlStub {
   label = "";
   disabled = false;
   click?: () => unknown;
+  change?: (value: string) => unknown;
+  value = "";
   setButtonText(label: string) { this.label = label; return this; }
   setDisabled(disabled: boolean) { this.disabled = disabled; return this; }
   setCta() { return this; }
   onClick(callback: () => unknown) { this.click = callback; return this; }
   addOption() { return this; }
-  setValue() { return this; }
-  onChange() { return this; }
+  setValue(value: string) { this.value = value; return this; }
+  onChange(callback: (value: string) => unknown) { this.change = callback; return this; }
 }
 
 const harness = vi.hoisted(() => ({
@@ -56,11 +72,12 @@ const harness = vi.hoisted(() => ({
   persisted: null as unknown,
   apiVersion: "1.11.4",
   databaseOpen: vi.fn(),
+  vaultOn: vi.fn(),
   secrets: new Map<string, string>(),
   protocolHandler: undefined as ((params: Record<string, string>) => void) | undefined,
 }));
-const rows: { name: string; descEl: ElementStub; settingEl: ElementStub; buttons: ControlStub[] }[] = [];
-const tabs: { display(): void; containerEl: ElementStub }[] = [];
+const rows: { name: string; descEl: ElementStub; settingEl: ElementStub; controlEl: ElementStub; buttons: ControlStub[]; controls: ControlStub[] }[] = [];
+const tabs: { display(): void; hide(): void; containerEl: ElementStub }[] = [];
 const links: ElementStub[] = [];
 
 vi.mock("obsidian", async (importOriginal) => ({
@@ -92,6 +109,7 @@ vi.mock("obsidian", async (importOriginal) => ({
     settingEl = new ElementStub();
     controlEl = new ElementStub();
     buttons: ControlStub[] = [];
+    controls: ControlStub[] = [];
     constructor(container: ElementStub) { container.append(this.settingEl); rows.push(this); }
     setName(name: string) { this.name = name; return this; }
     setHeading() { this.settingEl.addClass("mod-heading"); return this; }
@@ -99,8 +117,12 @@ vi.mock("obsidian", async (importOriginal) => ({
     addButton(callback: (button: ControlStub) => unknown) {
       const button = new ControlStub(); this.buttons.push(button); callback(button); return this;
     }
-    addDropdown(callback: (control: ControlStub) => unknown) { callback(new ControlStub()); return this; }
-    addText(callback: (control: ControlStub) => unknown) { callback(new ControlStub()); return this; }
+    addDropdown(callback: (control: ControlStub) => unknown) {
+      const control = new ControlStub(); this.controls.push(control); callback(control); return this;
+    }
+    addText(callback: (control: ControlStub) => unknown) {
+      const control = new ControlStub(); this.controls.push(control); callback(control); return this;
+    }
     addToggle(callback: (control: ControlStub) => unknown) { callback(new ControlStub()); return this; }
   },
   Plugin: class {
@@ -111,14 +133,14 @@ vi.mock("obsidian", async (importOriginal) => ({
         setSecret: (key: string, value: string) => { harness.secrets.set(key, value); },
       },
       vault: {
-        getName: () => "test-vault", on: vi.fn(),
+        getName: () => "test-vault", on: harness.vaultOn,
         adapter: { exists: async () => true, write: harness.write },
       },
       workspace: { getLeavesOfType: () => [] },
     };
     async loadData() { return harness.persisted; }
     async saveData(data: unknown) { harness.persisted = structuredClone(data); }
-    addSettingTab(tab: { display(): void; containerEl: ElementStub }) { tabs.push(tab); }
+    addSettingTab(tab: { display(): void; hide(): void; containerEl: ElementStub }) { tabs.push(tab); }
     addStatusBarItem() { return new ElementStub(); }
     registerObsidianProtocolHandler(_action: string, callback: (params: Record<string, string>) => void) {
       harness.protocolHandler = callback;
@@ -162,7 +184,7 @@ async function loadPlugin() {
 describe("login settings and installation lifecycle", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    harness.request.mockReset();
+    harness.request.mockReset().mockImplementation(() => new Promise(() => {}));
     rows.length = 0; tabs.length = 0; links.length = 0;
     harness.secrets.clear(); harness.open.mockReset();
     harness.platform.isIosApp = true;
@@ -180,6 +202,68 @@ describe("login settings and installation lifecycle", () => {
 
   const storedAuth = () => ({ accessToken: "saved-access", qid: "42", token: "saved-token",
     expiresAt: Date.now() + 3_600_000, oauthCode: "saved-code" });
+
+  it.each([false, true])("replaces actual sync timers on mode and interval changes (mobile=%s)", async mobile => {
+    vi.useFakeTimers();
+    harness.platform.isMobileApp = mobile;
+    vi.stubGlobal("window", { open: harness.open, setInterval, clearInterval, setTimeout, clearTimeout });
+    const plugin = await loadPlugin();
+    const sync = vi.spyOn(plugin, "syncNow").mockResolvedValue();
+    const modeControl = () => rows.filter(row => row.name === "同步模式").at(-1)!.controls[0]!;
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(sync).not.toHaveBeenCalled(); // Manual mode has no timer.
+    await modeControl().change!("automatic");
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(179_999);
+    expect(sync).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sync).toHaveBeenCalledExactlyOnceWith(false, false);
+
+    await modeControl().change!("scheduled");
+    expect(vi.getTimerCount()).toBe(1);
+    const intervalRow = rows.filter(row => row.name === "同步周期（分钟）").at(-1)!;
+    expect(intervalRow.descEl.textContent).toBe("4 至 1440 分钟");
+    expect(intervalRow.controls[0]!.inputEl).toMatchObject({ type: "number", min: "4", max: "1440" });
+    expect(intervalRow.controls[0]!.value).toBe("30");
+    await intervalRow.controls[0]!.change!("3");
+    expect(plugin.settings.intervalMinutes).toBe(4);
+    expect(harness.persisted).toMatchObject({ mode: "scheduled", intervalMinutes: 4 });
+    expect(rows.filter(row => row.name === "同步周期（分钟）").at(-1)!.controls[0]!.value).toBe("4");
+    expect(vi.getTimerCount()).toBe(1);
+    sync.mockClear();
+    await vi.advanceTimersByTimeAsync(239_999);
+    expect(sync).not.toHaveBeenCalled(); // The old three-minute timer is gone.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sync).toHaveBeenCalledExactlyOnceWith(false, false);
+    await modeControl().change!("manual");
+    expect(vi.getTimerCount()).toBe(0);
+    await plugin.onunload();
+  });
+
+  it("keeps local file change debounce at 1.5 seconds and suppresses it in the mobile background", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { open: harness.open, setInterval, clearInterval, setTimeout, clearTimeout });
+    const doc = { visibilityState: "visible" };
+    vi.stubGlobal("document", doc);
+    harness.persisted = { ...DEFAULT_SETTINGS, mode: "automatic" };
+    const plugin = await loadPlugin();
+    const sync = vi.spyOn(plugin, "syncNow").mockResolvedValue();
+    const onModify = harness.vaultOn.mock.calls.find(call => call[0] === "modify")![1];
+    onModify({ path: "note.md" });
+    await vi.advanceTimersByTimeAsync(1000);
+    onModify({ path: "note.md" });
+    await vi.advanceTimersByTimeAsync(1499);
+    expect(sync).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sync).toHaveBeenCalledExactlyOnceWith(false, false);
+    sync.mockClear();
+    doc.visibilityState = "hidden";
+    onModify({ path: "note.md" });
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(sync).not.toHaveBeenCalled();
+    await plugin.onunload();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
   it.each(["1.10.3", "1.11.3"])("rejects API %s before settings, secrets, callbacks or storage are touched", async (version) => {
     harness.apiVersion = version;
@@ -273,7 +357,7 @@ describe("login settings and installation lifecycle", () => {
     harness.protocolHandler!({ code: "old-code", state: "old-state" });
     await vi.dynamicImportSettled();
     await plugin.syncNow(false, false);
-    expect(harness.request).not.toHaveBeenCalled();
+    expect(harness.request.mock.calls.every(([request]) => !request.url.includes("mobile-exchange"))).toBe(true);
     expect(harness.desktopLogin).not.toHaveBeenCalled();
     expect(plugin.auth).toBeUndefined();
     await plugin.onunload();
@@ -333,121 +417,287 @@ describe("login settings and installation lifecycle", () => {
     await reinstalled.onunload();
   });
 
-  it("shows the stalled login stage, prevents repeated starts, and allows retry after timeout", async () => {
-    vi.useFakeTimers();
+
+  const latestRow = (name: string) => rows.filter(row => row.name === name).at(-1)!;
+  const loginLink = (name = "请登录 360AI 云盘账号") =>
+    latestRow(name).controlEl.children.find(child => child.classes.has("yunpan-sync-login-link"))!;
+  const pending = () => JSON.parse(harness.secrets.get(MOBILE_PENDING_OAUTH_SECRET_ID)!) as { state: string };
+  function mockPreparation() {
+    harness.request.mockImplementation(async ({ url }: { url: string }) => {
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return { status: 200, json: {} };
+      if (url.endsWith("/register")) return { status: 201, json: { client_id: "mobile-client" } };
+      if (url.endsWith("/oauth/360/mobile-exchange")) return { status: 200, json: { oauth_code: "new-oauth-code" } };
+      return { status: 200, json: { errno: 0,
+        data: { access_token: "new-access", qid: "42", token: "cloud-token", access_token_expire: 3600 } } };
+    });
+  }
+  async function preparedPlugin() {
+    mockPreparation();
     const plugin = await loadPlugin();
-    harness.request.mockImplementation(() => new Promise(() => {}));
-    const operation = plugin.login();
-    await vi.dynamicImportSettled();
-    await vi.advanceTimersByTimeAsync(0);
-    void plugin.login();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(harness.request).toHaveBeenCalledOnce();
-    const account = rows.find((row) => row.name === "请登录 360AI 云盘账号")!;
-    const remote = rows.find((row) => row.name === "远程目录")!;
-    expect(account.descEl.textContent).toContain("正在读取授权配置");
-    expect(account.buttons[0]!.disabled).toBe(false);
-    expect(account.buttons[0]!.label).toBe("重新登录");
-    expect(account.buttons[1]!.buttonEl.hidden).toBe(false);
-    expect(remote.buttons[0]!.disabled).toBe(false);
-    await vi.advanceTimersByTimeAsync(15_001);
-    await operation;
-    expect(account.descEl.textContent).toContain("读取授权配置超时");
-    expect(account.buttons[0]!.disabled).toBe(false);
-    expect(remote.buttons[0]!.disabled).toBe(false);
-    expect(account.buttons[1]!.buttonEl.hidden).toBe(true);
-    expect(harness.save.mock.calls.length).toBeGreaterThan(1);
-    harness.request.mockResolvedValueOnce({ status: 503, json: {} });
-    await plugin.login();
+    await plugin.prepareMobileLogin();
+    return plugin;
+  }
+
+  it("prepares on settings display, shares both links and reuses work across renders", async () => {
+    mockPreparation();
+    const plugin = await loadPlugin();
+    expect(loginLink().textContent).toBe("准备登录…");
+    expect(loginLink().attributes["aria-disabled"]).toBe("true");
+    tabs.at(-1)!.display();
+    tabs.at(-1)!.display();
+    await plugin.prepareMobileLogin();
+    const account = loginLink(); const remote = loginLink("远程目录");
+    expect(account.textContent).toBe("登录");
+    expect(account.attributes.href).toBe(remote.attributes.href);
+    expect(new URL(account.attributes.href!).searchParams.get("code_challenge")).toBeTruthy();
     expect(harness.request).toHaveBeenCalledTimes(2);
-    expect(account.descEl.textContent).toContain("读取授权配置失败（HTTP 503）");
+    expect(harness.secrets.get(MOBILE_PENDING_OAUTH_SECRET_ID)).toBe("");
+    expect(plugin.currentStatus.phase).toBe("idle");
+    tabs.at(-1)!.display();
+    await plugin.prepareMobileLogin();
+    expect(harness.request).toHaveBeenCalledTimes(2);
+    expect(harness.open).not.toHaveBeenCalled();
+    await plugin.onunload();
   });
 
-  it("cancels immediately during configuration loading and ignores its late response", async () => {
+  it.each([
+    ["iPhone", "请登录 360AI 云盘账号"], ["iPhone", "远程目录"],
+    ["Android", "请登录 360AI 云盘账号"], ["Android", "远程目录"],
+  ])("lets the real link navigate synchronously on %s from %s", async (platform, rowName) => {
+    vi.useFakeTimers();
+    harness.platform.isIosApp = platform === "iPhone";
+    harness.platform.isAndroidApp = platform === "Android";
+    const plugin = await preparedPlugin();
+    const link = loginLink(rowName);
+    const url = link.attributes.href!;
+    const containerChildren = [...tabs.at(-1)!.containerEl.children];
+    const event = link.fire("click");
+    // These assertions run before any microtask or timer, just as native navigation does.
+    expect(event.defaultPrevented).toBe(false);
+    expect(link.attributes.href).toBe(url);
+    expect(tabs.at(-1)!.containerEl.children).toEqual(containerChildren);
+    expect(plugin.pendingAuthorizationUrl).toBe(url);
+    expect(new URL(url).searchParams.get("state")).toBe(pending().state);
+    expect(link.attributes.target).toBe("_blank");
+    expect(link.attributes.rel).toBe("noopener noreferrer");
+    expect(harness.request).toHaveBeenCalledTimes(2);
+    expect(harness.open).not.toHaveBeenCalled();
+    // A second click on the consumed link cannot start another authorization.
+    expect(link.fire("click").defaultPrevented).toBe(true);
+    expect(plugin.pendingAuthorizationUrl).toBe(url);
+    await vi.advanceTimersByTimeAsync(0);
+    await plugin.prepareMobileLogin();
+    expect(loginLink().textContent).toBe("重新登录");
+    expect(loginLink().attributes.href).not.toBe(url);
+    const fallback = links.filter(entry => entry.textContent === "打开授权页面").at(-1)!;
+    expect(fallback.attributes.href).toBe(url);
+    expect(latestRow("请登录 360AI 云盘账号").buttons[0]!.buttonEl.hidden).toBe(false);
+    tabs.at(-1)!.hide();
+    plugin.cancelLogin();
+    await plugin.onunload();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("accepts an immediate callback and ignores duplicates without requiring a second tap", async () => {
+    const plugin = await preparedPlugin();
+    vi.spyOn(plugin, "refreshAccountProfile").mockResolvedValue();
+    const link = loginLink();
+    expect(link.fire("click").defaultPrevented).toBe(false);
+    const state = pending().state;
+    harness.protocolHandler!({ action: "yunpan-sync", code: "returned-code", state });
+    harness.protocolHandler!({ action: "yunpan-sync", code: "returned-code", state });
+    await vi.waitFor(() => expect(plugin.currentStatus.message).toBe("已登录"));
+    expect(plugin.auth).toMatchObject({ accessToken: "new-access", oauthCode: "new-oauth-code" });
+    expect(plugin.pendingAuthorizationUrl).toBeUndefined();
+    expect(harness.secrets.get(MOBILE_PENDING_OAUTH_SECRET_ID)).toBe("");
+    expect(harness.request.mock.calls.filter(([request]) => request.url.includes("mobile-exchange"))).toHaveLength(1);
+    expect(harness.notice).not.toHaveBeenCalledWith("请点击“打开授权页面”继续授权");
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(plugin.mobileLoginPreparation.ready).toBeUndefined();
+    await plugin.onunload();
+  });
+
+  it("does not activate a link whose click has already been prevented", async () => {
+    const plugin = await preparedPlugin();
+    loginLink().fire("click", { defaultPrevented: true });
+    expect(plugin.pendingAuthorizationUrl).toBeUndefined();
+    expect(plugin.mobileLoginPreparation.ready).toBeDefined();
+    await plugin.onunload();
+  });
+
+  it.each(["click", "display"])("replaces an expired preparation on %s without navigating automatically", async trigger => {
+    vi.useFakeTimers();
+    const plugin = await preparedPlugin();
+    const oldLink = loginLink(); const oldUrl = oldLink.attributes.href;
+    vi.setSystemTime(Date.now() + 5 * 60_000);
+    if (trigger === "click") expect(oldLink.fire("click").defaultPrevented).toBe(true);
+    else tabs.at(-1)!.display();
+    expect(loginLink().hasAttribute("href")).toBe(false);
+    await plugin.prepareMobileLogin();
+    expect(loginLink().attributes.href).not.toBe(oldUrl);
+    expect(plugin.pendingAuthorizationUrl).toBeUndefined();
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.request).toHaveBeenCalledTimes(4);
+    await plugin.onunload();
+  });
+
+  it("shows preparation timeout, disables both links and retries only on request", async () => {
     vi.useFakeTimers();
     const plugin = await loadPlugin();
-    const existingAuth = JSON.stringify({ accessToken: "existing", qid: "42", token: "token", expiresAt: Date.now() + 60_000 });
-    harness.secrets.set("yunpan-sync-auth", existingAuth);
+    await vi.dynamicImportSettled();
+    expect(harness.request).toHaveBeenCalledOnce();
+    expect(loginLink().fire("click").defaultPrevented).toBe(true);
+    expect(loginLink("远程目录").attributes["aria-disabled"]).toBe("true");
+    await vi.advanceTimersByTimeAsync(15_001);
+    expect(latestRow("请登录 360AI 云盘账号").descEl.textContent).toContain("读取授权配置超时");
+    expect(loginLink().textContent).toBe("重试准备");
+    expect(loginLink().attributes.tabindex).toBe("0");
+    tabs.at(-1)!.display();
+    await plugin.prepareMobileLogin();
+    expect(harness.request).toHaveBeenCalledOnce();
+    mockPreparation();
+    expect(loginLink().fire("keydown", { key: "Enter" }).defaultPrevented).toBe(true);
+    await plugin.prepareMobileLogin();
+    expect(loginLink().textContent).toBe("登录");
+    expect(plugin.currentStatus.phase).toBe("idle");
+    expect(harness.open).not.toHaveBeenCalled();
+    await plugin.onunload();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("shows registration failure and lets either login entry retry preparation", async () => {
+    harness.request.mockResolvedValueOnce({ status: 200, json: {} })
+      .mockResolvedValueOnce({ status: 503, json: {} });
+    const plugin = await loadPlugin();
+    await plugin.prepareMobileLogin();
+    expect(latestRow("请登录 360AI 云盘账号").descEl.textContent).toContain("注册授权客户端失败（HTTP 503）");
+    mockPreparation();
+    expect(loginLink("远程目录").fire("click").defaultPrevented).toBe(true);
+    await plugin.prepareMobileLogin();
+    expect(loginLink().textContent).toBe("登录");
+    expect(plugin.pendingAuthorizationUrl).toBeUndefined();
+    await plugin.onunload();
+  });
+
+  it("ignores a late preparation after unload and refuses clicks from detached UI", async () => {
     let resolve!: (value: unknown) => void;
     harness.request.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
-    const operation = plugin.login();
+    const plugin = await loadPlugin();
     await vi.dynamicImportSettled();
-    const account = rows.find(row => row.name === "请登录 360AI 云盘账号")!;
-    await account.buttons[1]!.click!();
+    const operation = plugin.prepareMobileLogin();
+    const link = loginLink();
+    await plugin.onunload();
     await operation;
-    expect(plugin.currentStatus).toMatchObject({ phase: "idle", message: "登录已取消" });
-    expect(account.buttons[0]!.label).toBe("登录");
-    expect(account.buttons[1]!.buttonEl.hidden).toBe(true);
-    expect(harness.secrets.get("yunpan-sync-auth")).toBe(existingAuth);
-    expect(vi.getTimerCount()).toBe(0);
     resolve({ status: 200, json: {} });
     await vi.dynamicImportSettled();
+    expect(plugin.mobileLoginPreparation.ready).toBeUndefined();
+    expect(link.fire("click").defaultPrevented).toBe(true);
     expect(harness.request).toHaveBeenCalledOnce();
     expect(harness.open).not.toHaveBeenCalled();
-    expect(harness.notice).not.toHaveBeenCalledWith(expect.stringContaining("登录失败"));
   });
 
-  it("keeps only the latest attempt when restart is clicked repeatedly", async () => {
-    const plugin = await loadPlugin();
+  it("cancels the active authorization and next preparation while preserving existing credentials", async () => {
+    vi.useFakeTimers();
+    const plugin = await preparedPlugin();
+    const existing = JSON.stringify(storedAuth());
+    harness.secrets.set(AUTH_SECRET_ID, existing);
+    // Simulate the next preparation stalling after the first authorization is activated.
+    harness.secrets.delete(AUTH_SECRET_ID);
+    const operation = plugin.login();
     harness.request.mockImplementation(() => new Promise(() => {}));
-    const attempts = [plugin.login(), plugin.relogin(), plugin.relogin()];
     await vi.dynamicImportSettled();
-    expect(harness.request).toHaveBeenCalledOnce();
+    const nextPreparation = plugin.prepareMobileLogin();
+    harness.secrets.set(AUTH_SECRET_ID, existing);
+    tabs.at(-1)!.hide();
     plugin.cancelLogin();
-    await Promise.all(attempts);
+    await Promise.all([operation, nextPreparation]);
     expect(plugin.currentStatus.message).toBe("登录已取消");
+    expect(harness.secrets.get(AUTH_SECRET_ID)).toBe(existing);
+    expect(harness.secrets.get(MOBILE_PENDING_OAUTH_SECRET_ID)).toBe("");
+    expect(plugin.mobileLoginPreparation.ready).toBeUndefined();
+    expect(plugin.mobileLoginPreparation.preparing).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    await plugin.onunload();
   });
 
-  it("restarts with fresh state and ignores an old callback without consuming the new state", async () => {
-    const plugin = await loadPlugin();
-    harness.request.mockResolvedValue({ status: 200, json: { client_id: "mobile-client" } });
-    const first = plugin.login();
-    await vi.waitFor(() => expect(harness.open).toHaveBeenCalledTimes(1));
-    const oldPending = JSON.parse(harness.secrets.get("yunpan-sync-mobile-oauth-pending")!);
-    const account = rows.filter(row => row.name === "请登录 360AI 云盘账号").at(-1)!;
-    const second = account.buttons[0]!.click!();
-    await vi.waitFor(() => expect(harness.open).toHaveBeenCalledTimes(2));
-    await first;
-    const pending = harness.secrets.get("yunpan-sync-mobile-oauth-pending")!;
-    expect(JSON.parse(pending).state).not.toBe(oldPending.state);
-    harness.protocolHandler!({ code: "old-code", state: oldPending.state });
-    await vi.dynamicImportSettled();
-    expect(harness.secrets.get("yunpan-sync-mobile-oauth-pending")).toBe(pending);
-    expect(plugin.pendingAuthorizationUrl).toBe(harness.open.mock.calls[1]![0]);
-    expect(harness.request).toHaveBeenCalledTimes(4);
-    plugin.cancelLogin();
-    await second;
-    harness.protocolHandler!({ code: "late-code", state: JSON.parse(pending).state });
-    await vi.dynamicImportSettled();
-    expect(harness.request).toHaveBeenCalledTimes(4);
-    expect(plugin.auth).toBeUndefined();
-  });
-
-  it("does not let a cancelled token exchange resolve a new mobile login", async () => {
-    const plugin = await loadPlugin();
-    harness.request.mockResolvedValue({ status: 200, json: { client_id: "mobile-client" } });
-    const first = plugin.login();
-    await vi.waitFor(() => expect(harness.open).toHaveBeenCalledTimes(1));
-    const pending = JSON.parse(harness.secrets.get("yunpan-sync-mobile-oauth-pending")!);
-    let resolve!: (value: unknown) => void;
-    harness.request.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
-    harness.protocolHandler!({ code: "old-code", state: pending.state });
-    await vi.waitFor(() => expect(harness.request).toHaveBeenCalledTimes(3));
+  it("restarts with fresh state and rejects old callbacks without consuming the current state", async () => {
+    const plugin = await preparedPlugin();
+    const first = plugin.login(); const oldState = pending().state;
+    await plugin.prepareMobileLogin();
     const second = plugin.relogin();
     await first;
-    await vi.waitFor(() => expect(harness.open).toHaveBeenCalledTimes(2));
-    const newPending = harness.secrets.get("yunpan-sync-mobile-oauth-pending");
+    const newState = pending().state;
+    expect(newState).not.toBe(oldState);
+    harness.protocolHandler!({ code: "old-code", state: oldState });
+    await vi.dynamicImportSettled();
+    expect(pending().state).toBe(newState);
+    expect(harness.request.mock.calls.filter(([request]) => request.url.includes("mobile-exchange"))).toHaveLength(0);
+    tabs.at(-1)!.hide();
+    plugin.cancelLogin(); await second;
+    harness.protocolHandler!({ code: "late-code", state: newState });
+    await vi.dynamicImportSettled();
+    expect(plugin.auth).toBeUndefined();
+    await plugin.onunload();
+  });
+
+  it("does not let a cancelled token exchange resolve the replacement login", async () => {
+    const plugin = await preparedPlugin();
+    const first = plugin.login(); const oldState = pending().state;
+    await plugin.prepareMobileLogin();
+    let resolve!: (value: unknown) => void;
+    harness.request.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    harness.protocolHandler!({ code: "old-code", state: oldState });
+    await vi.dynamicImportSettled();
+    const second = plugin.relogin(); const newState = pending().state;
+    await first; await plugin.prepareMobileLogin();
     resolve({ status: 200, json: { oauth_code: "cancelled-oauth-code" } });
     await vi.dynamicImportSettled();
-    expect(harness.request).toHaveBeenCalledTimes(5);
-    expect(plugin.currentStatus.phase).toBe("login");
     expect(plugin.auth).toBeUndefined();
-    expect(harness.secrets.get("yunpan-sync-mobile-oauth-pending")).toBe(newPending);
-    // The cancelled callback must not block callbacks for the replacement attempt.
+    expect(pending().state).toBe(newState);
     harness.request.mockResolvedValueOnce({ status: 403, json: {} });
-    harness.protocolHandler!({ code: "new-code", state: JSON.parse(newPending!).state });
+    harness.protocolHandler!({ code: "new-code", state: newState });
     await second;
-    expect(plugin.currentStatus).toMatchObject({ phase: "error", message: expect.stringContaining("HTTP 403") });
+    expect(plugin.currentStatus.message).toContain("HTTP 403");
+    expect(plugin.pendingAuthorizationUrl).toBeUndefined();
+    expect(latestRow("浏览器授权").settingEl.hidden).toBe(true);
+    await plugin.onunload();
+  });
+
+  it.each(["iPhone", "Android"])("retains the manual link and copying on %s, then clears them on timeout", async platform => {
+    vi.useFakeTimers();
+    harness.platform.isIosApp = platform === "iPhone";
+    harness.platform.isAndroidApp = platform === "Android";
+    const plugin = await preparedPlugin();
+    const operation = plugin.login();
+    const url = plugin.pendingAuthorizationUrl!;
+    const authorization = latestRow("浏览器授权");
+    const fallback = links.filter(entry => entry.textContent === "打开授权页面").at(-1)!;
+    expect(fallback.attributes).toMatchObject({ href: url, target: "_blank", rel: "noopener noreferrer" });
+    expect(authorization.settingEl.parent?.attributes["aria-label"]).toBe("账号设置");
+    await authorization.buttons[0]!.click!();
+    expect(harness.copy).toHaveBeenCalledWith(url);
+    harness.copy.mockRejectedValueOnce(new Error("Clipboard unavailable"));
+    await authorization.buttons[0]!.click!();
+    expect(harness.notice).toHaveBeenCalledWith("无法自动复制，请长按“打开授权页面”链接复制");
+    await plugin.prepareMobileLogin();
+    await vi.advanceTimersByTimeAsync(180_001);
+    await operation;
+    expect(plugin.currentStatus.message).toContain("授权超时");
+    expect(plugin.pendingAuthorizationUrl).toBeUndefined();
+    expect(authorization.settingEl.hidden).toBe(true);
+    expect(harness.secrets.get(MOBILE_PENDING_OAUTH_SECRET_ID)).toBe("");
+    expect(harness.open).not.toHaveBeenCalled();
+    await plugin.onunload();
+  });
+
+  it("only prepares when login is called without a ready authorization", async () => {
+    mockPreparation();
+    const plugin = await loadPlugin();
+    await plugin.login();
+    expect(plugin.mobileLoginPreparation.ready).toBeDefined();
+    expect(plugin.pendingAuthorizationUrl).toBeUndefined();
+    expect(harness.open).not.toHaveBeenCalled();
+    await plugin.onunload();
   });
 
   it("supports restart and cancel from desktop settings", async () => {
@@ -473,67 +723,6 @@ describe("login settings and installation lifecycle", () => {
     expect(signals[1]!.aborted).toBe(true);
     expect(account.buttons[0]!.label).toBe("登录");
     expect(plugin.currentStatus.message).toBe("登录已取消");
-  });
-
-  it.each([["iPhone", "silent"], ["iPhone", "throws"], ["Android", "silent"], ["Android", "throws"]])("provides a mobile authorization link on %s when browser opening %s", async (platform, behavior) => {
-    vi.useFakeTimers();
-    harness.platform.isIosApp = platform === "iPhone";
-    harness.platform.isAndroidApp = platform === "Android";
-    const plugin = await loadPlugin();
-    harness.request.mockResolvedValueOnce({ status: 200, json: {} })
-      .mockResolvedValueOnce({ status: 201, json: { client_id: "mobile-client" } });
-    let stateWasSavedBeforeOpening = false;
-    harness.open.mockImplementation(() => {
-      stateWasSavedBeforeOpening = Boolean(harness.secrets.get("yunpan-sync-mobile-oauth-pending"));
-      if (behavior === "throws") throw new Error("Native browser unavailable");
-      return null;
-    });
-    const operation = plugin.login();
-    await vi.dynamicImportSettled();
-    // WebCrypto runs outside the fake timer queue.
-    await vi.waitFor(() => expect(harness.open).toHaveBeenCalledOnce());
-    expect(stateWasSavedBeforeOpening).toBe(true);
-    expect(harness.open.mock.calls[0]).toHaveLength(1);
-    const link = links.find((entry) => entry.textContent === "打开授权页面");
-    expect(link).toBeDefined();
-    const url = link!.attributes.href!;
-    expect(new URL(url).origin).toBe("https://mcp.yunpan.com");
-    expect(new URL(url).searchParams.get("login_surface")).toBe("mobile");
-    expect(new URL(url).searchParams.get("code_challenge_method")).toBe("S256");
-    expect(link!.attributes.target).toBe("_blank");
-    expect(link!.attributes.rel).toBe("noopener noreferrer");
-    expect(harness.open).toHaveBeenCalledWith(url);
-    const authorization = rows.find((row) => row.name === "浏览器授权");
-    expect(authorization).toBeDefined();
-    expect(authorization!.settingEl.parent?.attributes["aria-label"]).toBe("账号设置");
-    await authorization!.buttons.find((button) => button.label === "复制授权链接")!.click!();
-    expect(harness.copy).toHaveBeenCalledWith(url);
-    expect(harness.request).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(180_001);
-    await operation;
-    expect(harness.secrets.get("yunpan-sync-mobile-oauth-pending")).toBe("");
-    expect(plugin.pendingAuthorizationUrl).toBeUndefined();
-    expect(authorization!.settingEl.hidden).toBe(true);
-    harness.request.mockResolvedValueOnce({ status: 503, json: {} });
-    await plugin.login();
-    expect(plugin.currentStatus.message).toContain("HTTP 503");
-  });
-
-  it("handles an immediate browser callback and removes the fallback link on exchange failure", async () => {
-    const plugin = await loadPlugin();
-    harness.request.mockResolvedValueOnce({ status: 200, json: {} })
-      .mockResolvedValueOnce({ status: 201, json: { client_id: "mobile-client" } })
-      .mockResolvedValueOnce({ status: 403, json: {} });
-    harness.open.mockImplementation(() => {
-      const pending = JSON.parse(harness.secrets.get("yunpan-sync-mobile-oauth-pending")!) as { state: string };
-      harness.protocolHandler!({ action: "yunpan-sync", code: "returned-code", state: pending.state });
-      return null;
-    });
-    await plugin.login();
-    expect(plugin.currentStatus.phase).toBe("error");
-    expect(plugin.currentStatus.message).toContain("HTTP 403");
-    expect(plugin.pendingAuthorizationUrl).toBeUndefined();
-    expect(harness.secrets.get("yunpan-sync-mobile-oauth-pending")).toBe("");
-    expect(rows.find((row) => row.name === "浏览器授权")!.settingEl.hidden).toBe(true);
+    expect(harness.open).not.toHaveBeenCalled();
   });
 });

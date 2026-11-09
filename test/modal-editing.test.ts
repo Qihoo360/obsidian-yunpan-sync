@@ -112,7 +112,7 @@ vi.mock("obsidian", () => ({
         setValue: (value: string) => { el.value = value; return control; },
         setDisabled: (value: boolean) => { el.disabled = value; return control; },
         setTooltip: () => control, setPlaceholder: () => control, setIcon: () => control,
-        addOption: () => control,
+        addOption: (value: string, label: string) => { el.attributes[`option-${value}`] = label; return control; },
         onChange: (fn: (value: string) => void) => { el.addEventListener("input", () => fn(el.value)); return control; },
         onClick: (fn: () => void) => { el.addEventListener("click", fn); return control; },
       };
@@ -149,6 +149,18 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); });
 
 describe("directory picker interactions", () => {
+  it("keeps the directory footer layout independent from keyboard viewport tracking", async () => {
+    const modal = new RemoteDirectoryModal({} as never, { call: vi.fn().mockResolvedValue(page("Notes")) });
+    void modal.choose(); await settle();
+    const modalEl = modal.modalEl as unknown as Element;
+    expect(modalEl.classes.has("yunpan-sync-viewport-modal")).toBe(false);
+    ui.doc.documentElement.style.setProperty("--keyboard-height", "420px");
+    ui.win.dispatchEvent(new Event("keyboardWillShow")); ui.flushFrames();
+    expect(modalEl.properties.has("--yunpan-visible-height")).toBe(false);
+    expect(button(root(modal), "返回上一层")).toBeDefined();
+    modal.close();
+  });
+
   it("starts at root on each opening, navigates, and selects only on final confirmation", async () => {
     const call = vi.fn().mockResolvedValueOnce(page("Notes")).mockResolvedValueOnce(page("Child"))
       .mockResolvedValueOnce(page("Notes")).mockResolvedValueOnce(page("Notes"));

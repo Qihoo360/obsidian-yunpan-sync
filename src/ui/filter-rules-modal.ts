@@ -31,12 +31,12 @@ export class FilterRulesModal extends Modal {
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: "过滤规则" });
     this.contentEl.createEl("p", {
-      text: "选择不参与同步的文件或文件夹。支持路径和通配符，例如“图片”或“**/*.tmp”；Aa 控制是否区分大小写。",
+      text: "选择参与或不参与同步的文件或文件夹。规则按列表从上到下匹配，最后命中的规则生效；Aa 控制是否区分大小写。",
       cls: "setting-item-description",
     });
     const actions = this.contentEl.createDiv({ cls: "yunpan-sync-filter-actions" });
     actions.createEl("button", { text: "添加规则" }).addEventListener("click", () => {
-      this.rules.unshift({ id: crypto.randomUUID(), enabled: true, pattern: "", caseSensitive: false });
+      this.rules.unshift({ id: crypto.randomUUID(), enabled: true, pattern: "", action: "exclude", caseSensitive: false });
       this.render();
     });
     const list = this.contentEl.createDiv({ cls: "yunpan-sync-filter-list" });
@@ -74,7 +74,9 @@ export class FilterRulesModal extends Modal {
     const setting = new Setting(container).setClass("yunpan-sync-filter-rule")
       .addToggle((toggle) => toggle.setValue(rule.enabled).setTooltip("启用规则")
         .onChange((value) => { rule.enabled = value; }))
-      .addDropdown((dropdown) => dropdown.addOption("exclude", "排除").setValue("exclude"))
+      .addDropdown((dropdown) => dropdown.addOption("exclude", "排除").addOption("include", "包含")
+        .setValue(rule.action === "include" ? "include" : "exclude")
+        .onChange((value) => { rule.action = value === "include" ? "include" : "exclude"; }))
       .addText((text) => text.setPlaceholder("例如：**/*.tmp").setValue(rule.pattern)
         .onChange((value) => { rule.pattern = value; }))
       .addExtraButton((button) => button.setIcon("arrow-up").setTooltip("上移")

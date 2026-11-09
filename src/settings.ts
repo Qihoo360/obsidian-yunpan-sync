@@ -1,10 +1,15 @@
 export type SyncMode = "manual" | "automatic" | "scheduled";
 export type Environment = "production";
 
+export const AUTOMATIC_INTERVAL_MINUTES = 3;
+export const MIN_SCHEDULED_INTERVAL_MINUTES = AUTOMATIC_INTERVAL_MINUTES + 1;
+export const MAX_SCHEDULED_INTERVAL_MINUTES = 1440;
+
 export interface FilterRule {
   id: string;
   enabled: boolean;
   pattern: string;
+  action?: "exclude" | "include";
   caseSensitive: boolean;
 }
 
@@ -25,7 +30,7 @@ export const DEFAULT_FILTER_RULES: readonly FilterRule[] = [
   "**/.codex",
   "**/.opencode",
   "**/.claude",
-].map((pattern, index) => ({ id: `default-${index + 1}`, enabled: true, pattern, caseSensitive: false }));
+].map((pattern, index) => ({ id: `default-${index + 1}`, enabled: true, pattern, action: "exclude" as const, caseSensitive: false }));
 
 export interface PluginSettings {
   environment: Environment;
@@ -65,7 +70,7 @@ function normalizeFilterRules(value: unknown): FilterRule[] | undefined {
     const pattern = typeof source.pattern === "string" ? source.pattern.trim() : "";
     if (!pattern || pattern.length > 512) return [];
     const id = typeof source.id === "string" && source.id.trim() ? source.id.trim() : `rule-${index + 1}`;
-    return [{ id, enabled: source.enabled !== false, pattern,
+    return [{ id, enabled: source.enabled !== false, pattern, action: source.action === "include" ? "include" as const : "exclude" as const,
       caseSensitive: source.caseSensitive === true }];
   });
 }
@@ -74,7 +79,7 @@ function legacyExtensionRules(value: string): FilterRule[] {
   return [...new Set(value.split(/[\s,;，；]+/)
     .map((item) => item.trim().toLowerCase().replace(/^\*?\.?/, ""))
     .filter(Boolean))]
-    .map((extension, index) => ({ id: `legacy-extension-${index + 1}`, enabled: true,
+    .map((extension, index) => ({ id: `legacy-extension-${index + 1}`, enabled: true, action: "exclude" as const,
       pattern: `**/*.${extension}`, caseSensitive: false }));
 }
 
@@ -82,8 +87,7 @@ export function normalizeSettings(input: Partial<PluginSettings> | null | undefi
   const environment = "production" as const;
   const mode: SyncMode = ["manual", "automatic", "scheduled"].includes(input?.mode ?? "")
     ? input!.mode! : "manual";
-  const requested = Number(input?.intervalMinutes ?? 30);
-  const intervalMinutes = Math.min(1440, Math.max(1, Number.isFinite(requested) ? Math.round(requested) : 30));
+  const intervalMinutes = normalizeScheduledInterval(input?.intervalMinutes);
   const excludedExtensions = typeof input?.excludedExtensions === "string" ? input.excludedExtensions : "";
   const persistedRules = normalizeFilterRules(input?.filterRules);
   const filterRules = persistedRules ?? [
@@ -109,8 +113,14 @@ export function ensureDeviceId(settings: PluginSettings, createId: () => string 
   return true;
 }
 
+export function normalizeScheduledInterval(value: unknown): number {
+  const requested = Number(value ?? DEFAULT_SETTINGS.intervalMinutes);
+  return Math.min(MAX_SCHEDULED_INTERVAL_MINUTES, Math.max(MIN_SCHEDULED_INTERVAL_MINUTES,
+    Number.isFinite(requested) ? Math.round(requested) : DEFAULT_SETTINGS.intervalMinutes));
+}
+
 export function pollIntervalMs(settings: PluginSettings): number | undefined {
-  if (settings.mode === "automatic") return 30_000;
+  if (settings.mode === "automatic") return AUTOMATIC_INTERVAL_MINUTES * 60_000;
   if (settings.mode === "scheduled") return settings.intervalMinutes * 60_000;
   return undefined;
 }

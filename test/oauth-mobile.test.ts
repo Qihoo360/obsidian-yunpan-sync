@@ -15,34 +15,31 @@ describe("mobile OAuth", () => {
     let finishRequest!: (value: ReturnType<typeof response>) => void;
     if (stage === "注册授权客户端") requestUrl.mockResolvedValueOnce(response({}));
     requestUrl.mockImplementationOnce(() => new Promise((resolve) => { finishRequest = resolve; }));
-    const open = vi.fn();
     let failure: unknown;
     const operation = new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php")
-      .start(open).catch((error) => { failure = error; });
+      .prepare().catch((error) => { failure = error; });
 
     await vi.advanceTimersByTimeAsync(15_001);
     expect(failure).toBeInstanceOf(Error);
     expect((failure as Error).message).toContain(`${stage}超时`);
     finishRequest(response({ client_id: "late-client" }));
     await operation;
-    expect(open).not.toHaveBeenCalled();
+    expect(requestUrl).toHaveBeenCalledTimes(stage === "注册授权客户端" ? 2 : 1);
   });
 
-  it("reports preparation progress before opening the browser", async () => {
+  it("reports preparation progress and returns a URL without opening a browser", async () => {
     requestUrl.mockResolvedValueOnce(response({})).mockResolvedValueOnce(response({ client_id: "mobile-client" }));
     const progress: string[] = [];
     const oauth = new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php", (message) => progress.push(message));
-    await oauth.start(() => {
-      expect(progress).toEqual(["正在读取授权配置", "正在注册授权客户端", "正在准备安全授权", "正在打开浏览器授权"]);
-    });
+    const prepared = await oauth.prepare();
+    expect(progress).toEqual(["正在读取授权配置", "正在注册授权客户端", "正在准备安全授权"]);
+    expect(new URL(prepared.authorizationUrl).searchParams.get("state")).toBe(prepared.pending.state);
   });
 
   it("identifies the failed request without exposing the response body", async () => {
     requestUrl.mockResolvedValueOnce(response({})).mockResolvedValueOnce(response({ secret: "private-server-body" }, 403));
-    const open = vi.fn();
-    await expect(new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php").start(open))
+    await expect(new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php").prepare())
       .rejects.toThrow("注册授权客户端失败（HTTP 403）");
-    expect(open).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -54,14 +51,14 @@ describe("mobile OAuth", () => {
   ])("rejects untrusted metadata %s=%s", async (field, url) => {
     requestUrl.mockResolvedValueOnce(response({ [field!]: url }))
       .mockResolvedValueOnce(response({ client_id: "mobile-client" }));
-    await expect(new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php").start(vi.fn()))
+    await expect(new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php").prepare())
       .rejects.toThrow("OAuth 服务返回了不受信任的地址");
     expect(requestUrl).toHaveBeenCalledTimes(1);
   });
 
   it("identifies a native network failure without including sensitive error content", async () => {
     requestUrl.mockRejectedValueOnce(new Error("private-native-error"));
-    await expect(new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php").start(vi.fn()))
+    await expect(new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php").prepare())
       .rejects.toThrow("读取授权配置失败：网络请求异常，请检查 Obsidian 的网络权限");
   });
 
@@ -73,14 +70,12 @@ describe("mobile OAuth", () => {
       }))
       .mockResolvedValueOnce(response({ client_id: "mobile-client" }, 201));
 
-    const open = vi.fn();
-    const pending = await new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php").start(open);
+    const { pending, authorizationUrl } = await new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php").prepare();
 
     expect(mobileIssuer("production")).toBe("https://mcp.yunpan.com");
     expect(pending.clientId).toBe("mobile-client");
     expect(pending.verifier.length).toBeGreaterThan(20);
-    expect(open).toHaveBeenCalledOnce();
-    const authorization = new URL(open.mock.calls[0]?.[0] as string);
+    const authorization = new URL(authorizationUrl);
     expect(authorization.origin).toBe("https://mcp.yunpan.com");
     expect(authorization.pathname).toBe("/authorize");
     expect(authorization.searchParams.get("login_surface")).toBe("mobile");
@@ -103,10 +98,9 @@ describe("mobile OAuth", () => {
       }));
 
     const oauth = new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php");
-    const open = vi.fn();
-    const pending = await oauth.start(open);
-    expect(new URL(open.mock.calls[0]?.[0] as string).origin).toBe("https://mcp.yunpan.com");
-    expect(new URL(open.mock.calls[0]?.[0] as string).searchParams.get("login_surface")).toBe("mobile");
+    const { pending, authorizationUrl } = await oauth.prepare();
+    expect(new URL(authorizationUrl).origin).toBe("https://mcp.yunpan.com");
+    expect(new URL(authorizationUrl).searchParams.get("login_surface")).toBe("mobile");
     const auth = await oauth.complete({ action: "yunpan-sync", code: "mcp-code", state: pending.state }, pending);
 
     expect(auth).toMatchObject({ accessToken: "access", qid: "42", token: "cloud-token", oauthCode: "cloud-oauth-code" });
@@ -126,7 +120,7 @@ describe("mobile OAuth", () => {
       .mockResolvedValueOnce(response({ client_id: "mobile-client" }, 201));
 
     const oauth = new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php");
-    const pending = await oauth.start(vi.fn());
+    const { pending } = await oauth.prepare();
     await expect(oauth.complete({ action: "yunpan-sync", code: "mcp-code", state: "wrong" }, pending))
       .rejects.toThrow("OAuth state 校验失败");
     expect(requestUrl).toHaveBeenCalledTimes(2);
@@ -140,7 +134,7 @@ describe("mobile OAuth", () => {
       }))
       .mockResolvedValueOnce(response({ client_id: "mobile-client" }, 201));
     const oauth = new MobileOAuth("production", "https://openapi.eyun.360.cn/intf.php");
-    const pending = await oauth.start(vi.fn());
+    const { pending } = await oauth.prepare();
     await expect(oauth.complete({ action: "yunpan-sync", code: "code", state: pending.state, error: "access_denied" }, pending))
       .rejects.toThrow("OAuth 授权被取消");
     await expect(oauth.complete({ action: "yunpan-sync", code: "code", state: pending.state }, { ...pending, createdAt: 0 }))

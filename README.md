@@ -36,6 +36,8 @@
 5. 保持默认的 **手动** 模式，点击左侧功能区的同步图标，或从命令面板运行 **360AI Cloud Sync: 立即同步**。
 6. 首次同步时检查任务列表，确认无误后继续。
 
+移动端进入设置页会先显示“准备登录…”，准备好后点击“登录”直接打开授权链接。若浏览器未打开，仍可使用“打开授权页面”或复制授权链接；准备失败时点击“重试准备”。
+
 > [!IMPORTANT]
 > 首次同步前请备份 Vault。双向同步会传播删除操作；如果同一路径在两端都有不同内容，插件会保留冲突副本，但备份仍是最稳妥的恢复方式。
 
@@ -44,8 +46,8 @@
 | 模式 | 行为 | 适合场景 |
 | --- | --- | --- |
 | **手动** | 只在点击“立即同步”或运行命令时同步 | 首次安装、按需同步 |
-| **自动** | 监听本地 Vault 变化并防抖处理，同时约每 30 秒检查云端变化 | 多设备持续同步 |
-| **低频自动** | 按设置的分钟间隔执行完整同步 | 希望降低后台请求频率 |
+| **自动** | 本地变化后防抖约 1.5 秒触发同步，同时约每 3 分钟检查云端变化 | 多设备持续同步 |
+| **低频自动** | 按设置的分钟间隔执行完整同步，可设 4–1440 分钟，默认 30 分钟 | 希望降低后台请求频率 |
 
 所有模式都保留 **立即同步** 命令。你也可以随时暂停或恢复同步。
 
@@ -55,7 +57,7 @@
 - **任务预览**：首次同步展示上传、下载、新建目录、删除、重命名和移动等计划任务，可取消不希望执行的项目。
 - **传输进度**：同步弹窗、设置页和右侧状态面板展示总体状态、队列数量以及每个文件的进度条。
 - **失败重试**：可重试单个失败文件或全部失败任务；持久任务会在插件重新启动后恢复。
-- **过滤规则**：可按文件名、目录或通配符排除内容，支持启停、调整顺序和区分大小写；规则同时作用于上传、下载和本地变更监听。
+- **过滤规则**：可按文件名、目录或通配符包含或排除内容，支持启停、调整顺序和区分大小写；规则按列表从上到下匹配，最后命中的规则生效，同时作用于上传、下载和本地变更监听。
 - **完整性校验**：上传和下载使用文件哈希及分块哈希校验，下载完成后再替换目标文件。
 - **同步状态**：状态栏展示当前阶段，内容无变化时会明确提示“本地与云端已是最新”。
 
@@ -73,7 +75,7 @@
 - 默认同步当前 Vault 中除 `.obsidian` 以外的全部文件和文件夹。
 - 可选择同步 `.obsidian` 配置目录；插件自身目录始终排除，避免同步本地数据库、凭据和设备状态。
 - `.trash`、`.yunpan-sync`、系统文件和常见临时文件始终排除。
-- 可按扩展名排除文件，例如 `log, tmp, bak`；规则同时作用于上传和下载。
+- 可按路径和通配符设置“排除”或“包含”规则，例如排除 `Private/**` 后包含 `Private/keep/**`；规则同时作用于上传和下载。
 - 每个 Vault 绑定一个独立的 360AI 云盘目录，可在可视化目录选择器中选择或新建目录。
 
 
@@ -120,6 +122,8 @@ Requires Obsidian **1.11.4 or later** on Desktop, Android, and iOS. If the commu
 5. Keep the default **Manual** mode for the first run. Click the sync ribbon icon, or run **360AI Cloud Sync: Sync now** from the command palette.
 6. Review the planned tasks and continue when they look correct.
 
+On mobile, wait for sign-in preparation to finish, then tap **登录** to open the authorization link directly. If the browser does not open, use **打开授权页面** or copy the link. If preparation fails, tap **重试准备** to retry.
+
 > [!IMPORTANT]
 > Back up your vault before the first sync. Two-way sync propagates deletions. The plugin preserves a conflict copy when both sides contain different content at the same path, but a backup remains the safest recovery option.
 
@@ -128,8 +132,8 @@ Requires Obsidian **1.11.4 or later** on Desktop, Android, and iOS. If the commu
 | Mode | Behavior | Best for |
 | --- | --- | --- |
 | **Manual** | Sync only when you click **Sync now** or run the command | First-time setup and on-demand sync |
-| **Automatic** | Watch debounced local vault events and check remote changes about every 30 seconds | Continuous multi-device sync |
-| **Scheduled** | Run a full sync at the configured interval in minutes | Reducing background request frequency |
+| **Automatic** | Sync local changes after about 1.5 seconds of debounce and check remote changes about every 3 minutes | Continuous multi-device sync |
+| **Scheduled** | Run a full sync every 4–1440 minutes as configured; defaults to 30 minutes | Reducing background request frequency |
 
 The **Sync now** command remains available in every mode. Synchronization can also be paused and resumed at any time.
 
@@ -156,7 +160,7 @@ When both local and remote content have changed since the same baseline, the plu
 - By default, the entire vault is synchronized except for `.obsidian`.
 - You may enable `.obsidian` synchronization. The plugin's own directory is always excluded so its database, credentials, and device state never enter the sync set.
 - `.trash`, `.yunpan-sync`, operating-system metadata, and common temporary files are always excluded.
-- Exclude extensions such as `log, tmp, bak`; the filter applies to both uploads and downloads.
+- Include or exclude paths and wildcards; rules are evaluated from top to bottom and the last match wins. The filter applies to both uploads and downloads.
 - Each vault binds to one 360AI Cloud Disk folder, selected or created through the visual cloud directory picker.
 
 

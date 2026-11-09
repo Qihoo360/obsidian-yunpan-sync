@@ -34,6 +34,18 @@ describe("sync domain contracts", () => {
     expect(shouldIgnorePath("notes/readme.md", { filterRules })).toBe(false);
   });
 
+  it("uses the last matching include or exclude rule", () => {
+    const rules = [
+      { id: "all", enabled: true, pattern: "Private/**", action: "exclude" as const, caseSensitive: false },
+      { id: "keep", enabled: true, pattern: "Private/keep/**", action: "include" as const, caseSensitive: false },
+      { id: "again", enabled: true, pattern: "**/*.secret", action: "exclude" as const, caseSensitive: false },
+    ];
+    expect(shouldIgnorePath("Private/drop.md", { filterRules: rules })).toBe(true);
+    expect(shouldIgnorePath("Private/keep/readme.md", { filterRules: rules })).toBe(false);
+    expect(shouldIgnorePath("Private/keep/password.secret", { filterRules: rules })).toBe(true);
+    expect(shouldIgnorePath("Public/readme.md", { filterRules: rules })).toBe(false);
+  });
+
   it("normalizes a bound remote root", () => {
     expect(normalizeRemoteRoot("Obsidian\\Work")).toBe("/Obsidian/Work/");
     expect(() => normalizeRemoteRoot("../../escape")).toThrow();
