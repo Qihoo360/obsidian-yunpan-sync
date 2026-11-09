@@ -5,6 +5,16 @@ const readProjectFile = (path: string): string =>
   readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
 describe("community release packaging", () => {
+  it("advertises the compiled API baseline for the new release and preserves historical requirements", () => {
+    const manifest = JSON.parse(readProjectFile("manifest.json"));
+    const pkg = JSON.parse(readProjectFile("package.json"));
+    const versions = JSON.parse(readProjectFile("versions.json"));
+    expect(manifest.minAppVersion).toBe("1.11.4");
+    expect(pkg.devDependencies.obsidian).toBe(manifest.minAppVersion);
+    expect(versions[manifest.version]).toBe(manifest.minAppVersion);
+    expect(versions["1.0.3"]).toBe("1.14.4");
+    expect(manifest.isDesktopOnly).toBe(false);
+  });
   it("uses the community-compatible plugin id", () => {
     const manifest = JSON.parse(readProjectFile("manifest.json")) as { id?: string };
 

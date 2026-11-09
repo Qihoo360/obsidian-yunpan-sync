@@ -27,6 +27,8 @@
 
 ### 快速开始
 
+需要 Obsidian **1.11.4 或更高版本**（Desktop、Android、iOS）。市场提示 `No appropriate version found.` 时，请检查 Obsidian 版本并升级；插件获准加载后也会对低版本显示“版本过低，请先升级 obsidian”。
+
 1. 将 `main.js`、`manifest.json` 和 `styles.css` 放入 Vault 的 `.obsidian/plugins/yunpan-sync/` 目录。
 2. 在 Obsidian 的 **设置 → 第三方插件** 中启用 **360AI Cloud Sync**。
 3. 打开插件设置，点击 **登录**，在浏览器中完成 360AI 云盘授权。
@@ -108,6 +110,8 @@
 - **Automatic session renewal**: Reuse the saved OAuth Code when the Access Token expires; ask for browser authorization again only after the OAuth Code itself expires.
 
 ### Quick Start
+
+Requires Obsidian **1.11.4 or later** on Desktop, Android, and iOS. If the community installer reports `No appropriate version found.`, check and upgrade your Obsidian version. The plugin also checks the API version when it is allowed to load.
 
 1. Place `main.js`, `manifest.json`, and `styles.css` in `.obsidian/plugins/yunpan-sync/` inside your vault.
 2. Enable **360AI Cloud Sync** under **Settings → Community plugins** in Obsidian.

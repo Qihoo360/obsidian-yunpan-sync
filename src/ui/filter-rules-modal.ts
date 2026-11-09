@@ -1,8 +1,12 @@
 import { Modal, Setting, type App } from "obsidian";
 import type { FilterRule } from "../settings.js";
+import { trackModalViewport } from "./modal-viewport.js";
 
 export class FilterRulesModal extends Modal {
   private rules: FilterRule[];
+  private stopViewport?: () => void;
+  private saving = false;
+  private opened = false;
 
   constructor(app: App, rules: readonly FilterRule[],
     private readonly save: (rules: FilterRule[]) => Promise<void>) {
@@ -11,8 +15,16 @@ export class FilterRulesModal extends Modal {
   }
 
   onOpen(): void {
+    this.opened = true;
     this.modalEl.addClass("yunpan-sync-filter-modal");
     this.render();
+    this.stopViewport = trackModalViewport(this.modalEl);
+  }
+
+  onClose(): void {
+    this.opened = false;
+    this.stopViewport?.();
+    this.stopViewport = undefined;
   }
 
   private render(): void {
@@ -30,13 +42,31 @@ export class FilterRulesModal extends Modal {
     const list = this.contentEl.createDiv({ cls: "yunpan-sync-filter-list" });
     this.rules.forEach((rule, index) => this.renderRule(list, rule, index));
 
+    const saveError = this.contentEl.createDiv({ cls: "yunpan-sync-editor-error",
+      attr: { role: "alert" } });
     const footer = this.contentEl.createDiv({ cls: "yunpan-sync-modal-footer" });
     footer.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
-    footer.createEl("button", { text: "保存", cls: "mod-cta" }).addEventListener("click", async () => {
+    const saveButton = footer.createEl("button", { text: "保存", cls: "mod-cta" });
+    saveButton.addEventListener("click", async () => {
+      if (this.saving) return;
+      this.saving = true;
+      saveButton.disabled = true;
+      saveError.setText("");
       const rules = this.rules.map((rule) => ({ ...rule, pattern: rule.pattern.trim() }))
         .filter((rule) => rule.pattern.length > 0);
-      await this.save(rules);
-      this.close();
+      const controls = this.contentEl.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLSelectElement>("input, button, select");
+      const enabledControls = Array.from(controls).filter(control => !control.disabled);
+      enabledControls.forEach(control => { control.disabled = true; });
+      try {
+        await this.save(rules);
+        if (this.opened) this.close();
+      } catch (error) {
+        if (this.opened) saveError.setText(`保存失败：${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        this.saving = false;
+        enabledControls.forEach(control => { control.disabled = false; });
+        saveButton.disabled = false;
+      }
     });
   }
 

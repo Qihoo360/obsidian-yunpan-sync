@@ -14,28 +14,60 @@
 
 .yunpan-sync-settings-page {
   max-width: 980px;
-  padding-bottom: 32px;
+  padding: 16px 16px 32px;
+  background: var(--background-secondary-alt, var(--background-secondary));
+  border-radius: 16px;
 }
 
-.yunpan-sync-settings-page > h3 {
+.yunpan-sync-settings-page > .setting-item.mod-heading {
   margin: 34px 0 16px;
   margin-left: 0;
   padding-left: 0;
+  padding-block: 0;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-weight: var(--font-semibold);
   font-size: var(--font-ui-medium);
   letter-spacing: 0;
 }
 
-.yunpan-sync-settings-page > .setting-item {
-  min-height: 76px;
-  margin-bottom: 12px;
-  padding: 16px 20px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
-  background: var(--background-secondary-alt, var(--background-secondary));
+.yunpan-sync-settings-version {
+  margin-top: 12px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  overflow-wrap: anywhere;
 }
 
-.yunpan-sync-settings-page > .setting-item .setting-item-name {
+.yunpan-sync-settings-group {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 16px;
+  background: var(--background-primary);
+  padding: 0 20px;
+}
+
+.yunpan-sync-settings-group > .setting-item {
+  min-height: 76px;
+  margin: 0;
+  padding: 20px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.yunpan-sync-settings-group > .setting-item + .setting-item {
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.yunpan-sync-settings-group .setting-item-name {
   font-size: var(--font-ui-medium);
+}
+
+.yunpan-sync-settings-group .setting-item-info {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .yunpan-sync-remote-root-setting {
@@ -58,7 +90,7 @@
   grid-area: control;
 }
 
-.yunpan-sync-settings-page > .setting-item .setting-item-description {
+.yunpan-sync-settings-group .setting-item-description {
   margin-top: 5px;
   line-height: 1.45;
 }
@@ -72,15 +104,19 @@
   overflow-wrap: anywhere;
 }
 
-.yunpan-sync-settings-page > .setting-item .setting-item-control {
+.yunpan-sync-settings-group .setting-item-control {
   gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
 }
 
-.yunpan-sync-settings-page > .setting-item input[type="text"] {
+.yunpan-sync-settings-group input[type="text"] {
   min-width: min(260px, 38vw);
+  max-width: 100%;
 }
 
-.yunpan-sync-settings-page > .setting-item button:not(.clickable-icon):not(.yunpan-sync-inline-purchase) {
+.yunpan-sync-settings-group button:not(.clickable-icon):not(.yunpan-sync-inline-purchase) {
   min-width: 96px;
 }
 
@@ -103,11 +139,79 @@
 
 .yunpan-sync-filter-modal {
   width: min(880px, calc(100vw - 32px));
-  border-radius: 8px;
+  height: min(720px, calc(var(--yunpan-visible-height, 100dvh) - 24px));
+  border-radius: 16px;
+}
+
+/* Fixed in the visual viewport rather than the keyboard-obscured layout viewport. */
+.modal-container .modal.yunpan-sync-viewport-modal {
+  position: fixed;
+  top: var(--yunpan-visible-center, 50dvh);
+  left: 50%;
+  right: auto;
+  bottom: auto;
+  transform: translate(-50%, -50%);
+  margin: 0;
+  min-height: 0;
+  max-height: calc(var(--yunpan-visible-height, 100dvh) - 24px);
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 16px;
+}
+
+.modal-container .modal.yunpan-sync-viewport-modal > .modal-header {
+  display: none;
+}
+
+.modal-container .modal.yunpan-sync-viewport-modal > .modal-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-height: 0;
+  height: auto;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.yunpan-sync-viewport-insets {
+  position: absolute;
+  visibility: hidden;
+  pointer-events: none;
+  padding-top: var(--safe-area-inset-top, 0px);
+  padding-bottom: var(--safe-area-inset-bottom, 0px);
+}
+
+.yunpan-sync-viewport-modal .yunpan-sync-modal-footer {
+  flex: 0 0 auto;
+}
+
+.yunpan-sync-filter-modal .modal-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.yunpan-sync-filter-modal h2,
+.yunpan-sync-filter-modal .modal-content > .setting-item-description,
+.yunpan-sync-filter-actions,
+.yunpan-sync-filter-modal .yunpan-sync-modal-footer {
+  flex: 0 0 auto;
+}
+
+.yunpan-sync-filter-modal h2,
+.yunpan-sync-directory-modal h2 {
+  margin: 0 0 12px;
 }
 
 .yunpan-sync-filter-list {
-  max-height: min(62vh, 620px);
+  flex: 1;
+  min-height: 0;
   margin-top: 18px;
   overflow: auto;
   overscroll-behavior: contain;
@@ -142,7 +246,7 @@
 }
 
 .yunpan-sync-filter-rule .clickable-icon.is-active {
-  box-shadow: inset 0 0 0 2px #fff;
+  box-shadow: inset 0 0 0 2px var(--interactive-accent);
 }
 
 .yunpan-sync-filter-actions {
@@ -150,18 +254,18 @@
 }
 
 @media (max-width: 680px) {
-  .yunpan-sync-settings-page > .setting-item {
+  .yunpan-sync-settings-group > .setting-item {
     align-items: stretch;
     flex-direction: column;
     gap: 12px;
   }
 
-  .yunpan-sync-settings-page > .setting-item .setting-item-control {
+  .yunpan-sync-settings-group .setting-item-control {
     width: 100%;
     justify-content: flex-end;
   }
 
-  .yunpan-sync-settings-page > .setting-item input[type="text"] {
+  .yunpan-sync-settings-group input[type="text"] {
     min-width: 0;
     flex: 1;
   }
@@ -645,41 +749,33 @@
 
 .yunpan-sync-directory-modal {
   width: min(760px, calc(100vw - 32px));
-  max-height: min(760px, calc(100dvh - 48px));
-  border-radius: 8px;
+  height: min(640px, calc(var(--yunpan-visible-height, 100dvh) - 24px));
+  border-radius: 16px;
 }
 
 .yunpan-sync-directory-modal .modal-content {
   display: flex;
-  min-height: min(560px, calc(100dvh - 96px));
-  max-height: calc(100dvh - 48px);
+  min-height: 0;
+  flex: 1;
   flex-direction: column;
-  overflow-y: auto;
+  overflow: hidden;
 }
 
-.yunpan-sync-directory-breadcrumb {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.yunpan-sync-directory-breadcrumb button {
-  display: inline-grid;
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  place-items: center;
-}
+.yunpan-sync-directory-modal h2 { flex: 0 0 auto; }
 
 .yunpan-sync-directory-path {
+  flex: 0 0 auto;
   min-width: 0;
+  max-height: 3.5em;
+  overflow-y: auto;
   overflow-wrap: anywhere;
   font-family: var(--font-monospace);
   color: var(--text-muted);
+  margin-top: 12px;
 }
 
 .yunpan-sync-directory-list-header {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -691,13 +787,13 @@
 
 .yunpan-sync-directory-list {
   display: block;
-  min-height: 220px;
-  max-height: min(440px, 50vh);
+  min-height: 0;
   flex: 1;
   overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
-  background: var(--background-secondary);
+  background: var(--background-primary);
 }
 
 .yunpan-sync-directory-row {
@@ -750,24 +846,91 @@
   color: var(--text-faint);
 }
 
-.yunpan-sync-directory-list > .setting-item-description {
+.yunpan-sync-directory-list .setting-item-description,
+.yunpan-sync-directory-load-error {
   display: grid;
-  min-height: 220px;
   padding: 28px 12px;
   place-items: center;
   text-align: center;
 }
 
-.yunpan-sync-directory-modal .setting-item {
+.yunpan-sync-directory-create {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 12px;
+  background: var(--background-primary);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.yunpan-sync-directory-create-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.yunpan-sync-directory-create-row input {
+  min-width: 0;
+  width: 100%;
+}
+
+.yunpan-sync-editor-error {
   flex: 0 0 auto;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-error);
+  overflow-wrap: anywhere;
+  max-height: 4em;
+  overflow-y: auto;
+}
+
+.yunpan-sync-editor-error:empty {
+  display: none;
 }
 
 .yunpan-sync-directory-modal .yunpan-sync-modal-footer {
   flex: 0 0 auto;
-  margin-top: 16px;
+  margin-top: 12px;
+}
+
+.yunpan-sync-directory-footer {
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.yunpan-sync-directory-navigation,
+.yunpan-sync-directory-selection {
+  display: flex;
+  gap: 8px;
+}
+
+.yunpan-sync-directory-modal .yunpan-sync-directory-footer button {
+  min-width: 0;
+  width: auto;
+}
+
+@media (max-width: 680px) {
+  .yunpan-sync-settings-page { padding-inline: 8px; }
+  .yunpan-sync-settings-group { padding-inline: 16px; }
+  .yunpan-sync-directory-footer { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .yunpan-sync-directory-navigation,
+  .yunpan-sync-directory-selection { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .yunpan-sync-directory-footer button { width: 100%; }
+  .yunpan-sync-directory-create-row button { width: auto; padding-inline: 10px; }
+  .yunpan-sync-filter-modal,
+  .yunpan-sync-directory-modal { padding: 16px; }
+}
+
+@media (max-height: 480px) {
+  .yunpan-sync-filter-modal .modal-content > .setting-item-description {
+    max-height: 2.8em;
+    overflow-y: auto;
+    margin-block: 4px;
+  }
+  .yunpan-sync-filter-modal h2,
+  .yunpan-sync-directory-modal h2 { margin-bottom: 4px; font-size: var(--font-ui-medium); }
+  .yunpan-sync-filter-actions { margin-top: 4px; }
+  .yunpan-sync-filter-list { margin-top: 6px; }
+  .yunpan-sync-viewport-modal .yunpan-sync-modal-footer { margin-top: 8px; padding-top: 8px; }
 }
 
 .yunpan-sync-side-view {
@@ -941,7 +1104,33 @@
   .yunpan-sync-task-modal .modal-content { min-height: 0; }
 }
 
-/* Match the reference CTA in both themes, including Obsidian's icon controls. */
+.yunpan-sync-compact-viewport.yunpan-sync-filter-modal .modal-content > .setting-item-description {
+  max-height: 2.8em;
+  overflow-y: auto;
+  margin-block: 4px;
+}
+
+.yunpan-sync-compact-viewport h2 { margin-bottom: 4px; font-size: var(--font-ui-medium); }
+.yunpan-sync-compact-viewport .yunpan-sync-filter-actions { margin-top: 4px; }
+.yunpan-sync-compact-viewport .yunpan-sync-filter-list { margin-top: 6px; }
+.yunpan-sync-compact-viewport .yunpan-sync-modal-footer { margin-top: 8px; padding-top: 8px; }
+
+.modal-container .modal.yunpan-sync-tight-viewport {
+  height: calc(var(--yunpan-visible-height) - 8px);
+  max-height: calc(var(--yunpan-visible-height) - 8px);
+  padding: 8px;
+}
+
+.yunpan-sync-tight-viewport.yunpan-sync-filter-modal .modal-content > .setting-item-description,
+.yunpan-sync-tight-viewport .yunpan-sync-filter-actions {
+  display: none;
+}
+
+.yunpan-sync-tight-viewport h2 { margin-bottom: 0; }
+.yunpan-sync-tight-viewport .yunpan-sync-filter-list { margin-top: 4px; }
+.yunpan-sync-tight-viewport .yunpan-sync-modal-footer { margin-top: 4px; padding-top: 4px; }
+
+/* Theme-aware secondary actions; only primary actions use the brand purple. */
 body :is(
   .yunpan-sync-settings-page,
   .yunpan-sync-modal,
@@ -949,13 +1138,11 @@ body :is(
   .yunpan-sync-filter-modal,
   .yunpan-sync-side-view
 ) :is(button, .clickable-icon, .modal-close-button) {
-  --text-color: #fff;
-  --icon-color: #fff;
-  --icon-color-hover: #fff;
-  --icon-color-active: #fff;
-  --icon-color-focused: #fff;
-  color: #fff;
-  background: #8a5bf5;
+  --text-color: var(--text-normal);
+  --icon-color: var(--text-muted);
+  --icon-color-hover: var(--text-normal);
+  color: var(--text-normal);
+  background: var(--background-secondary);
 }
 
 body :is(
@@ -965,7 +1152,7 @@ body :is(
   .yunpan-sync-filter-modal,
   .yunpan-sync-side-view
 ) :is(button, .clickable-icon, .modal-close-button):not(:disabled):not([aria-disabled="true"]):hover {
-  background: #7948df;
+  background: var(--background-modifier-hover);
 }
 
 body :is(
@@ -982,7 +1169,7 @@ body :is(
   .yunpan-sync-filter-modal,
   .yunpan-sync-side-view
 ) :is(button, .clickable-icon, .modal-close-button).mobile-tap:not(:disabled):not([aria-disabled="true"]) {
-  background: #6938cf;
+  background: var(--background-modifier-active-hover);
 }
 
 body :is(
@@ -1003,14 +1190,48 @@ body :is(
   .yunpan-sync-filter-modal,
   .yunpan-sync-side-view
 ) :is(button, .clickable-icon, .modal-close-button):is(:disabled, [aria-disabled="true"]) {
-  color: #fff;
-  background: #8a5bf5;
   opacity: 0.65;
   cursor: not-allowed;
 }
 
-.yunpan-sync-directory-modal .yunpan-sync-directory-row > span {
-  color: inherit;
+body :is(
+  .yunpan-sync-settings-page,
+  .yunpan-sync-modal,
+  .yunpan-sync-directory-modal,
+  .yunpan-sync-filter-modal,
+  .yunpan-sync-side-view
+) button.mod-cta {
+  --text-color: #fff;
+  color: #fff;
+  background: #8a5bf5;
+}
+
+body :is(.yunpan-sync-settings-page, .yunpan-sync-modal, .yunpan-sync-directory-modal,
+  .yunpan-sync-filter-modal, .yunpan-sync-side-view) button.mod-cta:not(:disabled):hover {
+  background: #7948df;
+}
+
+body :is(.yunpan-sync-settings-page, .yunpan-sync-modal, .yunpan-sync-directory-modal,
+  .yunpan-sync-filter-modal, .yunpan-sync-side-view) button.mod-cta:not(:disabled):active {
+  background: #6938cf;
+}
+
+body .yunpan-sync-directory-modal button.yunpan-sync-directory-row {
+  color: var(--text-normal);
+  background: transparent;
+  box-shadow: none;
+}
+
+body .yunpan-sync-directory-modal button.yunpan-sync-directory-row:not(:disabled):hover {
+  background: var(--background-modifier-hover);
+}
+
+body .yunpan-sync-directory-modal button.yunpan-sync-directory-row:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--interactive-accent);
+}
+
+body :is(.yunpan-sync-filter-modal, .yunpan-sync-directory-modal) .modal-close-button {
+  background: transparent;
 }
 
 body .yunpan-sync-settings-page button.yunpan-sync-cancel-login {

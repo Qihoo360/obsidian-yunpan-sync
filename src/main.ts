@@ -8,6 +8,7 @@ import {
   Platform,
   normalizePath,
   requestUrl,
+  requireApiVersion,
   type RequestUrlParam,
   type ButtonComponent,
 } from "obsidian";
@@ -49,9 +50,9 @@ import { RELOGIN_MESSAGE, statusBarDestination } from "./ui/auth-state.js";
 import { interruptSyncForDisconnect, resumeSyncAfterReconnect } from "./sync/connectivity.js";
 import { PluginLifecycleTimers, settleForPause } from "./lifecycle.js";
 import { openVaultPath } from "./ui/open-vault-path.js";
+import { dismissKeyboardOnBlankTap } from "./ui/dismiss-keyboard.js";
 
 const DEBOUNCE_MS = 1500;
-const PLUGIN_BUILD_ID = "mobile-oauth-browser-v2";
 
 function messageOf(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
@@ -82,10 +83,20 @@ export default class YunpanSyncPlugin extends Plugin {
   private loginGeneration = 0;
 
   async onload(): Promise<void> {
-    const persisted = await this.loadData() as Partial<PluginSettings> | null;
+    if (!requireApiVersion(this.manifest.minAppVersion)) {
+      new Notice("版本过低，请先升级 obsidian", 10000);
+      return;
+    }
+    const persisted = await this.loadData() as Partial<PluginSettings> | null | undefined;
     this.settings = normalizeSettings(persisted);
     const createdDeviceId = ensureDeviceId(this.settings);
     this.secrets = new SecretStore(this.app.secretStorage);
+    // Obsidian removes plugin settings on uninstall but retains Secret Storage.
+    // Clear orphaned authorization only on a fresh install, not on every unload.
+    if (persisted == null) {
+      this.secrets.clearAuth();
+      this.secrets.clearPendingOAuth();
+    }
     this.registerObsidianProtocolHandler("yunpan-sync", (params) => {
       void this.handleMobileOAuthCallback(params as Record<string, string>);
     });
@@ -145,6 +156,7 @@ export default class YunpanSyncPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    this.settingTab?.hide();
     this.endLoginAttempt();
     this.lifecycle.dispose();
     if (this.isMobileDevice) await settleForPause(true, this.engine);
@@ -192,7 +204,7 @@ export default class YunpanSyncPlugin extends Plugin {
     this.loginGeneration++;
     this.mobileAuthorizationUrl = undefined;
     this.mobileCallbackState = undefined;
-    this.secrets.clearPendingOAuth();
+    this.secrets?.clearPendingOAuth();
     if (this.mobileLoginWaiter) {
       clearTimeout(this.mobileLoginWaiter.timer);
       this.mobileLoginWaiter.reject(loginCancelledError());
@@ -511,7 +523,7 @@ export default class YunpanSyncPlugin extends Plugin {
 
   async chooseRemoteRoot(): Promise<void> {
     if (!this.api) { new Notice("请先登录 360AI 云盘"); return; }
-    const selected = await new RemoteDirectoryModal(this.app, this.api, this.settings.remoteRoot).choose();
+    const selected = await new RemoteDirectoryModal(this.app, this.api).choose();
     if (selected) await this.setRemoteRoot(selected);
   }
 
@@ -752,6 +764,7 @@ export default class YunpanSyncPlugin extends Plugin {
 }
 
 class YunpanSyncSettingTab extends PluginSettingTab {
+  private stopDismiss?: () => void;
   private statusEl?: HTMLElement;
   private transfersEl?: HTMLElement;
   private loginStatusEl?: HTMLElement;
@@ -761,6 +774,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly owner: YunpanSyncPlugin) { super(app, owner); }
 
   display(): void {
+    this.hide();
     const { containerEl } = this;
     containerEl.empty();
     this.loginButtons = [];
@@ -769,14 +783,12 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     this.authorizationEl = undefined;
     containerEl.addClass("yunpan-sync-settings-page");
     
-    new Setting(containerEl).setName("插件版本")
-      .setDesc(`${this.owner.manifest.version} · ${PLUGIN_BUILD_ID}`);
-
     new Setting(containerEl).setName("账号设置").setHeading();
-    this.renderAccount();
+    this.renderAccount(this.createGroup("账号设置"));
 
     new Setting(containerEl).setName("同步设置").setHeading();
-    const remote = new Setting(containerEl).setName("远程目录")
+    const syncGroup = this.createGroup("同步设置");
+    const remote = new Setting(syncGroup).setName("远程目录")
       .setDesc("请选择云端已有的文件夹，或在选择器中创建新文件夹");
     remote.settingEl.addClass("yunpan-sync-remote-root-setting");
     remote.settingEl.append(remote.descEl);
@@ -788,7 +800,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       button.setButtonText("登录").setCta().onClick(() => void this.startLogin());
     });
 
-    new Setting(containerEl).setName("同步模式")
+    new Setting(syncGroup).setName("同步模式")
       .setDesc(this.owner.isMobileDevice ? "移动端自动同步仅在前台运行，切到后台会暂停；默认手动" : "建议选择自动同步模式，可以实时自动为您同步")
       .addDropdown((dropdown) => {
         dropdown.addOption("manual", "手动");
@@ -799,7 +811,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
           await this.owner.saveSettings();
         });
       });
-    if (this.owner.settings.mode === "scheduled") new Setting(containerEl).setName("同步周期（分钟）")
+    if (this.owner.settings.mode === "scheduled") new Setting(syncGroup).setName("同步周期（分钟）")
       .setDesc("1 至 1440 分钟").addText((text) => {
         text.inputEl.type = "number"; text.inputEl.min = "1"; text.inputEl.max = "1440";
         text.setValue(String(this.owner.settings.intervalMinutes)).onChange(async (value) => {
@@ -808,7 +820,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
         });
       });
     if (this.owner.auth) {
-      const status = new Setting(containerEl).setName("同步状态");
+      const status = new Setting(syncGroup).setName("同步状态");
       this.statusEl = status.descEl;
       if (this.owner.currentStatus.failed > 0) status.addButton((button) => button
         .setButtonText("重试失败任务").onClick(() => void this.owner.retryFailed()));
@@ -816,17 +828,18 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     } else this.statusEl = undefined;
 
     new Setting(containerEl).setName("过滤规则").setHeading();
-    new Setting(containerEl).setName("同步 obsidian 配置")
+    const filterGroup = this.createGroup("过滤规则");
+    new Setting(filterGroup).setName("同步 obsidian 配置")
       .setDesc(".obsidian 为笔记仓库的系统配置，默认关闭，开启后迁移笔记时会自动同步笔记软件配置")
       .addToggle((toggle) => toggle.setValue(this.owner.settings.syncObsidianConfig)
         .onChange((value) => void this.owner.setSyncObsidianConfig(value)));
-    new Setting(containerEl).setName("同步过滤的文件格式")
+    new Setting(filterGroup).setName("同步过滤的文件格式")
       .setDesc("可按文件名、目录或通配符设置不参与同步的内容")
       .addButton((button) => button.setButtonText("编辑规则").onClick(() => this.owner.showFilterRules()));
 
     new Setting(containerEl).setName("同步遇到问题？").setHeading();
     
-    new Setting(containerEl).setName("一键自动修复")
+    new Setting(this.createGroup("同步遇到问题？")).setName("一键自动修复")
       .setDesc("重新检查云端目录和同步记录，用于修复云端文件未显示或同步状态异常。")
       .addButton((button) => button.setButtonText("自动修复").onClick(() => void this.owner.syncNow(true)));
 
@@ -836,7 +849,15 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     welcome.appendText("欢迎使用 ");
     welcome.createEl("strong", { text: "360AI 云盘" });
     welcome.appendText("，让您的笔记永远随身！");
+    containerEl.createDiv({ cls: "yunpan-sync-settings-version",
+      text: `插件版本 ${this.owner.manifest.version}` });
     this.renderLogin();
+    this.stopDismiss = dismissKeyboardOnBlankTap(containerEl);
+  }
+
+  hide(): void {
+    this.stopDismiss?.();
+    this.stopDismiss = undefined;
   }
 
   renderLogin(): void {
@@ -863,9 +884,14 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     if (!this.transfersEl) return;
   }
 
-  private renderAccount(): void {
+  private createGroup(label: string): HTMLElement {
+    return this.containerEl.createDiv({ cls: "yunpan-sync-settings-group",
+      attr: { role: "group", "aria-label": label } });
+  }
+
+  private renderAccount(container: HTMLElement): void {
     if (!this.owner.auth) {
-      const account = new Setting(this.containerEl).setName("请登录 360AI 云盘账号")
+      const account = new Setting(container).setName("请登录 360AI 云盘账号")
         .addButton((button) => {
           this.loginButtons.push(button);
           button.setButtonText("登录").setCta().onClick(() => void this.startLogin());
@@ -879,7 +905,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       this.loginStatusEl = account.descEl;
       const url = this.owner.pendingAuthorizationUrl;
       if (url) {
-        const authorization = new Setting(this.containerEl).setName("浏览器授权")
+        const authorization = new Setting(container).setName("浏览器授权")
           .setDesc("浏览器未自动打开时，点击授权链接；也可复制到 Chrome 或 Safari 中打开。完成授权后请返回 Obsidian。");
         authorization.controlEl.createEl("a", {
           text: "打开授权页面", cls: "external-link",
@@ -893,7 +919,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     }
     const profile = this.owner.profile;
     if (!profile) {
-      new Setting(this.containerEl)
+      new Setting(container)
         .setName(this.owner.profileLoading ? "正在加载账户信息..." : "账号：已登录")
         .setDesc(this.owner.profileError ? `账户信息加载失败：${this.owner.profileError}` : "")
         .addButton((button) => button.setButtonText("退出登录").onClick(() => void this.owner.logout()));
@@ -922,7 +948,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     const storage = profile.totalBytes === undefined
       ? formatStorageCapacity(profile.usedBytes)
       : `${formatStorageCapacity(profile.usedBytes)}/${formatStorageCapacity(profile.totalBytes)}`;
-    const account = new Setting(this.containerEl).setDesc(`存储空间：${storage}`)
+    const account = new Setting(container).setDesc(`存储空间：${storage}`)
       .addButton((button) => button.setButtonText("退出登录").onClick(() => void this.owner.logout()));
     account.nameEl.empty();
     account.nameEl.append(identityEl);
@@ -934,11 +960,12 @@ class YunpanSyncSettingTab extends PluginSettingTab {
 
   private renderProductLinks(): void {
     new Setting(this.containerEl).setName("产品与支持").setHeading();
-    new Setting(this.containerEl).setName("360AI 云盘官网")
+    const group = this.createGroup("产品与支持");
+    new Setting(group).setName("360AI 云盘官网")
       .setDesc("任何设备、随时随地，让文件都实时同步")
       .addButton((button) => button.setButtonText("前往体验").setCta()
         .onClick(() => openProductLink(this.owner.settings.environment, "officialSite")));
-    new Setting(this.containerEl).setName("问题反馈")
+    new Setting(group).setName("问题反馈")
       .setDesc(this.owner.auth ? "欢迎反馈使用问题和改进建议" : "登录后可提交与账号关联的反馈")
       .addButton((button) => button.setButtonText("去反馈")
         .setDisabled(!this.owner.auth)

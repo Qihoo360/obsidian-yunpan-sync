@@ -32,6 +32,19 @@ Desktop、Android 和 iOS 真实设备验收均已通过，记录见本文末尾
 
 验证：325 项自动化测试、生产构建、公开内容检查通过。本次改动已提供本地安装包，尚未记录新版 PC、Android 和 iOS 真机验收结果；下方 1.0.0 的真机记录不代表本版已验收。
 
+## 1.0.4 — 安装兼容与统一界面 / Installation compatibility and unified settings
+
+- 最低 Obsidian 版本调整为 `1.11.4`，与凭据存储 API 引入版本一致；使用该版 API 编译，修复 Android `1.12.7` 因旧门槛 `1.14.4` 无法从市场安装的问题。历史版本要求保持不变。
+- 插件获准加载后检查 API 版本，过低时提示“版本过低，请先升级 obsidian”，不初始化凭据、数据库和同步。市场安装前的提示由 Obsidian 控制。
+- PC 与移动端统一设置分组、目录选择和新建交互；目录选择器每次从根目录打开，新建成功后留在父目录。版本信息在页面底部居中显示。
+- 规则编辑及目录新建使用浏览器视口与 Obsidian 原生键盘高度调整弹窗，保持操作栏可访问；在插件设置页和编辑弹窗轻触空白可收起键盘，不拦截控件或滑动手势。
+- 配置不存在的新安装会清除残留的当前及旧插件登录凭据与待完成授权；正常重启、升级和重新启用保留登录态。
+- 本地简介增加连续中文品牌词 `360AI云盘`。官方目录修改材料见 `docs/community-directory-update.md`；本次没有向官方目录发起 PR，发布插件不会直接改变市场搜索词。
+
+验证：使用 Obsidian `1.11.4` API 完成类型检查；368 项自动化测试通过，覆盖版本门槛、模拟键盘视口与原生高度、轻触/滑动、目录交互和安装登录态。完整 `npm run verify`、发布附件检查与 `git diff --check` 均通过。
+
+设备状态：用户确认 Android Obsidian `1.12.7`、iPhone Obsidian `1.15.0` 的此前手动安装可用；这不是 `1.0.4` 的市场安装或多机型键盘验收。本次未记录 `1.0.4` 真机市场安装和键盘显示/收起验收，模拟测试结果不代表真机通过。
+
 ## 构建与发布 / Build and publish
 
 使用 Node.js 22，在仓库根目录执行：
@@ -39,17 +52,17 @@ Desktop、Android 和 iOS 真实设备验收均已通过，记录见本文末尾
 ```bash
 npm ci --ignore-scripts
 npm run verify
-npm run check:release -- --tag=1.0.3
+npm run check:release -- --tag=1.0.4
 ```
 
 `npm run verify` 包含公开内容检查、测试和生产构建，成功后会生成 `main.js`。
 
 完成下方发布检查后，将本版本提交推送至仓库默认分支，再打开 [创建 GitHub Release](https://github.com/Qihoo360/obsidian-yunpan-sync/releases/new)：
 
-1. 选择包含本次版本修改的提交，创建标签 `1.0.3`，不要添加 `v` 前缀。
-2. Release 标题填写 `1.0.3`，说明使用上方版本说明，并保留实际验证状态和已知限制。
+1. 选择包含本次版本修改的提交，创建标签 `1.0.4`，不要添加 `v` 前缀。
+2. Release 标题填写 `1.0.4`，说明使用上方版本说明，并保留实际验证状态和已知限制。
 3. 将构建自同一提交的 `main.js`、`manifest.json`、`styles.css` 作为独立附件上传，同时附上 `LICENSE` 和 `THIRD_PARTY_NOTICES.md`。
-4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.3`，附件齐全后发布 Release。
+4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.4`，附件齐全后发布 Release。
 
 Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安装文件，只有源码或自动生成的源码压缩包不能替代上述附件。
 
@@ -59,7 +72,7 @@ Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安�
 2. 在真实 Obsidian Desktop、Android 和 iOS 上分别验收生产账号授权、首次任务确认、双向增删改、冲突、断网恢复和退出登录。模拟测试只验证受控协议；未验证平台不得宣称通过。
 3. 首次使用前备份 Vault。生产迁移会清除旧环境登录态与同步基线，并要求重新登录和确认目录，不删除笔记。
 4. 确认版本更新记录、已知限制和[隐私说明](PRIVACY.md)与本次行为相符，并检查仓库和服务链接可用。
-5. 构建后执行 `npm run check:release -- --tag=1.0.3`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
+5. 构建后执行 `npm run check:release -- --tag=1.0.4`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
 6. GitHub Release 上传 `main.js`、`manifest.json`、`styles.css`，同时提供 [LICENSE](LICENSE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。不上传用户设置、数据库、Token 或构建缓存。
 
 ## 隐私与许可 / Privacy and licensing

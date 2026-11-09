@@ -44,7 +44,8 @@ describe("product requirement helpers", () => {
     expect(source).toContain("360AI 云盘");
     expect(source).not.toMatch(/360\s*云盘/);
     expect(metadata.author).toBe("360AI 云盘");
-    expect(metadata.description).toBe("Sync a vault with 360AI Cloud Disk in both directions.");
+    expect(metadata.description).toBe("Sync a vault with 360AI Cloud Disk (360AI云盘) in both directions.");
+    expect(metadata.description).toContain("360AI云盘");
     expect(metadata.description).toContain("360AI Cloud Disk");
     expect(manifest).not.toContain("360 Cloud");
   });
@@ -141,7 +142,7 @@ describe("product requirement helpers", () => {
     expect(controlRule).toContain("grid-template-columns: minmax(0, 1fr)");
   });
 
-  it("uses the reference purple and white labels for buttons across plugin surfaces", () => {
+  it("reserves purple for primary actions and uses neutral directory rows", () => {
     const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
     const buttonRule = styles.match(/body :is\(([^)]*)\) :is\(button, \.clickable-icon, \.modal-close-button\)\s*\{([^}]*)\}/);
 
@@ -149,8 +150,10 @@ describe("product requirement helpers", () => {
     for (const surface of ["settings-page", "modal", "directory-modal", "filter-modal", "side-view"]) {
       expect(buttonRule![1]).toContain(`.yunpan-sync-${surface}`);
     }
-    expect(buttonRule![2]).toContain("background: #8a5bf5");
-    expect(buttonRule![2]).toContain("color: #fff");
+    expect(buttonRule![2]).toContain("background: var(--background-secondary)");
+    expect(buttonRule![2]).toContain("color: var(--text-normal)");
+    expect(styles).toMatch(/button\.mod-cta\s*\{[^}]*background: #8a5bf5/);
+    expect(styles).toMatch(/button\.yunpan-sync-directory-row\s*\{[^}]*background: transparent/);
     expect(styles).toContain(":not(:disabled):not([aria-disabled=\"true\"]):hover");
     expect(styles).toContain(":not(:disabled):not([aria-disabled=\"true\"]):active");
   });
@@ -184,14 +187,16 @@ describe("product requirement helpers", () => {
     expect(modalSource).toContain('header.createSpan({ text: "远程路径" })');
   });
 
-  it("places new-folder controls before the remote directory list", () => {
+  it("keeps the directory list scrollable inside a viewport-bounded modal", () => {
     const modalSource = readFileSync(new URL("../src/ui/remote-directory-modal.ts", import.meta.url), "utf8");
     const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
-    expect(modalSource.indexOf('new Setting(contentEl).setName("新建文件夹")'))
-      .toBeLessThan(modalSource.indexOf('cls: "yunpan-sync-directory-list"'));
+    expect(modalSource).toContain("if (this.newFolderOpen) this.renderNewFolder(list, focusName)");
     const contentRule = styles.match(/\.yunpan-sync-directory-modal \.modal-content\s*\{([^}]*)\}/)?.[1] ?? "";
-    expect(contentRule).toContain("overflow-y: auto");
-    expect(contentRule).toContain("100dvh");
+    const listRule = styles.match(/\.yunpan-sync-directory-list\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(contentRule).toContain("overflow: hidden");
+    expect(contentRule).toContain("min-height: 0");
+    expect(listRule).toContain("overflow: auto");
+    expect(styles).toContain("var(--yunpan-visible-height, 100dvh)");
   });
 
   it("categorizes actionable synchronization errors", () => {
@@ -216,7 +221,7 @@ describe("product requirement helpers", () => {
   it("shows only real synchronization progress and aligns section titles with card content", () => {
     const modalSource = readFileSync(new URL("../src/ui/sync-modal.ts", import.meta.url), "utf8");
     const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
-    const headingRule = styles.match(/\.yunpan-sync-settings-page > h3\s*\{([^}]*)\}/)?.[1] ?? "";
+    const headingRule = styles.match(/\.yunpan-sync-settings-page > \.setting-item\.mod-heading\s*\{([^}]*)\}/)?.[1] ?? "";
 
     expect(modalSource).not.toContain("缓存更新进度");
     expect(modalSource).not.toContain("yunpan-sync-modal-cache-panel");
@@ -226,11 +231,14 @@ describe("product requirement helpers", () => {
 
   it("keeps settings sections visually separated with theme-aware surfaces", () => {
     const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
-    const itemRule = styles.match(/\.yunpan-sync-settings-page > \.setting-item\s*\{([^}]*)\}/)?.[1] ?? "";
-    const headingRule = styles.match(/\.yunpan-sync-settings-page > h3\s*\{([^}]*)\}/)?.[1] ?? "";
+    const itemRule = styles.match(/\.yunpan-sync-settings-group\s*\{([^}]*)\}/)?.[1] ?? "";
+    const headingRule = styles.match(/\.yunpan-sync-settings-page > \.setting-item\.mod-heading\s*\{([^}]*)\}/)?.[1] ?? "";
 
     expect(itemRule).toContain("border: 1px solid var(--background-modifier-border)");
-    expect(itemRule).toContain("var(--background-secondary-alt, var(--background-secondary))");
+    expect(itemRule).toContain("background: var(--background-primary)");
+    expect(styles).toMatch(/\.yunpan-sync-settings-group > \.setting-item \+ \.setting-item\s*\{[^}]*border-top:/);
+    expect(headingRule).toContain("background: transparent");
+    expect(headingRule).toContain("border: 0");
     expect(itemRule).not.toContain("background: white");
     expect(itemRule).not.toContain("background: #fff");
     expect(headingRule).toContain("margin: 34px 0 16px");
@@ -258,11 +266,15 @@ describe("product requirement helpers", () => {
     expect(styles).toMatch(/\.yunpan-sync-side-failure-actions\s*\{[^}]*display:\s*flex/);
   });
 
-  it("shows the loaded plugin version and build identifier", () => {
+  it("shows only the loaded version centered below the welcome message", () => {
     const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-    expect(source).toContain("PLUGIN_BUILD_ID");
+    const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+    expect(source).not.toContain("PLUGIN_BUILD_ID");
+    expect(source).not.toContain("mobile-oauth-browser-v2");
     expect(source).toContain("this.manifest.version");
     expect(source).toContain("插件版本");
+    expect(source.indexOf('cls: "yunpan-sync-settings-version"')).toBeGreaterThan(source.indexOf('cls: "yunpan-sync-welcome"'));
+    expect(styles).toMatch(/\.yunpan-sync-settings-version\s*\{[^}]*text-align: center/);
   });
 
   it("extracts only safe cloud directories from a paged file list", () => {
