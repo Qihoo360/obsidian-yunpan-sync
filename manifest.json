@@ -1,7 +1,7 @@
 {
   "id": "yunpan-sync",
   "name": "360AI Cloud Sync",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "minAppVersion": "1.11.4",
   "description": "Sync a vault with 360AI Cloud Disk (360AI云盘) in both directions.",
   "author": "360AI 云盘",

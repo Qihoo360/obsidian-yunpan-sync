@@ -102,7 +102,7 @@ export class MobileOAuth {
     return json(response, stage);
   }
 
-  async prepare(): Promise<PreparedMobileOAuth> {
+  async prepare(surface: "mobile" | "desktop" = "mobile"): Promise<PreparedMobileOAuth> {
     const metadata = await this.request("读取授权配置", {
       url: `${this.issuer}/.well-known/oauth-authorization-server`,
       method: "GET",
@@ -134,7 +134,8 @@ export class MobileOAuth {
     authorization.searchParams.set("client_id", clientId);
     authorization.searchParams.set("redirect_uri", MOBILE_REDIRECT_URI);
     authorization.searchParams.set("response_type", "code");
-    authorization.searchParams.set("login_surface", "mobile");
+    authorization.searchParams.set("login_surface", surface);
+    if (surface === "desktop") authorization.searchParams.set("completion_mode", "page");
     authorization.searchParams.set("state", state);
     authorization.searchParams.set("code_challenge", await this.step("准备安全授权", () => challenge(verifier)));
     authorization.searchParams.set("code_challenge_method", "S256");
@@ -143,7 +144,7 @@ export class MobileOAuth {
     return { authorizationUrl: authorization.toString(), pending };
   }
 
-  async complete(params: { action?: string; code?: string; state?: string; error?: string }, pending: MobilePendingOAuth): Promise<CloudAuth> {
+  async complete(params: { action?: string; code?: string; state?: string; error?: string }, pending: MobilePendingOAuth, surface: "mobile" | "desktop" = "mobile"): Promise<CloudAuth> {
     if (params.action && params.action !== "yunpan-sync") throw new Error("OAuth 回调协议不匹配");
     if (pending.issuer !== this.issuer) throw new Error("OAuth 环境已切换，请重新登录");
     if (Date.now() - pending.createdAt > MOBILE_PENDING_MAX_AGE_MS) throw new Error("OAuth 授权已超时");
@@ -152,7 +153,7 @@ export class MobileOAuth {
     if (!params.code) throw new Error("OAuth 回调缺少授权码");
     const code = params.code;
     const response = await withLoginCancellation(() => requestUrl({
-      url: `${pending.issuer}/oauth/360/mobile-exchange`,
+      url: `${pending.issuer}/oauth/360/${surface === "desktop" ? "exchange" : "mobile-exchange"}`,
       method: "POST",
       headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
       body: form({ client_id: pending.clientId, code, redirect_uri: MOBILE_REDIRECT_URI, code_verifier: pending.verifier }),

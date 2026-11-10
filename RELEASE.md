@@ -2,6 +2,17 @@
 
 仓库：[Qihoo360/obsidian-yunpan-sync](https://github.com/Qihoo360/obsidian-yunpan-sync)
 
+## 1.0.6 — 同步预检查与桌面授权 / Sync preflight and desktop authorization
+
+- 修复主按钮悬停、按下时的颜色优先级，统一紫底白字并逐级加深，覆盖设置、同步弹窗、目录选择器、规则弹窗及侧边栏。
+- 新安装和缺少或无效设置时默认自动同步，升级保留已保存的有效模式；首次同步确认和移动端仅前台同步保持不变。
+- 会员到期明确展示“会员已过期”，提供续费入口；移动端续费和扩容打开专用支付页面。
+- 每次同步刷新账户信息，在文件操作前检查套餐有效期及本次计划新增容量。覆盖正增长、冲突副本、所选任务和重试去重；过期、容量不足或上传容量信息不可靠时保留任务并提供操作入口，自动同步避免重复弹窗。
+- 改进文件与目录类型冲突、整棵目录冲突及重命名规划，避免预检查前改变文件；区分云端容量限制与本地磁盘不足。
+- 桌面 OAuth 改为动态注册、PKCE 和 Obsidian 协议回跳，授权后展示 HTTPS 通用完成页，无需本机 HTTP 回调服务；移动端保持原授权流程。
+
+验证：Android、iOS 真机验证均已通过，由用户于 2026-11-10 确认。本地 435 项测试（34 个文件）、类型检查、生产构建、公开内容及发布附件检查通过；GitHub CI 状态可在仓库 Actions 中查看。生产授权元数据及桌面兑换端点已确认可达。桌面 Safari/Chrome 完整授权链路尚未记录本版实测结果。
+
 ## 1.0.5 — Android 设置页兼容 / Android settings compatibility
 
 - 自动模式云端检查由每 30 秒调整为每 3 分钟；本地文件变化仍在防抖约 1.5 秒后触发同步。
@@ -65,17 +76,17 @@ Desktop、Android 和 iOS 真实设备验收均已通过，记录见本文末尾
 ```bash
 npm ci --ignore-scripts
 npm run verify
-npm run check:release -- --tag=1.0.5
+npm run check:release -- --tag=1.0.6
 ```
 
 `npm run verify` 包含公开内容检查、测试和生产构建，成功后会生成 `main.js`。
 
 完成下方发布检查后，将本版本提交推送至仓库默认分支，再打开 [创建 GitHub Release](https://github.com/Qihoo360/obsidian-yunpan-sync/releases/new)：
 
-1. 选择包含本次版本修改的提交，创建标签 `1.0.5`，不要添加 `v` 前缀。
-2. Release 标题填写 `1.0.5`，说明使用上方版本说明，并保留实际验证状态和已知限制。
+1. 选择包含本次版本修改的提交，创建标签 `1.0.6`，不要添加 `v` 前缀。
+2. Release 标题填写 `1.0.6`，说明使用上方版本说明，并保留实际验证状态和已知限制。
 3. 将构建自同一提交的 `main.js`、`manifest.json`、`styles.css` 作为独立附件上传，同时附上 `LICENSE` 和 `THIRD_PARTY_NOTICES.md`。
-4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.5`，附件齐全后发布 Release。
+4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.6`，附件齐全后发布 Release。
 
 Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安装文件，只有源码或自动生成的源码压缩包不能替代上述附件。
 
@@ -85,7 +96,7 @@ Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安�
 2. 在真实 Obsidian Desktop、Android 和 iOS 上分别验收生产账号授权、首次任务确认、双向增删改、冲突、断网恢复和退出登录。模拟测试只验证受控协议；未验证平台不得宣称通过。
 3. 首次使用前备份 Vault。生产迁移会清除旧环境登录态与同步基线，并要求重新登录和确认目录，不删除笔记。
 4. 确认版本更新记录、已知限制和[隐私说明](PRIVACY.md)与本次行为相符，并检查仓库和服务链接可用。
-5. 构建后执行 `npm run check:release -- --tag=1.0.5`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
+5. 构建后执行 `npm run check:release -- --tag=1.0.6`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
 6. GitHub Release 上传 `main.js`、`manifest.json`、`styles.css`，同时提供 [LICENSE](LICENSE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。不上传用户设置、数据库、Token 或构建缓存。
 
 ## 隐私与许可 / Privacy and licensing
@@ -103,3 +114,5 @@ The MIT license covers this code. Cloud services, membership, trademarks, and se
 | Desktop | passed（通过） | 1.0.0 | 用户确认 |
 | Android | passed（通过） | 1.0.0 | 用户确认 |
 | iOS | passed（通过） | 1.0.0 | 用户确认 |
+| Android | passed（通过） | 1.0.6 | 用户于 2026-11-10 确认移动端真机验证通过 |
+| iOS | passed（通过） | 1.0.6 | 用户于 2026-11-10 确认移动端真机验证通过 |

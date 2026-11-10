@@ -16,6 +16,7 @@ export interface SyncModalOwner {
   hideSyncProgress(modal: SyncProgressModal): void;
   retryTask(id: string): Promise<void>;
   removeFailedTask(id: string): Promise<void>;
+  resolveSyncRestriction?(): Promise<void>;
 }
 
 export class SyncProgressModal extends Modal {
@@ -151,6 +152,10 @@ export class SyncProgressModal extends Modal {
   private renderFooter(finished: boolean): void {
     const footer = this.footerEl!;
     footer.empty();
+    const restriction = this.owner.currentStatus.restriction;
+    if (restriction) footer.createEl("button", { cls: "mod-cta",
+      text: restriction.kind === "membership" ? "去续费" : restriction.kind === "capacity" ? "去扩容" : "刷新后重试" })
+      .addEventListener("click", () => void this.owner.resolveSyncRestriction?.());
     if (!finished) footer.createEl("button", { text: "停止同步", cls: "mod-warning" })
       .addEventListener("click", () => this.owner.cancelSync());
     footer.createEl("button", { text: finished ? "关闭" : "隐藏" })

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { requestUrl } from "./obsidian.js";
 
 import { StoreClient } from "../src/transfer/store-client.js";
+import { classifySyncError } from "../src/sync/error-guidance.js";
 
 const client = () => new StoreClient("https://up1.yunpan.360.cn/intf.php", {
   qid: "123",
@@ -65,6 +66,17 @@ describe("StoreClient common protocol fields", () => {
       rtick: "1700000000000",
       sign: expectedSign("Download.downloadBlockV2"),
     });
+  });
+
+  it("preserves the server origin of capacity errors instead of reporting a local disk error", async () => {
+    requestUrl.mockResolvedValue({ status: 200, text: '{"errno":2007,"errmsg":"空间不足"}' });
+    try { await client().callJson("Upload.uploadFile", {}, new Uint8Array([1])); }
+    catch (error) {
+      expect(classifySyncError(error).category).toBe("cloud-capacity");
+      expect(error).toMatchObject({ errno: 2007 });
+      return;
+    }
+    throw new Error("Expected cloud capacity rejection");
   });
 
   

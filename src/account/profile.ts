@@ -12,6 +12,10 @@ export interface AccountProfile {
   expiresAt?: number;
   usedBytes?: number;
   totalBytes?: number;
+  availableBytes?: number;
+  enterpriseUsedBytes?: number;
+  enterpriseTotalBytes?: number;
+  enterpriseAvailableBytes?: number;
 }
 
 function text(value: unknown): string | undefined {
@@ -21,7 +25,7 @@ function text(value: unknown): string | undefined {
 }
 
 function nonNegativeNumber(value: unknown): number | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
+  if ((typeof value !== "number" && typeof value !== "string") || String(value).trim() === "") return undefined;
   const result = Number(value);
   return Number.isFinite(result) && result >= 0 ? result : undefined;
 }
@@ -49,8 +53,14 @@ export function normalizeAccountProfile(data: Record<string, unknown>, qid: stri
     ?? usableIdentity(data.name, qid);
   const username = usableIdentity(data.userName, qid) ?? usableIdentity(data.username, qid);
   const isVip = truthyFlag(data.is_vip);
-  const usedBytes = nonNegativeNumber(data.used_size) ?? nonNegativeNumber(data.e_used_size);
-  const totalBytes = nonNegativeNumber(data.total_size) ?? nonNegativeNumber(data.e_total_size);
+  const usedBytes = nonNegativeNumber(data.used_size);
+  const totalBytes = nonNegativeNumber(data.total_size);
+  const availableBytes = nonNegativeNumber(data.available_size);
+  const enterprise = data.enterprise && typeof data.enterprise === "object"
+    ? data.enterprise as Record<string, unknown> : undefined;
+  const enterpriseUsedBytes = nonNegativeNumber(enterprise?.used_size) ?? nonNegativeNumber(data.e_used_size);
+  const enterpriseTotalBytes = nonNegativeNumber(enterprise?.total_size) ?? nonNegativeNumber(data.e_total_size);
+  const enterpriseAvailableBytes = nonNegativeNumber(enterprise?.available_size) ?? nonNegativeNumber(data.e_available_size);
   return {
     displayName,
     qid,
@@ -65,6 +75,10 @@ export function normalizeAccountProfile(data: Record<string, unknown>, qid: stri
     expiresAt: epochMilliseconds(data.expire),
     usedBytes,
     totalBytes,
+    ...(availableBytes === undefined ? {} : { availableBytes }),
+    ...(enterpriseUsedBytes === undefined ? {} : { enterpriseUsedBytes }),
+    ...(enterpriseTotalBytes === undefined ? {} : { enterpriseTotalBytes }),
+    ...(enterpriseAvailableBytes === undefined ? {} : { enterpriseAvailableBytes }),
   };
 }
 

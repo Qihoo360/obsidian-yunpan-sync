@@ -51,7 +51,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   environment: "production",
   openapiBaseUrl: "https://openapi.eyun.360.cn/intf.php",
   remoteRoot: "/Obsidian/",
-  mode: "manual",
+  mode: "automatic",
   intervalMinutes: 30,
   paused: false,
   deviceId: "",
@@ -86,7 +86,7 @@ function legacyExtensionRules(value: string): FilterRule[] {
 export function normalizeSettings(input: Partial<PluginSettings> | null | undefined): PluginSettings {
   const environment = "production" as const;
   const mode: SyncMode = ["manual", "automatic", "scheduled"].includes(input?.mode ?? "")
-    ? input!.mode! : "manual";
+    ? input!.mode! : "automatic";
   const intervalMinutes = normalizeScheduledInterval(input?.intervalMinutes);
   const excludedExtensions = typeof input?.excludedExtensions === "string" ? input.excludedExtensions : "";
   const persistedRules = normalizeFilterRules(input?.filterRules);

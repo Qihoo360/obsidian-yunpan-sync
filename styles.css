@@ -1250,12 +1250,16 @@ body :is(
 }
 
 body :is(.yunpan-sync-settings-page, .yunpan-sync-modal, .yunpan-sync-directory-modal,
-  .yunpan-sync-filter-modal, .yunpan-sync-side-view) button.mod-cta:not(:disabled):hover {
+  .yunpan-sync-filter-modal, .yunpan-sync-side-view) :is(button.mod-cta, a.yunpan-sync-login-link):not(:disabled):not([aria-disabled="true"]):hover {
+  color: #fff;
   background: #7948df;
 }
 
 body :is(.yunpan-sync-settings-page, .yunpan-sync-modal, .yunpan-sync-directory-modal,
-  .yunpan-sync-filter-modal, .yunpan-sync-side-view) button.mod-cta:not(:disabled):active {
+  .yunpan-sync-filter-modal, .yunpan-sync-side-view) :is(button.mod-cta, a.yunpan-sync-login-link):not(:disabled):not([aria-disabled="true"]):active,
+body :is(.yunpan-sync-settings-page, .yunpan-sync-modal, .yunpan-sync-directory-modal,
+  .yunpan-sync-filter-modal, .yunpan-sync-side-view) :is(button.mod-cta, a.yunpan-sync-login-link).mobile-tap:not(:disabled):not([aria-disabled="true"]) {
+  color: #fff;
   background: #6938cf;
 }
 

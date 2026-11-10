@@ -1,5 +1,6 @@
 import { SyncDatabase, type SyncTask, type TaskKind } from "../storage/database.js";
 import { OpenApiError } from "../net/openapi-client.js";
+import { syncRestrictionError } from "./quota.js";
 
 export type TaskExecutor = (task: SyncTask) => Promise<void>;
 
@@ -23,6 +24,7 @@ export class TaskRunner {
   private readonly checkpoint: () => Promise<void>;
   private readonly shouldCancel: () => boolean;
   private readonly concurrency: number;
+  private stopped = false;
 
   constructor(
     private readonly database: SyncDatabase,
@@ -40,7 +42,7 @@ export class TaskRunner {
   }
 
   async runOne(): Promise<boolean> {
-    if (this.shouldCancel()) return false;
+    if (this.stopped || this.shouldCancel()) return false;
     const task = this.database.claimNextRunnableTask(this.now(), this.kinds);
     if (!task) return false;
     const execute = this.executors[task.kind];
@@ -60,6 +62,13 @@ export class TaskRunner {
       
       await this.checkpoint();
     } catch (error) {
+      const restriction = syncRestrictionError(error);
+      if (restriction) {
+        this.stopped = true;
+        this.database.deferTask(task.id, restriction.message);
+        await this.checkpoint();
+        throw restriction;
+      }
       const message = error instanceof Error ? error.message : String(error);
       const nextAttempt = task.attempt + 1;
       this.database.failTask(task.id, message,
@@ -78,6 +87,7 @@ export class TaskRunner {
   }
 
   async drain(limit = Number.POSITIVE_INFINITY): Promise<number> {
+    this.stopped = false;
     let reserved = 0;
     let processed = 0;
     const worker = async (): Promise<void> => {
@@ -90,7 +100,9 @@ export class TaskRunner {
         processed++;
       }
     };
-    await Promise.all(Array.from({ length: this.concurrency }, () => worker()));
+    const outcomes = await Promise.allSettled(Array.from({ length: this.concurrency }, () => worker()));
+    const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+    if (failure) throw failure.reason;
     return processed;
   }
 

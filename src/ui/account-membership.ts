@@ -54,12 +54,24 @@ export function hasActiveMembership(profile: AccountProfile, now = Date.now()): 
   return profile.isVip && (profile.expiresAt === undefined || profile.expiresAt > now);
 }
 
-export function membershipDisplay(profile: AccountProfile): MembershipDisplay {
-  const storage = profile.totalBytes === undefined
-    ? formatStorageCapacity(profile.usedBytes)
-    : `${formatStorageCapacity(profile.usedBytes)}/${formatStorageCapacity(profile.totalBytes)}`;
+export function hasExpiredMembership(profile: AccountProfile, now = Date.now()): boolean {
+  return profile.expiresAt !== undefined && profile.expiresAt <= now;
+}
+
+export function membershipLabel(profile: AccountProfile, now = Date.now()): string {
+  if (hasActiveMembership(profile, now)) return profile.vipLabel;
+  if (hasExpiredMembership(profile, now)) return "会员已过期";
+  return "普通用户";
+}
+
+export function membershipDisplay(profile: AccountProfile, now = Date.now()): MembershipDisplay {
+  const usedBytes = profile.usedBytes ?? profile.enterpriseUsedBytes;
+  const totalBytes = profile.totalBytes ?? profile.enterpriseTotalBytes;
+  const storage = totalBytes === undefined
+    ? formatStorageCapacity(usedBytes)
+    : `${formatStorageCapacity(usedBytes)}/${formatStorageCapacity(totalBytes)}`;
   return {
-    status: { label: "会员状态", value: profile.vipLabel, renewal: true },
+    status: { label: "会员状态", value: membershipLabel(profile, now), renewal: true },
     details: [
       { label: "到期时间", value: profile.expiresAt ? new Date(profile.expiresAt).toLocaleString() : "无到期时间" },
       { label: "存储空间", value: storage },

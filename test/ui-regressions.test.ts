@@ -68,6 +68,7 @@ vi.mock("../src/storage/persistence.js", () => ({ DatabasePersistence: {} }));
 import YunpanSyncPlugin from "../src/main.js";
 import { YunpanStatusView, type StatusViewOwner } from "../src/ui/status-view.js";
 import { SyncTaskPreviewModal } from "../src/ui/sync-modal.js";
+import type { EngineStatus } from "../src/sync/engine.js";
 
 function harness(hasFile: () => Promise<boolean> = async () => false) {
   const owner = {
@@ -192,6 +193,24 @@ describe("local file availability through the plugin", () => {
     } } as never, {} as never);
     const owner = plugin as unknown as { hasVaultFile(path: string): Promise<boolean> };
     expect(await owner.hasVaultFile("notes/file.md")).toBe(false);
+  });
+});
+
+describe("sync restriction actions", () => {
+  it.each([["membership", "去续费"], ["capacity", "去扩容"], ["unknown", "刷新后重试"]] as const)("renders an explicit %s action in the sidebar", async (kind, label) => {
+    const { view, root, owner } = harness();
+    const resolveSyncRestriction = vi.fn(async () => undefined);
+    Object.assign(owner, { resolveSyncRestriction });
+    const currentStatus: EngineStatus = { phase: "error", message: "blocked", queued: 1, failed: 0,
+      restriction: { kind, message: "blocked", remainingBytes: 1, requiredBytes: 2 } };
+    Object.assign(owner, { currentStatus, conflicts: [] });
+    await view.onOpen();
+    const button = root.all().find(el => el.tag === "button" && el.text === label)!;
+    expect(button).toBeDefined();
+    expect(resolveSyncRestriction).not.toHaveBeenCalled();
+    button.listeners.get("click")!();
+    expect(resolveSyncRestriction).toHaveBeenCalledOnce();
+    await view.onClose();
   });
 });
 

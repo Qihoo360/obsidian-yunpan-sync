@@ -7,7 +7,8 @@ import {
   parseRemoteDirectoryPage,
   summarizeRemoteDirectoryResponse,
 } from "../src/ui/remote-directory.js";
-import { feedbackUrl, openFeedbackLink, openProductLink, productLinks } from "../src/ui/product-links.js";
+import { feedbackUrl, openFeedbackLink, openProductLink, productLinks, membershipPaymentUrl } from "../src/ui/product-links.js";
+import { SyncPreflightError } from "../src/sync/quota.js";
 import { WindowsPathError } from "../src/domain/paths.js";
 
 describe("product requirement helpers", () => {
@@ -212,8 +213,8 @@ describe("product requirement helpers", () => {
   it("categorizes actionable synchronization errors", () => {
     expect(classifySyncError(new Error("ENOSPC: no space left on device"))).toEqual({
       category: "space",
-      title: "存储空间不足",
-      detail: "存储空间不足，请清理不需要的文件或扩容后重试。",
+      title: "本地存储空间不足",
+      detail: "本地磁盘空间不足，请清理设备存储后重试。",
     });
     expect(classifySyncError(new Error("HTTP 403 permission denied")).category).toBe("permission");
     expect(classifySyncError(new Error("EBUSY file is being used")).category).toBe("occupied");
@@ -264,11 +265,11 @@ describe("product requirement helpers", () => {
     expect(androidRule).toContain("scroll-padding-top: 24px");
   });
 
-  it("offers all sync modes on mobile while keeping manual as the default", () => {
+  it("offers all sync modes on mobile while defaulting new installs to automatic", () => {
     const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
     const settings = readFileSync(new URL("../src/settings.ts", import.meta.url), "utf8");
 
-    expect(settings).toContain('mode: "manual"');
+    expect(settings).toContain('mode: "automatic"');
     expect(source).toContain('dropdown.addOption("automatic", "自动同步");');
     expect(source).toContain('dropdown.addOption("scheduled", "低频自动");');
     expect(source).not.toContain('this.settings.mode = "manual"');
@@ -414,6 +415,7 @@ describe("product requirement helpers", () => {
   it("uses the confirmed production product and renewal links", () => {
     expect(productLinks("production")).toEqual({
       renewal: "https://www.yunpan.com/file/index?default_show_renew=1",
+      capacity: "https://www.yunpan.com/mapp/pay",
       officialSite: "https://www.yunpan.com/",
       download: "https://yunpan.360.cn/disk/download1.html",
     });
@@ -424,6 +426,20 @@ describe("product requirement helpers", () => {
 
     expect(openProductLink("production", "officialSite", open)).toBe(true);
     expect(open).toHaveBeenCalledWith("https://www.yunpan.com/", "_blank", "noopener,noreferrer");
+  });
+
+  it("keeps mobile payment on mapp and desktop payment on the website", () => {
+    expect(membershipPaymentUrl("production", true)).toBe("https://www.yunpan.com/mapp/pay");
+    expect(membershipPaymentUrl("production", false)).toBe("https://www.yunpan.com/file/index?default_show_renew=1");
+  });
+
+  it("distinguishes membership, cloud quota and local disk errors without discarding numeric details", () => {
+    const error = new SyncPreflightError("capacity", "套餐容量不足，剩余 1 B，本次同步预计新增占用 2 B。", 1, 2);
+    expect(classifySyncError(error)).toMatchObject({ category: "cloud-capacity", detail: error.message });
+    expect(classifySyncError(error.message).detail).toBe(error.message);
+    expect(classifySyncError(new OpenApiError("个人空间不足", 2007)).category).toBe("cloud-capacity");
+    expect(classifySyncError(new OpenApiError("您的套餐已过期")).category).toBe("membership");
+    expect(classifySyncError(new Error("ENOSPC")).category).toBe("space");
   });
 
   it("builds the production feedback URL with the current qid", () => {

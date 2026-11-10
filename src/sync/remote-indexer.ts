@@ -58,6 +58,14 @@ function finiteNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(number) ? number : fallback;
 }
 
+// Keep unknown file sizes distinct from real empty files in the persisted index.
+// Quota preflight rejects this sentinel when an overwrite needs the old size.
+function fileSize(value: unknown): number {
+  if ((typeof value !== "string" && typeof value !== "number") || String(value).trim() === "") return -1;
+  const size = Number(value);
+  return Number.isFinite(size) && size >= 0 ? size : -1;
+}
+
 function resolveNodes(raw: RawNode[]): RemoteNode[] {
   const byId = new Map<string, RawNode>();
   for (const node of raw) {
@@ -99,7 +107,7 @@ function resolveNodes(raw: RawNode[]): RemoteNode[] {
       nid: String(node.nid), pid: String(node.pid ?? "0"), path,
       name: String(node.name ?? node.fname), isDir: node.is_dir === true || Number(node.is_dir ?? node.type) === 1,
       version: finiteNumber(node.version ?? node.ver ?? node.nv), hash: node.fhash ?? node.hash ?? node.file_hash,
-      size: finiteNumber(node.fsize ?? node.size ?? node.count_size),
+      size: node.is_dir === true || Number(node.is_dir ?? node.type) === 1 ? 0 : fileSize(node.fsize ?? node.size ?? node.count_size),
       mtime: finiteNumber(node.fmtime ?? node.mtime ?? node.modify_time),
       status: node.status === undefined ? undefined : finiteNumber(node.status),
     }];

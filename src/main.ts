@@ -44,10 +44,11 @@ import type { SyncConflict, SyncTask } from "./storage/database.js";
 import { RemoteDirectoryModal } from "./ui/remote-directory-modal.js";
 import { YUNPAN_STATUS_VIEW, YunpanStatusView } from "./ui/status-view.js";
 import { classifySyncError } from "./sync/error-guidance.js";
-import { openFeedbackLink, openProductLink } from "./ui/product-links.js";
+import { openFeedbackLink, openProductLink, openMembershipPayment } from "./ui/product-links.js";
+import { SyncPreflightError } from "./sync/quota.js";
 
 
-import { hasActiveMembership, membershipIcon } from "./ui/account-membership.js";
+import { hasActiveMembership, membershipIcon, membershipLabel } from "./ui/account-membership.js";
 import { FilterRulesModal } from "./ui/filter-rules-modal.js";
 import { RELOGIN_MESSAGE, statusBarDestination } from "./ui/auth-state.js";
 import { interruptSyncForDisconnect, resumeSyncAfterReconnect } from "./sync/connectivity.js";
@@ -77,6 +78,7 @@ export default class YunpanSyncPlugin extends Plugin {
   private syncUiHidden = false;
   private removingFailure = false;
   private displayedSyncWarnings = new Set<string>();
+  private lastRestrictionWarning?: string;
   private expiredAuthQid?: string;
   private readonly lifecycle = new PluginLifecycleTimers();
   private mobileLoginWaiter?: { resolve: (auth: CloudAuth) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
@@ -290,7 +292,24 @@ export default class YunpanSyncPlugin extends Plugin {
         const { DesktopOAuth } = await import("./auth/oauth-desktop.js");
         if (!current()) return;
         const oauth = new DesktopOAuth(this.settings.environment, this.settings.openapiBaseUrl);
-        auth = await oauth.login((url) => window.open(url, "_blank"), 180_000, attempt.signal);
+        const preparedDesktop = await oauth.prepare(attempt.signal);
+        if (!current()) return;
+        this.secrets.setPendingOAuth(preparedDesktop.pending);
+        this.mobileAuthorizationUrl = preparedDesktop.authorizationUrl;
+        const authorization = new Promise<CloudAuth>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            if (!current() || this.mobileLoginWaiter?.timer !== timer) return;
+            this.mobileLoginWaiter = undefined;
+            this.secrets.clearPendingOAuth();
+            reject(new Error("等待云盘 OAuth 授权超时"));
+          }, 180_000);
+          this.mobileLoginWaiter = { resolve, reject, timer };
+        });
+        this.updateStatus({ phase: "login", message: "等待浏览器授权", queued: 0, failed: 0 });
+        this.settingTab?.display();
+        try { window.open(preparedDesktop.authorizationUrl, "_blank"); }
+        catch (error) { throw error instanceof Error ? error : new Error(String(error)); }
+        auth = await authorization;
       }
       if (!current()) return;
       if (previousQid && previousQid !== auth.qid) this.persistence?.database.resetSyncState();
@@ -355,10 +374,16 @@ export default class YunpanSyncPlugin extends Plugin {
     this.settingTab?.renderLogin();
     this.secrets.clearPendingOAuth();
     try {
-      const { MobileOAuth } = await import("./auth/oauth-mobile.js");
       if (!current()) return;
-      const oauth = new MobileOAuth(this.settings.environment, this.settings.openapiBaseUrl, undefined, attempt?.signal);
-      const auth = await oauth.complete(params, pending);
+      let auth: CloudAuth;
+      if (pending.flow === "desktop") {
+        const { DesktopOAuth } = await import("./auth/oauth-desktop.js");
+        auth = await new DesktopOAuth(this.settings.environment, this.settings.openapiBaseUrl)
+          .complete(params, pending as import("./auth/oauth-desktop.js").DesktopPendingOAuth, attempt?.signal);
+      } else {
+        const { MobileOAuth } = await import("./auth/oauth-mobile.js");
+        auth = await new MobileOAuth(this.settings.environment, this.settings.openapiBaseUrl, undefined, attempt?.signal).complete(params, pending);
+      }
       if (!current()) return;
       if (waiter) {
         if (this.mobileLoginWaiter !== waiter) return;
@@ -435,11 +460,21 @@ export default class YunpanSyncPlugin extends Plugin {
         ? (tasks) => this.confirmSyncTasks(tasks, true) : undefined);
       await this.persistence?.save();
       if (this.status.phase === "idle" && isSuccessfulSyncMessage(this.status.message)) {
+        this.displayedSyncWarnings.clear();
+        this.lastRestrictionWarning = undefined;
         new Notice(completionNotice(this.status.message));
         if (this.conflicts.length > 0) new Notice(`检测到 ${this.conflicts.length} 个冲突，已保留双方文件`);
       }
     } catch (error) {
       await this.persistence?.save();
+      if (error instanceof SyncPreflightError) {
+        this.updateStatus({ ...this.status, phase: "error", message: error.message, lastError: error.message, restriction: error });
+        const warningKey = `${this.auth?.qid ?? ""}:${error.kind}`;
+        const firstWarning = this.lastRestrictionWarning !== warningKey;
+        if (interactive || firstWarning) new Notice(error.message);
+        this.lastRestrictionWarning = warningKey;
+        return;
+      }
       if (this.handleAuthError(error)) return;
       const guidance = classifySyncError(error);
       this.updateStatus({ ...this.status, phase: "error", message: guidance.title, lastError: guidance.detail });
@@ -447,6 +482,15 @@ export default class YunpanSyncPlugin extends Plugin {
     } finally {
       this.syncModal?.render();
       this.refreshStatusViews();
+    }
+  }
+
+  async resolveSyncRestriction(): Promise<void> {
+    if (this.status.restriction?.kind === "unknown") {
+      await this.refreshAccountProfile(false);
+      await this.syncNow();
+    } else if (this.status.restriction) {
+      openMembershipPayment(this.settings.environment, this.isMobileDevice);
     }
   }
 
@@ -641,7 +685,26 @@ export default class YunpanSyncPlugin extends Plugin {
       new DownloadMachine(api, makeStore, ownerQid), () => this.settings,
       `${auth.qid}:${this.app.vault.getName()}:${normalizeRemoteRoot(this.settings.remoteRoot)}`,
       (status) => this.updateStatus(status), checkpoint,
-      (transfers) => this.updateTransfers(transfers));
+      (transfers) => this.updateTransfers(transfers), async () => {
+        const data = await api.call<Record<string, unknown>>("User.getUserDetail", {});
+        const qid = this.auth?.qid;
+        if (!qid) throw new Error("登录状态已失效，请重新登录");
+        // User detail carries the current personal and enterprise (e_*) quotas.
+        // An arbitrary enterprise-list row may belong to a different space.
+        const profile = normalizeAccountProfile(data ?? {}, qid);
+        this.accountProfile = profile;
+        this.settingTab?.display();
+        return {
+          isVip: profile.isVip,
+          expiresAt: profile.expiresAt,
+          availableBytes: profile.availableBytes,
+          usedBytes: profile.usedBytes,
+          totalBytes: profile.totalBytes,
+          enterpriseAvailableBytes: profile.enterpriseAvailableBytes,
+          enterpriseUsedBytes: profile.enterpriseUsedBytes,
+          enterpriseTotalBytes: profile.enterpriseTotalBytes,
+        };
+      });
   }
 
   private handleReloginRequired(error: unknown): boolean {
@@ -829,7 +892,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     else this.addLoginControl(remote);
 
     new Setting(syncGroup).setName("同步模式")
-      .setDesc(this.owner.isMobileDevice ? "移动端自动同步仅在前台运行，切到后台会暂停；默认手动" : "建议选择自动同步模式，可以实时自动为您同步")
+      .setDesc(this.owner.isMobileDevice ? "移动端自动同步仅在前台运行，切到后台会暂停" : "自动同步会实时为您同步文件")
       .addDropdown((dropdown) => {
         dropdown.addOption("manual", "手动");
         dropdown.addOption("automatic", "自动同步");
@@ -922,9 +985,15 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     const summary = summarizeTransfers(this.owner.transferProgress);
     const last = status.lastSuccess ? new Date(status.lastSuccess).toLocaleString() : "尚未完成同步";
     const completed = status.completed ?? summary.completedCount;
-    const readableError = status.lastError ? classifySyncError(status.lastError).detail : undefined;
+    const readableError = status.lastError
+      ? classifySyncError(status.lastError).detail
+      : undefined;
     this.statusEl.setText(`最新同步时间：${last}（${completed} 项同步成功，${status.failed} 项同步失败）${readableError ? `\n最近错误：${readableError}` : ""}`);
     this.statusEl.toggleClass("yunpan-sync-error", status.phase === "error");
+    if (status.restriction) this.statusEl.createEl("button", {
+      text: status.restriction.kind === "membership" ? "去续费" : status.restriction.kind === "capacity" ? "去扩容" : "刷新后重试",
+      cls: "mod-cta",
+    }).addEventListener("click", () => void this.owner.resolveSyncRestriction());
   }
 
   renderTransfers(): void {
@@ -983,15 +1052,17 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     }
     const label = document.createElement("span");
     label.className = "yunpan-sync-membership-label";
-    label.textContent = active ? profile.vipLabel : "普通用户";
+    label.textContent = membershipLabel(profile);
     identityEl.append(label);
     if (!active) {
-      const purchase = identityEl.createEl("button", { text: "购买会员", cls: "yunpan-sync-inline-purchase" });
-      purchase.addEventListener("click", () => openProductLink(this.owner.settings.environment, "renewal"));
+      const purchase = identityEl.createEl("button", { text: membershipLabel(profile) === "会员已过期" ? "续费会员" : "购买会员", cls: "yunpan-sync-inline-purchase" });
+      purchase.addEventListener("click", () => openMembershipPayment(this.owner.settings.environment, this.owner.isMobileDevice));
     }
-    const storage = profile.totalBytes === undefined
-      ? formatStorageCapacity(profile.usedBytes)
-      : `${formatStorageCapacity(profile.usedBytes)}/${formatStorageCapacity(profile.totalBytes)}`;
+    const usedBytes = profile.usedBytes ?? profile.enterpriseUsedBytes;
+    const totalBytes = profile.totalBytes ?? profile.enterpriseTotalBytes;
+    const storage = totalBytes === undefined
+      ? formatStorageCapacity(usedBytes)
+      : `${formatStorageCapacity(usedBytes)}/${formatStorageCapacity(totalBytes)}`;
     const account = new Setting(container).setDesc(`存储空间：${storage}`)
       .addButton((button) => button.setButtonText("退出登录").onClick(() => void this.owner.logout()));
     account.nameEl.empty();

@@ -167,12 +167,21 @@ vi.mock("../src/storage/persistence.js", () => ({
 }));
 
 vi.mock("../src/auth/oauth-desktop.js", () => ({
-  DesktopOAuth: class { login = harness.desktopLogin; },
+  DesktopOAuth: class {
+    async prepare() {
+      return {
+        authorizationUrl: "https://mcp.yunpan.com/authorize?state=desktop-state",
+        pending: { state: "desktop-state", verifier: "A".repeat(43), clientId: "desktop-client", createdAt: Date.now(), issuer: "https://mcp.yunpan.com", flow: "desktop", redirectUri: "obsidian://yunpan-sync", completionUri: "https://mcp.yunpan.com/oauth/complete" },
+      };
+    }
+    complete = harness.desktopLogin;
+  },
 }));
 
 import YunpanSyncPlugin from "../src/main.js";
 import { DEFAULT_SETTINGS } from "../src/settings.js";
 import { AUTH_SECRET_ID, LEGACY_AUTH_SECRET_ID, MOBILE_PENDING_OAUTH_SECRET_ID } from "../src/auth/secrets.js";
+import { SyncPreflightError } from "../src/sync/quota.js";
 
 async function loadPlugin() {
   const plugin = new YunpanSyncPlugin({} as never, {} as never);
@@ -191,10 +200,15 @@ describe("login settings and installation lifecycle", () => {
     harness.platform.isAndroidApp = false;
     harness.platform.isMobileApp = true;
     harness.desktopLogin.mockReset();
-    harness.persisted = null;
+    // Lifecycle tests opt into manual mode; the product default for a fresh
+    // installation is covered by settings tests and is automatic.
+    harness.persisted = { ...DEFAULT_SETTINGS, mode: "manual" };
     harness.apiVersion = "1.11.4";
     harness.protocolHandler = undefined;
-    vi.stubGlobal("window", { open: harness.open });
+    vi.stubGlobal("window", { open: harness.open, setInterval: (...args: Parameters<typeof setInterval>) => setInterval(...args),
+      clearInterval: (...args: Parameters<typeof clearInterval>) => clearInterval(...args),
+      setTimeout: (...args: Parameters<typeof setTimeout>) => setTimeout(...args),
+      clearTimeout: (...args: Parameters<typeof clearTimeout>) => clearTimeout(...args) });
     vi.stubGlobal("document", {});
     vi.stubGlobal("navigator", { clipboard: { writeText: harness.copy } });
   });
@@ -202,6 +216,23 @@ describe("login settings and installation lifecycle", () => {
 
   const storedAuth = () => ({ accessToken: "saved-access", qid: "42", token: "saved-token",
     expiresAt: Date.now() + 3_600_000, oauthCode: "saved-code" });
+
+  it.each([true, false])("updates repeated automatic restrictions quietly and opens payment only on action (mobile=%s)", async mobile => {
+    harness.platform.isMobileApp = mobile;
+    const plugin = await loadPlugin();
+    const synchronize = vi.fn(async () => { throw new SyncPreflightError("capacity", "套餐容量不足，剩余 1 B，本次同步预计新增占用 2 B。", 1, 2); });
+    Object.assign(plugin, { engine: { synchronize, needsInitialConfirmation: () => false, isRunning: () => false } });
+    harness.notice.mockClear();
+    await plugin.syncNow(false, false);
+    synchronize.mockImplementation(async () => { throw new SyncPreflightError("capacity", "套餐容量不足，剩余 0 B，本次同步预计新增占用 3 B。", 0, 3); });
+    await plugin.syncNow(false, false);
+    expect(harness.notice).toHaveBeenCalledTimes(1);
+    expect(plugin.currentStatus.restriction).toMatchObject({ remainingBytes: 0, requiredBytes: 3 });
+    expect(harness.open).not.toHaveBeenCalled();
+    await plugin.resolveSyncRestriction();
+    expect(harness.open).toHaveBeenCalledWith(mobile ? "https://www.yunpan.com/mapp/pay" : "https://www.yunpan.com/file/index?default_show_renew=1", "_blank", "noopener,noreferrer");
+    await plugin.onunload();
+  });
 
   it.each([false, true])("replaces actual sync timers on mode and interval changes (mobile=%s)", async mobile => {
     vi.useFakeTimers();
@@ -353,7 +384,7 @@ describe("login settings and installation lifecycle", () => {
       expect(harness.secrets.get(key)).toBe("");
     }
     expect(harness.secrets.get("another-plugin-secret")).toBe("unrelated");
-    expect(harness.persisted).toMatchObject({ deviceId: expect.any(String), mode: "manual" });
+    expect(harness.persisted).toMatchObject({ deviceId: expect.any(String), mode: "automatic" });
     harness.protocolHandler!({ code: "old-code", state: "old-state" });
     await vi.dynamicImportSettled();
     await plugin.syncNow(false, false);
@@ -386,13 +417,17 @@ describe("login settings and installation lifecycle", () => {
 
   it("keeps the replacement login after reinstall and another restart", async () => {
     harness.platform.isMobileApp = false;
+    harness.persisted = null;
     harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
     const plugin = await loadPlugin();
     expect(plugin.auth).toBeUndefined();
     const auth = { ...storedAuth(), accessToken: "new-access", oauthCode: "new-code" };
     harness.desktopLogin.mockResolvedValueOnce(auth);
     vi.spyOn(YunpanSyncPlugin.prototype, "refreshAccountProfile").mockResolvedValue();
-    await plugin.login();
+    const login = plugin.login();
+    await vi.dynamicImportSettled();
+    harness.protocolHandler!({ code: "returned-code", state: "desktop-state" });
+    await login;
     expect(plugin.currentStatus.message).toBe("已登录");
     expect(plugin.auth).toEqual(auth);
     await plugin.onunload();
@@ -451,7 +486,7 @@ describe("login settings and installation lifecycle", () => {
     expect(account.attributes.href).toBe(remote.attributes.href);
     expect(new URL(account.attributes.href!).searchParams.get("code_challenge")).toBeTruthy();
     expect(harness.request).toHaveBeenCalledTimes(2);
-    expect(harness.secrets.get(MOBILE_PENDING_OAUTH_SECRET_ID)).toBe("");
+    expect(harness.secrets.get(MOBILE_PENDING_OAUTH_SECRET_ID) ?? "").toBe("");
     expect(plugin.currentStatus.phase).toBe("idle");
     tabs.at(-1)!.display();
     await plugin.prepareMobileLogin();
@@ -702,11 +737,6 @@ describe("login settings and installation lifecycle", () => {
 
   it("supports restart and cancel from desktop settings", async () => {
     harness.platform.isMobileApp = false;
-    const signals: AbortSignal[] = [];
-    harness.desktopLogin.mockImplementation((_open, _timeout, signal: AbortSignal) => {
-      signals.push(signal);
-      return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("登录已取消"))));
-    });
     const plugin = await loadPlugin();
     const first = plugin.login();
     await vi.dynamicImportSettled();
@@ -715,14 +745,10 @@ describe("login settings and installation lifecycle", () => {
     const second = account.buttons[0]!.click!();
     await vi.dynamicImportSettled();
     await first;
-    expect(signals).toHaveLength(2);
-    expect(signals[0]!.aborted).toBe(true);
-    expect(signals[1]!.aborted).toBe(false);
     account.buttons[1]!.click!();
     await second;
-    expect(signals[1]!.aborted).toBe(true);
-    expect(account.buttons[0]!.label).toBe("登录");
+    expect(account.buttons[0]!.label).toBe("重新登录");
     expect(plugin.currentStatus.message).toBe("登录已取消");
-    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.open).toHaveBeenCalledTimes(2);
   });
 });

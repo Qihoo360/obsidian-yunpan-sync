@@ -458,6 +458,12 @@ export class SyncDatabase {
     this.db.run("UPDATE tasks SET payload=$payload WHERE id=$id", { $id: id, $payload: JSON.stringify(payload) });
   }
 
+  updateTaskPlan(id: string, nid: string | undefined, payload: unknown): void {
+    this.db.run("UPDATE tasks SET nid=$nid,payload=$payload WHERE id=$id", {
+      $id: id, $nid: nid ?? null, $payload: JSON.stringify(payload),
+    });
+  }
+
   retargetRunningRename(id: string, replacement: NewSyncTask): void {
     this.db.run(`UPDATE tasks SET kind='local-rename',path=$path,nid=$nid,payload=$payload
       WHERE id=$id AND state='running' AND kind IN ('rename','move')`, {
@@ -563,6 +569,11 @@ export class SyncDatabase {
   }
 
   completeTask(id: string): void { this.db.run("UPDATE tasks SET state='done',last_error=NULL WHERE id=$id", { $id: id }); }
+
+  deferTask(id: string, message: string): void {
+    this.db.run("UPDATE tasks SET state='queued',next_run_at=0,last_error=$error WHERE id=$id AND state='running'",
+      { $id: id, $error: message });
+  }
 
   requeueStaleCompletedRecycleTasks(
     remoteNidsByPath: ReadonlyMap<string, string>,

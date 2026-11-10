@@ -1,94 +1,50 @@
-import { createRequire } from "node:module";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+const requestUrl = vi.hoisted(() => vi.fn());
+vi.mock("obsidian", async (importOriginal) => ({ ...await importOriginal<object>(), requestUrl }));
+vi.mock("../src/auth/oauth.js", () => ({ exchangeOAuthCode: vi.fn() }));
+
 import { DesktopOAuth } from "../src/auth/oauth-desktop.js";
 import { exchangeOAuthCode } from "../src/auth/oauth.js";
 
-vi.mock("../src/auth/oauth.js", () => ({ exchangeOAuthCode: vi.fn() }));
-
 const auth = { accessToken: "access", qid: "42", token: "token", expiresAt: 1234 };
-const controllers: AbortController[] = [];
 
-function start() {
-  const controller = new AbortController();
-  controllers.push(controller);
-  let opened!: (url: string) => void;
-  const url = new Promise<string>(resolve => { opened = resolve; });
-  const operation = new DesktopOAuth("production", "https://openapi.eyun.360.cn/intf.php")
-    .login(opened, 180_000, controller.signal);
-  return { controller, url, operation };
-}
-
-function callbackUrl(authorization: string): string {
-  const url = new URL(authorization);
-  const callback = new URL(url.searchParams.get("decision_url")!);
-  callback.pathname = "/oauth/callback";
-  callback.searchParams.set("state", url.searchParams.get("state")!);
-  callback.searchParams.set("code", "returned-code");
-  return callback.toString();
-}
-
-describe("desktop OAuth cancellation", () => {
-  beforeEach(() => {
-    vi.stubGlobal("require", createRequire(import.meta.url));
-    vi.mocked(exchangeOAuthCode).mockReset().mockResolvedValue(auth);
-  });
-  afterEach(() => {
-    controllers.splice(0).forEach(controller => controller.abort());
-    vi.unstubAllGlobals();
+describe("desktop HTTPS OAuth", () => {
+  it("registers a native callback and requests the desktop HTTPS page with PKCE", async () => {
+    requestUrl.mockReset()
+      .mockResolvedValueOnce({ status: 200, json: {
+        authorization_endpoint: "https://mcp.yunpan.com/authorize",
+        registration_endpoint: "https://mcp.yunpan.com/register",
+      } })
+      .mockResolvedValueOnce({ status: 201, json: { client_id: "client-1" } });
+    const prepared = await new DesktopOAuth("production", "https://openapi.eyun.360.cn/intf.php").prepare();
+    const url = new URL(prepared.authorizationUrl);
+    expect(url.searchParams.get("completion_mode")).toBe("page");
+    expect(url.searchParams.get("redirect_uri")).toBe("obsidian://yunpan-sync");
+    expect(url.searchParams.has("completion_redirect_uri")).toBe(false);
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(url.searchParams.get("login_surface")).toBe("desktop");
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(prepared.pending.verifier));
+    expect(url.searchParams.get("code_challenge")).toBe(Buffer.from(digest).toString("base64url"));
+    expect(prepared.pending.flow).toBe("desktop");
   });
 
-  it("closes the callback server immediately when cancelled", async () => {
-    const { controller, url, operation } = start();
-    const authorization = await url;
-    const rejected = expect(operation).rejects.toThrow("登录已取消");
-    controller.abort();
-    await rejected;
-    await expect(fetch(callbackUrl(authorization))).rejects.toThrow();
-    expect(exchangeOAuthCode).not.toHaveBeenCalled();
+  it("checks state and exchanges the HTTPS completion code", async () => {
+    requestUrl.mockReset().mockResolvedValue({ status: 200, json: { oauth_code: "cloud-code" } });
+    vi.mocked(exchangeOAuthCode).mockResolvedValue(auth);
+    const pending = { state: "state", verifier: "A".repeat(43), clientId: "client", createdAt: Date.now(), issuer: "https://mcp.yunpan.com", flow: "desktop" as const };
+    await expect(new DesktopOAuth("production", "https://openapi.eyun.360.cn/intf.php").complete({ state: "wrong", code: "code" }, pending)).rejects.toThrow("state");
+    await expect(new DesktopOAuth("production", "https://openapi.eyun.360.cn/intf.php").complete({ state: "state", code: "code" }, pending)).resolves.toEqual(auth);
+    expect(exchangeOAuthCode).toHaveBeenCalledWith("https://openapi.eyun.360.cn/intf.php", "cloud-code");
+    expect(requestUrl).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: "https://mcp.yunpan.com/oauth/360/exchange",
+      body: new URLSearchParams({ client_id: "client", code: "code", redirect_uri: "obsidian://yunpan-sync", code_verifier: pending.verifier }).toString() }));
   });
 
-  it("rejects a pre-cancelled login without opening a browser", async () => {
+  it("does not expose a local HTTP callback path", async () => {
     const controller = new AbortController();
     controller.abort();
-    const open = vi.fn();
-    await expect(new DesktopOAuth("production", "https://openapi.eyun.360.cn/intf.php")
-      .login(open, 180_000, controller.signal)).rejects.toThrow("登录已取消");
-    expect(open).not.toHaveBeenCalled();
-  });
-
-  it("discards token exchange results after cancellation", async () => {
-    let resolve!: (value: typeof auth) => void;
-    vi.mocked(exchangeOAuthCode).mockImplementation(() => new Promise(done => { resolve = done; }));
-    const { controller, url, operation } = start();
-    const response = await fetch(callbackUrl(await url));
-    expect(response.status).toBe(200);
-    expect(exchangeOAuthCode).toHaveBeenCalledOnce();
-    const rejected = expect(operation).rejects.toThrow("登录已取消");
-    controller.abort();
-    await rejected;
-    resolve(auth);
-    await Promise.resolve();
-    expect(exchangeOAuthCode).toHaveBeenCalledOnce();
-  });
-
-  it("settles successful callbacks once even when cancelled afterwards", async () => {
-    const { controller, url, operation } = start();
-    expect((await fetch(callbackUrl(await url))).status).toBe(200);
-    await expect(operation).resolves.toEqual(auth);
-    controller.abort();
-    await expect(operation).resolves.toEqual(auth);
-    expect(exchangeOAuthCode).toHaveBeenCalledOnce();
-  });
-
-  it("ignores a stale state without ending the current authorization", async () => {
-    const { url, operation } = start();
-    const validCallback = callbackUrl(await url);
-    const staleCallback = new URL(validCallback);
-    staleCallback.searchParams.set("state", "old-browser-state");
-    expect((await fetch(staleCallback)).status).toBe(400);
-    expect(exchangeOAuthCode).not.toHaveBeenCalled();
-    expect((await fetch(validCallback)).status).toBe(200);
-    await expect(operation).resolves.toEqual(auth);
-    expect(exchangeOAuthCode).toHaveBeenCalledOnce();
+    requestUrl.mockClear();
+    await expect(new DesktopOAuth("production", "https://openapi.eyun.360.cn/intf.php").prepare(controller.signal)).rejects.toThrow("登录已取消");
+    expect(requestUrl).not.toHaveBeenCalled();
   });
 });

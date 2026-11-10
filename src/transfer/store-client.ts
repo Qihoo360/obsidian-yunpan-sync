@@ -1,6 +1,7 @@
 import { assertStoreUrl } from "../net/store-url.js";
 import { md5 } from "../net/signing.js";
 import { requestUrl } from "obsidian";
+import { OpenApiError } from "../net/openapi-client.js";
 
 
 export interface StoreRange { start: number; end: number }
@@ -82,7 +83,7 @@ export class StoreClient implements StoreClientLike {
       if (response.status < 200 || response.status >= 300) throw new Error(`Store ${method} failed: HTTP ${response.status}`);
       let envelope: { errno?: number; errmsg?: string; data?: Record<string, unknown> };
       try { envelope = JSON.parse(text) as typeof envelope; } catch { throw new Error(`Store ${method} returned invalid JSON`); }
-      if (Number(envelope.errno ?? 0) !== 0) throw new Error(envelope.errmsg || `Store ${method} error ${envelope.errno}`);
+      if (Number(envelope.errno ?? 0) !== 0) throw new OpenApiError(envelope.errmsg || `Store ${method} error ${envelope.errno}`, Number(envelope.errno));
       
       return envelope.data ?? envelope as Record<string, unknown>;
     } catch (error) {

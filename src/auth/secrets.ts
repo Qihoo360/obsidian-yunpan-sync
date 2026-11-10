@@ -16,6 +16,7 @@ export interface PendingOAuth {
   clientId: string;
   createdAt: number;
   issuer: string;
+  flow?: "mobile" | "desktop";
 }
 
 export interface SecretStorageLike {

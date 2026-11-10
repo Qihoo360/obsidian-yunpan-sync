@@ -33,7 +33,7 @@
 2. 在 Obsidian 的 **设置 → 第三方插件** 中启用 **360AI Cloud Sync**。
 3. 打开插件设置，点击 **登录**，在浏览器中完成 360AI 云盘授权。
 4. 在云端目录选择器中选择已有文件夹，或创建一个新文件夹作为当前 Vault 的同步目录。
-5. 保持默认的 **手动** 模式，点击左侧功能区的同步图标，或从命令面板运行 **360AI Cloud Sync: 立即同步**。
+5. 新安装默认使用 **自动** 模式；也可以点击左侧功能区的同步图标，或从命令面板运行 **360AI Cloud Sync: 立即同步**。
 6. 首次同步时检查任务列表，确认无误后继续。
 
 移动端进入设置页会先显示“准备登录…”，准备好后点击“登录”直接打开授权链接。若浏览器未打开，仍可使用“打开授权页面”或复制授权链接；准备失败时点击“重试准备”。
@@ -45,8 +45,8 @@
 
 | 模式 | 行为 | 适合场景 |
 | --- | --- | --- |
-| **手动** | 只在点击“立即同步”或运行命令时同步 | 首次安装、按需同步 |
-| **自动** | 本地变化后防抖约 1.5 秒触发同步，同时约每 3 分钟检查云端变化 | 多设备持续同步 |
+| **手动** | 只在点击“立即同步”或运行命令时同步 | 按需同步 |
+| **自动**（新安装默认） | 本地变化后防抖约 1.5 秒触发同步，同时约每 3 分钟检查云端变化 | 多设备持续同步 |
 | **低频自动** | 按设置的分钟间隔执行完整同步，可设 4–1440 分钟，默认 30 分钟 | 希望降低后台请求频率 |
 
 所有模式都保留 **立即同步** 命令。你也可以随时暂停或恢复同步。
@@ -86,9 +86,10 @@
 
 ### 使用前须知
 
-- Desktop、Android 和 iOS 均支持手动、自动和低频自动同步，默认使用手动模式。移动端自动同步和低频自动仅在 Obsidian 前台运行，离开前台或锁屏后会暂停并保存任务；回到 Obsidian 后会继续按所选模式工作。
-- 移动端 OAuth 登录已通过真实设备验证，详见 [验证记录](RELEASE.md#真实设备验证记录)。
-- Android 和 iOS 登录通过 MCP 选择移动授权页，未登录云盘时先登录，再确认授权并返回 Obsidian；桌面端沿用原授权页。
+- Desktop、Android 和 iOS 均支持手动、自动和低频自动同步，新安装默认自动，升级保留已有有效模式。自动同步需完成登录、目录绑定及首次任务确认。移动端自动同步和低频自动仅在 Obsidian 前台运行，离开前台或锁屏后会暂停并保存任务；回到 Obsidian 后会继续按所选模式工作。
+- 历史版本移动端 OAuth 的真实设备验证见 [验证记录](RELEASE.md#真实设备验证记录)；各版本新增改动的验证状态见发布说明。
+- Android 和 iOS 登录通过 MCP 选择移动授权页；桌面端使用桌面授权页并在 HTTPS 完成页返回 Obsidian。两端均使用 PKCE 和协议回跳。
+- 同步前刷新会员与容量信息。会员过期、上传预计新增占用超过剩余容量，或无法可靠获取上传容量时暂停本次同步并保留任务；续费或扩容后可重试。
 - 首次同步需要扫描本地与云端；文件较多时会比后续增量同步耗时更长。
 - 删除会双向传播。删除前请确认其他设备上的修改已经完成同步。
 - 被过滤的文件不会上传，也不会从云端下载，因此两端可能有意保持不同。
@@ -119,7 +120,7 @@ Requires Obsidian **1.11.4 or later** on Desktop, Android, and iOS. If the commu
 2. Enable **360AI Cloud Sync** under **Settings → Community plugins** in Obsidian.
 3. Open the plugin settings and click **Sign in** to authorize 360AI Cloud Disk in your browser.
 4. Choose an existing cloud folder, or create a new folder to bind to the current vault.
-5. Keep the default **Manual** mode for the first run. Click the sync ribbon icon, or run **360AI Cloud Sync: Sync now** from the command palette.
+5. New installations default to **Automatic** mode. You can also click the sync ribbon icon or run **360AI Cloud Sync: Sync now** from the command palette.
 6. Review the planned tasks and continue when they look correct.
 
 On mobile, wait for sign-in preparation to finish, then tap **登录** to open the authorization link directly. If the browser does not open, use **打开授权页面** or copy the link. If preparation fails, tap **重试准备** to retry.
@@ -131,8 +132,8 @@ On mobile, wait for sign-in preparation to finish, then tap **登录** to open t
 
 | Mode | Behavior | Best for |
 | --- | --- | --- |
-| **Manual** | Sync only when you click **Sync now** or run the command | First-time setup and on-demand sync |
-| **Automatic** | Sync local changes after about 1.5 seconds of debounce and check remote changes about every 3 minutes | Continuous multi-device sync |
+| **Manual** | Sync only when you click **Sync now** or run the command | On-demand sync |
+| **Automatic** (default for new installations) | Sync local changes after about 1.5 seconds of debounce and check remote changes about every 3 minutes | Continuous multi-device sync |
 | **Scheduled** | Run a full sync every 4–1440 minutes as configured; defaults to 30 minutes | Reducing background request frequency |
 
 The **Sync now** command remains available in every mode. Synchronization can also be paused and resumed at any time.
@@ -171,9 +172,10 @@ When both local and remote content have changed since the same baseline, the plu
 
 ### Before You Sync
 
-- Desktop, Android, and iOS support manual, automatic, and scheduled synchronization, with manual mode as the default. On mobile, automatic and scheduled synchronization run only while Obsidian is in the foreground; backgrounding or locking the device pauses and saves the queue, then resumes the selected mode when Obsidian returns to the foreground.
-- Mobile OAuth login has passed real-device validation; see the [verification record](RELEASE.md#真实设备验证记录).
-- Android and iOS request the mobile authorization page through MCP. Sign in to Yunpan, approve access, then return to Obsidian. Desktop keeps its existing authorization page.
+- Desktop, Android, and iOS support manual, automatic, and scheduled synchronization. New installations default to automatic mode; upgrades preserve a saved valid mode. Sign-in, folder binding, and initial task confirmation are still required. On mobile, automatic and scheduled synchronization run only while Obsidian is in the foreground; backgrounding or locking the device pauses and saves the queue, then resumes the selected mode when Obsidian returns to the foreground.
+- Historical mobile OAuth device validation is documented in the [verification record](RELEASE.md#真实设备验证记录); see the release notes for validation of newer changes.
+- Android and iOS request the mobile authorization page through MCP. Desktop uses the desktop authorization page and an HTTPS completion page. Both return through the Obsidian protocol with PKCE protection.
+- Every sync refreshes membership and quota information. Expired membership, insufficient remaining storage, or unreliable upload quota information pauses the run without discarding tasks; retry after renewal or expansion.
 - The initial run scans both local and cloud content and may take longer than later incremental runs for a large vault.
 - Deletions propagate in both directions. Make sure changes from other devices have synchronized before deleting important content.
 - Filtered files are neither uploaded nor downloaded, so the two sides may intentionally differ.

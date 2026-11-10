@@ -5,6 +5,7 @@ import { SyncEngine } from "../src/sync/engine.js";
 import { SyncDatabase } from "../src/storage/database.js";
 import { DEFAULT_SETTINGS, type PluginSettings } from "../src/settings.js";
 import { cloudFileHashes } from "../src/transfer/hashes.js";
+import type { SyncQuota } from "../src/sync/quota.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -122,6 +123,8 @@ class MemoryVault {
 type CloudEntry = { nid: string; pid: string; path: string; isDir: boolean; data?: Uint8Array; hash?: string; version: number; mtime: number; status?: number };
 
 class MemoryCloud {
+  omitFileSizes = false;
+  quota: SyncQuota = { isVip: true, availableBytes: 1_000_000 };
   readonly entries = new Map<string, CloudEntry>();
   private changes: CloudEntry[] = [];
   private nextNid = 2;
@@ -184,7 +187,8 @@ class MemoryCloud {
 
   readonly api = { call: async <T>(method: string, input: Record<string, unknown>): Promise<T> => {
     this.calls.push(method);
-    if (method === "User.getUserDetail" || method === "Enterprise.getListByUser") return {} as T;
+    if (method === "User.getUserDetail") return { is_vip: 1, available_size: this.quota.availableBytes } as T;
+    if (method === "Enterprise.getListByUser") return {} as T;
     if (method === "User.getVersion") return { ver: this.version } as T;
     if (method === "Incr.getBgsp") return { bgsp: "1", gsp: "1", ver: this.version, total: this.entries.size } as T;
     if (method === "Incr.getGlobalNodes") return { node_list: await this.raw([...this.entries.values()]), retnum: this.entries.size, gsp: "1", spnid: "0" } as T;
@@ -234,7 +238,7 @@ class MemoryCloud {
   }
   private async raw(entries: CloudEntry[]): Promise<Record<string, unknown>[]> {
     return entries.map((entry) => ({ nid: entry.nid, pid: entry.pid, name: entry.path.slice(entry.path.lastIndexOf("/") + 1),
-      is_dir: entry.isDir ? 1 : 0, fhash: entry.hash, fsize: entry.data?.byteLength ?? 0,
+      is_dir: entry.isDir ? 1 : 0, fhash: entry.hash, fsize: this.omitFileSizes && !entry.isDir ? undefined : entry.data?.byteLength ?? 0,
       fmtime: entry.mtime, nv: entry.version, status: entry.status }));
   }
 }
@@ -247,7 +251,7 @@ async function harness(paused = false): Promise<{ vault: MemoryVault; cloud: Mem
   const statuses: import("../src/sync/engine.js").EngineStatus[] = [];
   const settings = { ...DEFAULT_SETTINGS, paused, remoteRoot: "/Obsidian/", ownerQid: "42" };
   const engine = new SyncEngine(vault as never, db, cloud.api as never, cloud.uploader as never, cloud.downloader as never,
-    () => settings, "42:vault", (status) => statuses.push(status));
+    () => settings, "42:vault", (status) => statuses.push(status), undefined, undefined, async () => cloud.quota);
   return { vault, cloud, engine, db, settings, statuses };
 }
 
@@ -256,6 +260,143 @@ async function synchronize(engine: SyncEngine): Promise<void> {
 }
 
 describe("complete in-memory two-way synchronization", () => {
+  it("preflights before any file operations, preserves pending tasks and resumes after expansion", async () => {
+    const { vault, cloud, engine, db } = await harness();
+    vault.putFile("new.md", "12345");
+    cloud.quota.availableBytes = 4;
+    await expect(synchronize(engine)).rejects.toMatchObject({ kind: "capacity", remainingBytes: 4, requiredBytes: 5 });
+    expect(cloud.paths()).toEqual([]);
+    expect(cloud.calls.filter(method => method.startsWith("File."))).toEqual([]);
+    expect(db.getLastSuccessfulSync()).toBeUndefined();
+    expect(db.listPendingTasks()).toHaveLength(1);
+    expect(db.listFailedTasks()).toHaveLength(0);
+    cloud.quota.availableBytes = 5;
+    await synchronize(engine);
+    expect(cloud.text("/Obsidian/new.md")).toBe("12345");
+  });
+
+  it("refreshes membership for every run and blocks downloads, deletes and repair when expired", async () => {
+    const { vault, cloud, engine, db, statuses } = await harness();
+    vault.putFile("note.md", "base"); await synchronize(engine);
+    await vault.trash(vault.getFileByPath("note.md")!);
+    await cloud.putFile("/Obsidian/remote.md", "download");
+    cloud.quota = { isVip: false, expiresAt: Date.now() - 1, availableBytes: 100 };
+    const before = cloud.paths(); const callCount = cloud.calls.length;
+    await expect(engine.synchronize(true)).rejects.toMatchObject({ kind: "membership" });
+    expect(cloud.calls.slice(callCount)).toEqual([]);
+    expect(cloud.paths()).toEqual(before); expect(vault.paths()).toEqual([]);
+    expect(statuses.at(-1)?.restriction?.kind).toBe("membership");
+    cloud.quota = { isVip: true, availableBytes: 100 };
+    await synchronize(engine);
+    expect(vault.text("remote.md")).toBe("download");
+    expect(db.listPendingTasks()).toEqual([]);
+  });
+
+  it("checks only confirmed uploads, retains all tasks if blocked, and allows pure downloads without quota", async () => {
+    const { vault, cloud, engine, db } = await harness();
+    vault.putFile("small", "12"); vault.putFile("large", "123456789");
+    cloud.quota.availableBytes = 1;
+    const chooseSmall = async (tasks: readonly import("../src/storage/database.js").SyncTask[]) => new Set(tasks.filter(t => t.path === "small").map(t => t.id));
+    await expect(engine.synchronize(false, chooseSmall)).rejects.toMatchObject({ kind: "capacity", requiredBytes: 2 });
+    expect(db.listPendingTasks().map(t => t.path).sort()).toEqual(["large", "small"]);
+    expect(engine.needsInitialConfirmation()).toBe(true);
+    cloud.quota.availableBytes = 2;
+    await engine.synchronize(false, chooseSmall);
+    expect(cloud.paths()).toEqual(["small"]);
+
+    const other = await harness();
+    other.cloud.quota = { isVip: false };
+    await other.cloud.putFile("/Obsidian/download", "data");
+    await synchronize(other.engine);
+    expect(other.vault.text("download")).toBe("data");
+  });
+
+  it("uses current retry sizes, counts growth only and blocks missing capacity before any file operation", async () => {
+    const { vault, cloud, engine, db } = await harness();
+    vault.putFile("note", "base"); await synchronize(engine);
+    vault.putFile("note", "12345"); cloud.quota.availableBytes = 0;
+    await expect(synchronize(engine)).rejects.toMatchObject({ requiredBytes: 1 });
+    const pending = db.listPendingTasks().find(t => t.kind === "upload")!;
+    db.failTask(pending.id, "retry", 0);
+    vault.putFile("note", "12345678"); cloud.quota.availableBytes = 3;
+    await expect(synchronize(engine)).rejects.toMatchObject({ requiredBytes: 4 });
+    expect(db.listPendingTasks().filter(t => t.kind === "upload")).toHaveLength(1);
+    expect(cloud.text("/Obsidian/note")).toBe("base");
+    cloud.quota.availableBytes = 4; await synchronize(engine);
+    vault.putFile("note", "1"); cloud.quota = { isVip: true };
+    const callCount = cloud.calls.length;
+    await expect(synchronize(engine)).rejects.toMatchObject({ kind: "unknown" });
+    expect(cloud.calls.slice(callCount).filter(c => c.startsWith("File."))).toEqual([]);
+    cloud.quota.availableBytes = 0; await synchronize(engine);
+    expect(cloud.text("/Obsidian/note")).toBe("1");
+  });
+
+  it("does not guess an overwrite size when the remote index omits file metadata", async () => {
+    const { vault, cloud, engine } = await harness();
+    vault.putFile("note", "base"); await synchronize(engine);
+    vault.putFile("note", "growth"); cloud.omitFileSizes = true;
+    const callCount = cloud.calls.length;
+    await expect(engine.synchronize(true)).rejects.toMatchObject({ kind: "unknown" });
+    expect(cloud.calls.slice(callCount).filter(c => c.startsWith("File."))).toEqual([]);
+    expect(cloud.text("/Obsidian/note")).toBe("base");
+  });
+
+  it("budgets a conflict copy once before preserving it", async () => {
+    const { vault, cloud, engine } = await harness();
+    vault.putFile("note.md", "base"); await cloud.putFile("/Obsidian/note.md", "base");
+    await synchronize(engine);
+    vault.putFile("note.md", "local"); await cloud.putFile("/Obsidian/note.md", "remote");
+    cloud.quota.availableBytes = 4;
+    await expect(synchronize(engine)).rejects.toMatchObject({ requiredBytes: 5 });
+    expect(vault.text("note.md")).toBe("local");
+    cloud.quota.availableBytes = 5; await synchronize(engine);
+    expect(cloud.paths()).toEqual(vault.paths());
+  });
+
+  it("replaces an obsolete upload retry with conflict work without double counting its bytes", async () => {
+    const { vault, cloud, engine } = await harness();
+    vault.putFile("note", "base"); await synchronize(engine);
+    vault.putFile("note", "local-data"); cloud.quota.availableBytes = 0;
+    await expect(synchronize(engine)).rejects.toMatchObject({ kind: "capacity" });
+    await cloud.putFile("/Obsidian/note", "remote"); cloud.quota.availableBytes = 9;
+    await expect(synchronize(engine)).rejects.toMatchObject({ requiredBytes: 10 });
+    cloud.quota.availableBytes = 10; await synchronize(engine);
+    expect(cloud.paths()).toEqual(vault.paths());
+    expect(vault.text("note")).toBe("remote");
+  });
+
+  it.each([true, false])("preflights file/directory conflicts and preserves the complete local version (localDirectory=%s)", async localDirectory => {
+    const { vault, cloud, engine } = await harness();
+    if (localDirectory) { vault.mkdir("same"); vault.putFile("same/child", "child"); await cloud.putFile("/Obsidian/same", "remote"); }
+    else { vault.putFile("same", "local"); cloud.mkdir("/Obsidian/same"); await cloud.putFile("/Obsidian/same/child", "remote"); }
+    cloud.quota.availableBytes = 4;
+    await expect(synchronize(engine)).rejects.toMatchObject({ requiredBytes: 5 });
+    cloud.quota.availableBytes = 5;
+    await synchronize(engine);
+    expect(cloud.paths()).toEqual(vault.paths());
+    const protectedPath = vault.paths().find(path => path.startsWith("same (conflict-") && !path.includes("/"))!;
+    expect(vault.text(localDirectory ? `${protectedPath}/child` : protectedPath)).toBe(localDirectory ? "child" : "local");
+    expect(vault.text(localDirectory ? "same" : "same/child")).toBe("remote");
+  });
+
+  it("counts the entire protected directory before performing a divergent rename", async () => {
+    const { vault, cloud, engine } = await harness();
+    vault.mkdir("folder"); vault.putFile("folder/note.md", "base");
+    cloud.mkdir("/Obsidian/folder"); await cloud.putFile("/Obsidian/folder/note.md", "base");
+    await synchronize(engine);
+    await vault.rename(vault.getAbstractFileByPath("folder")!, "local-folder");
+    engine.recordRename("folder", "local-folder");
+    vault.putFile("local-folder/new.md", "new");
+    cloud.rename("/Obsidian/folder", "/Obsidian/remote-folder");
+    cloud.quota.availableBytes = 6;
+    const beforeLocal = vault.paths(); const beforeRemote = cloud.paths();
+    await expect(synchronize(engine)).rejects.toMatchObject({ kind: "capacity", requiredBytes: 7 });
+    expect(vault.paths()).toEqual(beforeLocal);
+    expect(cloud.paths()).toEqual(beforeRemote);
+    cloud.quota.availableBytes = 7;
+    await synchronize(engine);
+    expect(cloud.paths()).toEqual(vault.paths());
+  });
   it("preserves a whole directory tree when both sides rename it differently", async () => {
     const { vault, cloud, engine, db } = await harness();
     vault.mkdir("folder"); vault.putFile("folder/note.md", "base");

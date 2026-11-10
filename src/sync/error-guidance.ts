@@ -1,7 +1,8 @@
 import { OpenApiError } from "../net/openapi-client.js";
 import { WindowsPathError } from "../domain/paths.js";
+import { syncRestrictionError } from "./quota.js";
 
-export type SyncErrorCategory = "network" | "space" | "permission" | "occupied" | "authentication" | "destination" | "windows-path" | "unknown";
+export type SyncErrorCategory = "network" | "space" | "membership" | "cloud-capacity" | "quota-unknown" | "permission" | "occupied" | "authentication" | "destination" | "windows-path" | "unknown";
 
 export interface SyncErrorGuidance {
   category: SyncErrorCategory;
@@ -12,6 +13,11 @@ export interface SyncErrorGuidance {
 export function classifySyncError(error: unknown): SyncErrorGuidance {
   const detail = error instanceof Error ? error.message : String(error);
   const value = detail.toLowerCase();
+  const restriction = syncRestrictionError(error);
+  if (restriction) return { category: restriction.kind === "membership" ? "membership" : restriction.kind === "capacity" ? "cloud-capacity" : "quota-unknown",
+    title: restriction.kind === "membership" ? "会员已过期" : restriction.kind === "capacity" ? "套餐容量不足" : "无法确认同步容量",
+    detail: restriction.message };
+  if (/无法确认.*容量/.test(detail)) return { category: "quota-unknown", title: "无法确认同步容量", detail };
   if ((error instanceof OpenApiError && error.errno === 3009) || /dest(?:ination)? node not exist|目标(?:云端)?文件夹不存在/.test(value)) {
     return { category: "destination", title: "目标云端文件夹不存在", detail: "目标云端文件夹不存在，请确认目标文件夹后重试。" };
   }
@@ -40,7 +46,7 @@ export function classifySyncError(error: unknown): SyncErrorGuidance {
       detail: invalid ? `文件名包含 Windows 不支持的字符：${invalid[1]}` : "云端路径包含 Windows 不支持的文件名，请重命名后再同步。" };
   }
   if (/enospc|no space|空间不足|容量不足|quota/.test(value)) {
-    return { category: "space", title: "存储空间不足", detail: "存储空间不足，请清理不需要的文件或扩容后重试。" };
+    return { category: "space", title: "本地存储空间不足", detail: "本地磁盘空间不足，请清理设备存储后重试。" };
   }
   if (/eacces|eperm|permission|forbidden|http 403|无权限|权限不足/.test(value)) {
     return { category: "permission", title: "文件或云端权限不足", detail: "无法读写相关文件，请检查文件权限后重试。" };

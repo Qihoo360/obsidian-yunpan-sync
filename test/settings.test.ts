@@ -2,10 +2,18 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS, ensureDeviceId, normalizeSettings, pollIntervalMs } from "../src/settings.js";
 
 describe("plugin settings", () => {
-  it("defaults fresh installs to manual production sync", () => {
-    expect(DEFAULT_SETTINGS.mode).toBe("manual");
+  it("defaults fresh installs to automatic production sync", () => {
+    expect(DEFAULT_SETTINGS.mode).toBe("automatic");
     expect(DEFAULT_SETTINGS.openapiBaseUrl).toBe("https://openapi.eyun.360.cn/intf.php");
-    expect(pollIntervalMs(DEFAULT_SETTINGS)).toBeUndefined();
+    expect(pollIntervalMs(DEFAULT_SETTINGS)).toBe(3 * 60_000);
+  });
+
+  it.each([undefined, null, {}, { mode: "invalid" }, { mode: "" }])("falls back to automatic for absent or invalid settings %j", input => {
+    expect(normalizeSettings(input as never).mode).toBe("automatic");
+  });
+
+  it.each(["manual", "automatic", "scheduled"])("preserves a saved valid %s mode", mode => {
+    expect(normalizeSettings({ mode } as never).mode).toBe(mode);
   });
 
   it("allows only the supported scheduled intervals", () => {

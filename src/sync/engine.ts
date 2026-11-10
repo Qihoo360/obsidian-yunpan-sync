@@ -12,11 +12,13 @@ import { TaskRunner } from "./task-runner.js";
 import { RemoteIndexer } from "./remote-indexer.js";
 import { TransferProgressTracker, type FileTransferProgress } from "./progress.js";
 import { syncCompletionMessage } from "./outcome.js";
+import { assertSyncQuota, syncRestrictionError, type SyncQuota, type SyncRestriction } from "./quota.js";
+import { normalizeAccountProfile } from "../account/profile.js";
 
 interface Api { call<T>(method: OpenApiMethod, input: Record<string, string | number | boolean | null | undefined>): Promise<T> }
 export interface EngineStatus { phase: string; message: string; queued: number; failed: number; completed?: number;
   conflicts?: number; lastSuccess?: number; lastError?: string; failedTasks?: SyncTask[]; fileFailures?: SyncFileFailure[];
-  warnings?: string[] }
+  warnings?: string[]; restriction?: SyncRestriction }
 export interface SyncFileFailure { path: string; error: WindowsPathError }
 export type ConfirmSyncTasks = (tasks: readonly SyncTask[]) => Promise<ReadonlySet<string> | undefined>;
 
@@ -36,7 +38,7 @@ function bytesBuffer(bytes: Uint8Array): ArrayBuffer {
   const copy = new Uint8Array(bytes.length); copy.set(bytes); return copy.buffer;
 }
 
-interface PathSnapshot { path: string; snapshot: SyncSnapshot }
+interface PathSnapshot { path: string; snapshot: SyncSnapshot; sourcePath?: string; derivedFrom?: string }
 function pathKey(path: string): string { return path.normalize("NFC").toLocaleLowerCase("en-US"); }
 
 interface LocalRenamePayload {
@@ -72,7 +74,6 @@ export class SyncEngine {
   private running = false;
   private lastSuccess?: number;
   private lastError?: string;
-  private accountValidated = false;
   private readonly transfers = new TransferProgressTracker();
   private fileFailures: SyncFileFailure[] = [];
   private cancelled = false;
@@ -80,6 +81,9 @@ export class SyncEngine {
   private completed = 0;
   private warnings: string[] = [];
   private renameRefreshUsed = false;
+  private restriction?: SyncRestriction;
+  private readonly discardAfterPreflight = new Set<string>();
+  private planTaskIndex = new Map<string, SyncTask>();
 
   constructor(
     private readonly vault: Vault,
@@ -92,6 +96,7 @@ export class SyncEngine {
     private readonly report: (status: EngineStatus) => void,
     private readonly checkpoint: () => Promise<void> = async () => undefined,
     private readonly reportTransfers: (transfers: FileTransferProgress[]) => void = () => undefined,
+    private readonly loadQuota?: () => Promise<SyncQuota>,
   ) {
     this.lastSuccess = database.getLastSuccessfulSync();
   }
@@ -111,6 +116,8 @@ export class SyncEngine {
     this.lastError = undefined;
     this.fileFailures = [];
     this.warnings = [];
+    this.restriction = undefined;
+    this.discardAfterPreflight.clear();
     this.renameRefreshUsed = false;
     this.transfers.reset();
     this.publishTransfers();
@@ -122,14 +129,9 @@ export class SyncEngine {
       if (!this.database.getCursor(this.accountKey) && this.database.getBases().size > 0) {
         this.database.resetSyncState();
       }
-      if (!this.accountValidated) {
-        this.emit("account", "正在验证云盘账号与企业空间");
-        await Promise.all([
-          this.api.call("User.getUserDetail", {}),
-          this.api.call("Enterprise.getListByUser", { cache_status: 1 }),
-        ]);
-        this.accountValidated = true;
-      }
+      this.emit("account", "正在检查会员状态与云盘容量");
+      const quota = await this.currentQuota();
+      assertSyncQuota(quota, []);
       this.throwIfCancelled();
       this.bindKnownRenameIdentities();
       this.emit("remote-index", rebuild ? "正在重新检查云端目录" : "正在检查远端变化");
@@ -144,28 +146,36 @@ export class SyncEngine {
         "local-rename": (task) => this.renameLocal(task),
         rename: (task) => this.renameRemote(task), move: (task) => this.moveRemote(task),
       }, { kinds: ["local-rename", "rename", "move"], propagateErrors: true, checkpoint: this.checkpoint });
-      let appliedChanges = await structural.drain();
-      this.throwIfCancelled();
-      appliedChanges += await this.ensureRemoteRoot();
+      let appliedChanges = 0;
       this.emit("compare", "正在比较本地、远端和同步基线");
       await this.planTasks();
-      const planned = this.database.listPendingTasks();
+      const planned = this.pendingPlanTasks();
       const initialConfirmation = this.needsInitialConfirmation();
+      let selectedTasks = planned;
       if (confirmTasks && (planned.length > 0 || initialConfirmation)) {
         const selected = await confirmTasks(planned);
         if (!selected || (planned.length > 0 && selected.size === 0)) throw new SyncCancelledError();
-        this.database.removeTasks(planned.filter((task) => !selected.has(task.id)).map((task) => task.id));
-        await this.checkpoint();
+        selectedTasks = planned.filter((task) => selected.has(task.id));
+        selectedTasks = selectedTasks.filter(task => {
+          const parent = (task.payload as { derivedFrom?: string }).derivedFrom;
+          return !parent || selected.has(parent);
+        });
       }
+      await this.checkQuota(quota, selectedTasks);
+      this.database.removeTasks([...this.discardAfterPreflight,
+        ...planned.filter(task => !selectedTasks.some(selected => selected.id === task.id)).map(task => task.id)]);
+      this.discardAfterPreflight.clear();
+      await this.checkpoint();
       if (this.needsInitialConfirmation()) {
         if (!confirmTasks && planned.length > 0) throw new Error("首次同步需要用户确认");
         this.database.confirmBinding(this.accountKey);
         await this.checkpoint();
       }
-      appliedChanges += await new TaskRunner(this.database, {
-        "local-rename": (task) => this.renameLocal(task),
-        rename: (task) => this.renameRemote(task), move: (task) => this.moveRemote(task),
-      }, { kinds: ["local-rename", "rename", "move"], propagateErrors: true, checkpoint: this.checkpoint }).drain();
+      appliedChanges += await structural.drain();
+      this.throwIfCancelled();
+      const blockedStructure = this.database.listPendingTasks().filter(task => ["local-rename", "rename", "move"].includes(task.kind));
+      if (blockedStructure.length) throw new Error(`${blockedStructure.length} sync tasks are still queued`);
+      appliedChanges += await this.ensureRemoteRoot();
       this.queueTransferProgress();
       this.emit("transfer", "正在执行同步任务");
       const preparation = new TaskRunner(this.database, {
@@ -202,20 +212,42 @@ export class SyncEngine {
         
         return false;
       }
-      const message = error instanceof Error ? error.message : String(error);
+      const restriction = syncRestrictionError(error);
+      this.restriction = restriction;
+      const message = restriction?.message ?? (error instanceof Error ? error.message : String(error));
       const traceId = error instanceof OpenApiError ? error.traceId : undefined;
       const failedTasks = this.database.listFailedTasks();
-      this.lastError = this.failureCount(failedTasks) > 0
+      this.lastError = !restriction && this.failureCount(failedTasks) > 0
         ? `${this.failureCount(failedTasks)} sync files failed`
         : traceId ? `${message} (trace_id: ${traceId})` : message;
       this.emit("error", this.lastError, traceId);
       
-      throw error;
+      throw restriction ?? error;
     } finally {
       
       this.running = false;
       for (const resolve of this.idleWaiters.splice(0)) resolve();
     }
+  }
+
+  private async currentQuota(): Promise<SyncQuota> {
+    if (this.loadQuota) return this.loadQuota();
+    return normalizeAccountProfile(await this.api.call<Record<string, unknown>>("User.getUserDetail", {}), this.settings().ownerQid);
+  }
+
+  private pendingPlanTasks(): SyncTask[] {
+    return this.database.listPendingTasks().filter(task => !this.discardAfterPreflight.has(task.id));
+  }
+
+  private async checkQuota(quota: SyncQuota, tasks: readonly SyncTask[]): Promise<void> {
+    const current = await Promise.all(tasks.map(async task => {
+      const payload = task.payload as { sourcePath?: string; local?: SyncSnapshot };
+      if (task.kind !== "upload") return task;
+      const stat = await this.vault.adapter.stat(payload.sourcePath ?? task.path);
+      return { ...task, payload: { ...payload, local: stat?.type === "file"
+        ? { ...payload.local, kind: "file", size: stat.size } : undefined } };
+    }));
+    assertSyncQuota(quota, current);
   }
 
   retryFailed(): number { return this.database.retryFailedTasks(); }
@@ -278,7 +310,7 @@ export class SyncEngine {
       const resolution = await this.renameResolution(task);
       if (resolution === "execute") continue;
       if (resolution) this.database.replacePendingTask(task.id, resolution);
-      else this.database.removeTasks([task.id]);
+      else this.discardAfterPreflight.add(task.id);
       await this.checkpoint();
     }
   }
@@ -330,11 +362,11 @@ export class SyncEngine {
     const counts = this.database.taskCounts();
     const failedTasks = this.database.listFailedTasks();
     const failureCount = this.failureCount(failedTasks);
-    const displayMessage = phase === "error" && failureCount > 0 ? "部分文件同步失败" : message;
+    const displayMessage = phase === "error" && failureCount > 0 && !this.restriction ? "部分文件同步失败" : message;
     
     this.report({ phase, message: displayMessage, queued: counts.queued, failed: failureCount, completed: this.completed,
       conflicts: this.database.unresolvedConflictCount(), lastSuccess: this.lastSuccess, lastError: this.lastError,
-      failedTasks, fileFailures: [...this.fileFailures], warnings: [...this.warnings] });
+      failedTasks, fileFailures: [...this.fileFailures], warnings: [...this.warnings], restriction: this.restriction });
   }
 
   private failureCount(failedTasks = this.database.listFailedTasks()): number {
@@ -467,27 +499,36 @@ export class SyncEngine {
   }
 
   private async planTasks(): Promise<void> {
+    this.planTaskIndex = new Map(this.database.listPendingTasks().map(task => [`${task.kind}:${pathKey(task.path)}`, task]));
     const local = await this.scanLocal();
-    this.database.removeObsoleteLocalTasks(new Set([...local.values()].map((entry) => entry.path)));
     const remote = this.remoteMap();
     this.database.requeueStaleCompletedRecycleTasks(
       new Map([...remote].map(([key, entry]) => [key, entry.snapshot.nid ?? ""])),
       new Set(local.keys()),
     );
-    this.database.removeObsoleteRecycleTasks(new Set([...remote.values()].map((entry) => entry.path)));
+    for (const task of this.pendingPlanTasks()) {
+      if (task.kind === "recycle" && !remote.has(pathKey(task.path))) this.discardAfterPreflight.add(task.id);
+    }
     const base = new Map<string, PathSnapshot>();
     for (const [path, snapshot] of this.database.getBases()) {
       if (base.has(pathKey(path))) throw new Error(`Sync baseline contains a case-insensitive path collision: ${path}`);
       base.set(pathKey(path), { path, snapshot });
     }
-    const deferredBaseKeys = this.planRemoteRenames(local, remote, base);
+    const deferredBaseKeys = this.projectStructuralTasks(local, remote, base);
+    for (const key of this.planRemoteRenames(local, remote, base)) deferredBaseKeys.add(key);
+    for (const task of this.pendingPlanTasks()) {
+      if ((task.kind === "upload" || task.kind === "mkdir") && !local.has(pathKey(task.path)) &&
+        !(task.payload as { derivedFrom?: string }).derivedFrom) this.discardAfterPreflight.add(task.id);
+    }
     const paths = new Set([...local.keys(), ...remote.keys(), ...base.keys()]);
     const ordered = [...paths].sort((left, right) => {
       const directoryDifference = Number(local.get(right)?.snapshot.kind === "directory") - Number(local.get(left)?.snapshot.kind === "directory");
       return directoryDifference || left.split("/").length - right.split("/").length || left.localeCompare(right);
     });
     const recycledDirectories: string[] = [];
+    const protectedDirectories: string[] = [];
     for (const key of ordered) {
+      if (protectedDirectories.some(prefix => key.startsWith(prefix))) continue;
       const localEntry = local.get(key);
       const remoteEntry = remote.get(key);
       const baseEntry = base.get(key);
@@ -502,22 +543,113 @@ export class SyncEngine {
         baseEntry.path = path;
       }
       const decision = planThreeWay(baseEntry?.snapshot, localEntry?.snapshot, remoteEntry?.snapshot);
+      const nextKind = decision.action === "upload" ? localEntry?.snapshot.kind === "directory" ? "mkdir" : "upload"
+        : decision.action === "delete-remote" ? "recycle"
+        : ["download", "delete-local", "conflict"].includes(decision.action) ? "download" : undefined;
+      for (const kind of ["upload", "download", "mkdir", "recycle"] as const) {
+        const pending = this.planTaskIndex.get(`${kind}:${key}`);
+        if (pending && kind !== nextKind) this.discardAfterPreflight.add(pending.id);
+      }
       const id = crypto.randomUUID();
-      const payload = { local: localEntry?.snapshot, remote: remoteEntry?.snapshot, base: baseEntry?.snapshot,
+      const payload = { local: localEntry?.snapshot, sourcePath: localEntry?.sourcePath,
+        derivedFrom: localEntry?.derivedFrom,
+        remote: remoteEntry?.snapshot, base: baseEntry?.snapshot,
         conflict: decision.action === "conflict", remoteDeleted: decision.action === "conflict" && !remoteEntry };
-      if (decision.action === "upload") this.database.enqueue({ id, kind: localEntry?.snapshot.kind === "directory" ? "mkdir" : "upload", path, payload });
-      else if (decision.action === "download") this.database.enqueue({ id, kind: "download", path, nid: remoteEntry?.snapshot.nid, payload });
+      if (decision.action === "upload") this.enqueuePlan({ id, kind: localEntry?.snapshot.kind === "directory" ? "mkdir" : "upload", path, payload });
+      else if (decision.action === "download") this.enqueuePlan({ id, kind: "download", path, nid: remoteEntry?.snapshot.nid, payload });
       else if (decision.action === "delete-remote") {
         this.database.enqueue({ id, kind: "recycle", path, nid: remoteEntry?.snapshot.nid, payload });
         if (remoteEntry?.snapshot.kind === "directory") recycledDirectories.push(`${key}/`);
       }
-      else if (decision.action === "delete-local") this.database.enqueue({ id, kind: "download", path, payload: { ...payload, remoteDeleted: true } });
-      else if (decision.action === "conflict") this.database.enqueue({ id, kind: "download", path, nid: remoteEntry?.snapshot.nid, payload });
+      else if (decision.action === "delete-local") this.enqueuePlan({ id, kind: "download", path, payload: { ...payload, remoteDeleted: true } });
+      else if (decision.action === "conflict") {
+        const task = this.enqueuePlan({ id, kind: "download", path, nid: remoteEntry?.snapshot.nid, payload });
+        if (localEntry) {
+          const conflictPath = this.allocateConflictPath(task, local, remote);
+          this.planConflictUploads(task, local, conflictPath);
+          if (localEntry.snapshot.kind === "directory") {
+            protectedDirectories.push(`${key}/`);
+            for (const pending of this.pendingPlanTasks()) {
+              if (pathKey(pending.path).startsWith(`${key}/`)) this.discardAfterPreflight.add(pending.id);
+            }
+          }
+        }
+      }
       else if (decision.action === "drop-base") this.database.deleteBase(path);
       else if (decision.action === "none" && remoteEntry && !deferredBaseKeys.has(key)) {
         this.database.putBase(path, remoteEntry.snapshot);
       }
     }
+  }
+
+  /** Refresh snapshots without resetting a pending task's retry state. */
+  private enqueuePlan(task: Parameters<SyncDatabase["enqueue"]>[0]): SyncTask {
+    const key = `${task.kind}:${pathKey(task.path)}`;
+    const existing = this.planTaskIndex.get(key);
+    this.discardAfterPreflight.delete(existing?.id ?? "");
+    if (existing) {
+      const previous = existing.payload as { conflictPath?: string };
+      const payload = { ...task.payload as object, ...(previous.conflictPath ? { conflictPath: previous.conflictPath } : {}) };
+      this.database.updateTaskPlan(existing.id, task.nid, payload);
+      const refreshed = { ...existing, nid: task.nid, payload };
+      this.planTaskIndex.set(key, refreshed);
+      return refreshed;
+    }
+    this.database.enqueue(task);
+    const queued: SyncTask = { ...task, state: "queued", attempt: 0, nextRunAt: task.nextRunAt ?? Date.now() };
+    this.planTaskIndex.set(key, queued);
+    return queued;
+  }
+
+  private allocateConflictPath(task: SyncTask, local: Map<string, PathSnapshot>, remote: Map<string, PathSnapshot>): string {
+    const payload = task.payload as LocalRenamePayload;
+    if (payload.conflictPath) return payload.conflictPath;
+    for (let sequence = 0; sequence < 10_000; sequence++) {
+      const path = buildConflictPath(task.path, this.settings().deviceName, new Date(), sequence);
+      if (local.has(pathKey(path)) || remote.has(pathKey(path)) || this.database.listPendingTasks().some(t =>
+        (t.payload as LocalRenamePayload).conflictPath === path)) continue;
+      payload.conflictPath = path;
+      this.database.updateTaskPayload(task.id, payload);
+      return path;
+    }
+    throw new Error(`Unable to allocate conflict path for ${task.path}`);
+  }
+
+  private planConflictUploads(task: SyncTask, local: Map<string, PathSnapshot>, destination: string): void {
+    const sourceKey = pathKey(task.path);
+    for (const [key, entry] of local) {
+      if (key !== sourceKey && !key.startsWith(`${sourceKey}/`)) continue;
+      this.enqueuePlan({ id: crypto.randomUUID(), kind: entry.snapshot.kind === "directory" ? "mkdir" : "upload",
+        path: `${destination}${entry.path.slice(task.path.length)}`,
+        payload: { local: { ...entry.snapshot, nid: undefined }, sourcePath: entry.sourcePath ?? entry.path,
+          derivedFrom: task.id } });
+    }
+    this.database.updateTaskPayload(task.id, { ...task.payload as object, conflictPlanned: true });
+  }
+
+  /** Project structural intents onto snapshots; no local or cloud files change here. */
+  private projectStructuralTasks(local: Map<string, PathSnapshot>, remote: Map<string, PathSnapshot>, base: Map<string, PathSnapshot>): Set<string> {
+    const deferred = new Set<string>();
+    for (const task of this.pendingPlanTasks()) {
+      if (task.kind === "rename" || task.kind === "move") {
+        const payload = task.payload as RemoteRenamePayload;
+        this.relocateSnapshotTree(remote, payload.intermediatePath ?? task.path, payload.destination);
+        for (const key of this.relocateSnapshotTree(base, task.path, payload.destination)) deferred.add(key);
+      } else if (task.kind === "local-rename") {
+        const payload = task.payload as LocalRenamePayload;
+        if (payload.conflict) {
+          const destination = this.allocateConflictPath(task, local, remote);
+          this.relocateSnapshotTree(local, task.path, destination, true, task.id);
+          this.removeSnapshotTree(base, pathKey(payload.basePath ?? task.path));
+          this.removeSnapshotTree(base, pathKey(task.path));
+          this.database.updateTaskPayload(task.id, { ...payload, conflictPlanned: true });
+        } else {
+          this.relocateSnapshotTree(local, task.path, payload.destination, true, task.id);
+          for (const key of this.relocateSnapshotTree(base, task.path, payload.destination)) deferred.add(key);
+        }
+      }
+    }
+    return deferred;
   }
 
   private planRemoteRenames(
@@ -547,16 +679,18 @@ export class SyncEngine {
       if (!localEntry || this.destinationOccupied(local, sourceKey, destinationKey)) continue;
       const localChanged = !this.localTreeMatchesBase(baseEntry.path, local, base);
 
-      this.database.enqueue({
+      const task = this.enqueuePlan({
         id: crypto.randomUUID(), kind: "local-rename", path: baseEntry.path, nid,
         payload: { destination: remoteEntry.path, local: localEntry.snapshot, base: baseEntry.snapshot,
           remote: remoteEntry.snapshot, conflict: localChanged },
       });
       if (localChanged) {
-        this.removeSnapshotTree(local, sourceKey);
+        const destination = this.allocateConflictPath(task, local, remote);
+        this.relocateSnapshotTree(local, baseEntry.path, destination, true, task.id);
         this.removeSnapshotTree(base, sourceKey);
+        this.database.updateTaskPayload(task.id, { ...task.payload as object, conflictPlanned: true });
       } else {
-        this.relocateSnapshotTree(local, baseEntry.path, remoteEntry.path);
+        this.relocateSnapshotTree(local, baseEntry.path, remoteEntry.path, true, task.id);
         for (const key of this.relocateSnapshotTree(base, baseEntry.path, remoteEntry.path)) deferredBaseKeys.add(key);
       }
       claimedSources.push(`${sourceKey}/`);
@@ -598,7 +732,7 @@ export class SyncEngine {
     for (const key of [...map.keys()]) if (key === sourceKey || key.startsWith(prefix)) map.delete(key);
   }
 
-  private relocateSnapshotTree(map: Map<string, PathSnapshot>, source: string, destination: string): string[] {
+  private relocateSnapshotTree(map: Map<string, PathSnapshot>, source: string, destination: string, trackSource = false, derivedFrom?: string): string[] {
     const sourceKey = pathKey(source);
     const prefix = `${sourceKey}/`;
     const entries = [...map].filter(([key]) => key === sourceKey || key.startsWith(prefix));
@@ -608,7 +742,7 @@ export class SyncEngine {
       const suffix = entry.path.length === source.length ? "" : entry.path.slice(source.length);
       const path = `${destination}${suffix}`;
       const key = pathKey(path);
-      map.set(key, { path, snapshot: entry.snapshot });
+      map.set(key, { path, snapshot: entry.snapshot, sourcePath: entry.sourcePath ?? (trackSource ? entry.path : undefined), derivedFrom: derivedFrom ?? entry.derivedFrom });
       relocated.push(key);
     }
     return relocated;
@@ -760,6 +894,10 @@ export class SyncEngine {
         // Persist the recovery intent before changing the local filesystem. A shutdown
         // recovers this running task with its new local-rename executor.
         this.database.retargetRunningRename(task.id, resolution);
+        await this.planTasks();
+        await this.checkQuota(await this.currentQuota(), this.pendingPlanTasks());
+        this.database.removeTasks([...this.discardAfterPreflight]);
+        this.discardAfterPreflight.clear();
         await this.checkpoint();
         await this.renameLocal(resolution);
       }
@@ -829,18 +967,18 @@ export class SyncEngine {
     const existing = this.vault.getAbstractFileByPath(task.path);
     const existsInAdapter = existing ? true : await this.vault.adapter.exists(task.path, false);
     if (payload.remoteDeleted) {
-      if (existsInAdapter && payload.conflict) await this.preserveConflict(task.path, payload.local);
+      if (existsInAdapter && payload.conflict) await this.preserveConflict(task.path, payload.local, task);
       else if (existing) await this.vault.trash(existing, false);
       else if (existsInAdapter) await this.vault.adapter.trashLocal(task.path);
       this.database.deleteBase(task.path);
       return;
     }
+    if (existsInAdapter && payload.conflict) await this.preserveConflict(task.path, payload.local, task);
     if (payload.remote?.kind === "directory") {
-      if (!existsInAdapter) await this.createLocalDirectory(task.path);
+      if (!existsInAdapter || payload.conflict) await this.createLocalDirectory(task.path);
       this.database.putBase(task.path, payload.remote);
       return;
     }
-    if (existsInAdapter && payload.conflict) await this.preserveConflict(task.path, payload.local);
     this.transfers.queue(task.id, "download", task.path, payload.remote?.size ?? 0);
     this.transfers.start(task.id);
     this.publishTransfers();
@@ -913,7 +1051,7 @@ export class SyncEngine {
     if (payload?.conflictPath) payload.conflictPath = normalizeVaultPath(payload.conflictPath);
     const finish = (destination: string) => {
       this.database.recordConflict(originalPath, destination);
-      if (snapshot) this.database.enqueue({ id: crypto.randomUUID(),
+      if (snapshot && !(renameTask?.payload as { conflictPlanned?: boolean } | undefined)?.conflictPlanned) this.database.enqueue({ id: crypto.randomUUID(),
         kind: snapshot.kind === "directory" ? "mkdir" : "upload", path: destination,
         payload: { local: { ...snapshot, nid: undefined } } });
     };

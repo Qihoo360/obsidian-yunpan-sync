@@ -130,7 +130,7 @@ describe("remote index", () => {
 
     await new RemoteIndexer(api, db, "account", 10).rebuild();
 
-    expect(db.getRemoteNodes()[0]).toMatchObject({ version: 0, size: 0, mtime: 0 });
+    expect(db.getRemoteNodes()[0]).toMatchObject({ version: 0, size: -1, mtime: 0 });
   });
 
   it("preserves duplicate remote paths under distinct stable node ids", async () => {
@@ -755,6 +755,7 @@ describe("task runner", () => {
     expect(db.listPendingTasks().map((task) => [task.kind, task.path, task.payload])).toEqual([
       ["local-rename", "old.md", expect.objectContaining({ destination: "new.md", conflict: true })],
       ["download", "new.md", expect.objectContaining({ remote: expect.objectContaining({ nid: "10" }) })],
+      ["upload", expect.stringMatching(/^old \(conflict-/), expect.objectContaining({ local, sourcePath: "old.md" })],
     ]);
 
     const [protect, download] = db.listPendingTasks();
@@ -1085,6 +1086,19 @@ describe("task runner", () => {
 
     expect(execute).toHaveBeenCalledOnce();
     expect(db.listPendingTasks().map((task) => [task.id, task.state])).toEqual([["two", "queued"]]);
+  });
+
+  it("stops draining on server capacity rejection without failing or consuming the pending plan", async () => {
+    const SQL = await initSqlJs({ locateFile: () => "node_modules/sql.js/dist/sql-wasm.wasm" });
+    const db = new SyncDatabase(new SQL.Database());
+    for (const id of ["one", "two", "three"]) db.enqueue({ id, kind: "upload", path: id, nextRunAt: 0, payload: {} });
+    const upload = vi.fn(async () => { throw new OpenApiError("个人空间不足", 2007); });
+    await expect(new TaskRunner(db, { upload }).drain()).rejects.toMatchObject({ kind: "capacity" });
+    expect(upload).toHaveBeenCalledOnce();
+    expect(db.listPendingTasks().map(t => [t.state, t.attempt])).toEqual([["queued", 0], ["queued", 0], ["queued", 0]]);
+    expect(db.listFailedTasks()).toEqual([]);
+    await new TaskRunner(db, { upload: async () => undefined }).drain();
+    expect(db.listPendingTasks()).toEqual([]);
   });
 
   it("drains more than ten thousand queued tasks", async () => {

@@ -7,6 +7,8 @@ import {
 } from "../src/account/profile.js";
 import {
   hasActiveMembership,
+  hasExpiredMembership,
+  membershipLabel,
   membershipDisplay,
   membershipIcon,
 } from "../src/ui/account-membership.js";
@@ -108,13 +110,32 @@ describe("account profile", () => {
     expect(formatStorageCapacity(undefined)).toBe("未知");
   });
 
-  it("treats an expired membership as a normal account", () => {
+  it("distinguishes an expired membership from a normal account", () => {
     expect(hasActiveMembership({
       displayName: "user", qid: "1", isVip: true, vipLabel: "超级会员", expiresAt: 1000,
     }, 2000)).toBe(false);
     expect(hasActiveMembership({
       displayName: "user", qid: "1", isVip: true, vipLabel: "超级会员", expiresAt: 3000,
     }, 2000)).toBe(true);
+    const expired = { displayName: "user", qid: "1", isVip: true, vipLabel: "超级会员", expiresAt: 1000 };
+    expect(hasExpiredMembership(expired, 2000)).toBe(true);
+    expect(membershipLabel(expired, 2000)).toBe("会员已过期");
+    expect(membershipDisplay(expired, 2000).status.value).toBe("会员已过期");
+  });
+
+  it.each([1_800_000_000, 1_800_000_000_000])("normalizes expiry %s and treats the exact boundary as expired even with is_vip=0", expire => {
+    const profile = normalizeAccountProfile({ is_vip: 0, expire }, "42");
+    expect(profile.expiresAt).toBe(1_800_000_000_000);
+    expect(membershipLabel(profile, 1_800_000_000_000)).toBe("会员已过期");
+    expect(membershipIcon(profile)).toBeUndefined();
+    expect(hasActiveMembership(profile, 1_800_000_000_000)).toBe(false);
+  });
+
+  it("keeps ordinary users distinct and parses current personal and enterprise quotas independently", () => {
+    expect(membershipLabel(normalizeAccountProfile({ is_vip: 0, expire: 0 }, "42"))).toBe("普通用户");
+    expect(normalizeAccountProfile({ used_size: 10, total_size: 100, available_size: "90", e_used_size: 50,
+      e_total_size: 80, e_available_size: "25" }, "42")).toMatchObject({ usedBytes: 10, totalBytes: 100,
+      availableBytes: 90, enterpriseUsedBytes: 50, enterpriseTotalBytes: 80, enterpriseAvailableBytes: 25 });
   });
 
   it("uses the membership icon selected by the backend for the account type", () => {

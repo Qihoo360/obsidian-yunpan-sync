@@ -25,6 +25,7 @@ export interface StatusViewOwner {
   resolveConflict(id: number): Promise<void>;
   hasVaultFile(path: string): Promise<boolean>;
   openVaultPath(path: string): Promise<void>;
+  resolveSyncRestriction?(): Promise<void>;
 }
 
 export class YunpanStatusView extends ItemView {
@@ -83,6 +84,9 @@ export class YunpanStatusView extends ItemView {
       cls: "setting-item-description" });
     if (status.lastError) container.createDiv({ text: classifySyncError(status.lastError).detail,
       cls: "yunpan-sync-profile-error" });
+    if (status.restriction) container.createEl("button", { cls: "mod-cta",
+      text: status.restriction.kind === "membership" ? "去续费" : status.restriction.kind === "capacity" ? "去扩容" : "刷新后重试" })
+      .addEventListener("click", () => void this.owner.resolveSyncRestriction?.());
 
     const action = sideStatusAction(this.owner.isPaused, status.phase);
     new Setting(container).addButton((button) => button.setButtonText("立即同步").setCta()
