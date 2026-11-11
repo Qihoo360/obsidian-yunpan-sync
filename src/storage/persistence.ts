@@ -10,7 +10,9 @@ function arrayBuffer(bytes: Uint8Array): ArrayBuffer {
 }
 
 export class DatabasePersistence {
-  private saveQueue: Promise<void> = Promise.resolve();
+  private saving?: Promise<void>;
+  private requested = 0;
+  private persisted = 0;
 
   private constructor(
     readonly database: SyncDatabase,
@@ -28,9 +30,17 @@ export class DatabasePersistence {
   }
 
   async save(): Promise<void> {
-    const operation = this.saveQueue.catch(() => undefined).then(() => this.writeSnapshot());
-    this.saveQueue = operation;
-    return operation;
+    const version = ++this.requested;
+    while (this.persisted < version) {
+      if (!this.saving) {
+        this.saving = Promise.resolve().then(async () => {
+          const covered = this.requested;
+          await this.writeSnapshot();
+          this.persisted = covered;
+        }).finally(() => { this.saving = undefined; });
+      }
+      await this.saving;
+    }
   }
 
   private async writeSnapshot(): Promise<void> {

@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 class ElementStub {
+  className = "";
+  src = "";
   type = "";
   min = "";
   max = "";
@@ -8,6 +10,7 @@ class ElementStub {
   hidden = false;
   attributes: Record<string, string> = {};
   children: ElementStub[] = [];
+  all(): ElementStub[] { return [this, ...this.children.flatMap(child => child.all())]; }
   parent?: ElementStub;
   classes = new Set<string>();
   empty() { this.textContent = ""; this.children = []; }
@@ -50,6 +53,10 @@ class ControlStub {
   click?: () => unknown;
   change?: (value: string) => unknown;
   value = "";
+  icon = "";
+  tooltip = "";
+  setIcon(icon: string) { this.icon = icon; return this; }
+  setTooltip(tooltip: string) { this.tooltip = tooltip; return this; }
   setButtonText(label: string) { this.label = label; return this; }
   setDisabled(disabled: boolean) { this.disabled = disabled; return this; }
   setCta() { return this; }
@@ -76,8 +83,8 @@ const harness = vi.hoisted(() => ({
   secrets: new Map<string, string>(),
   protocolHandler: undefined as ((params: Record<string, string>) => void) | undefined,
 }));
-const rows: { name: string; descEl: ElementStub; settingEl: ElementStub; controlEl: ElementStub; buttons: ControlStub[]; controls: ControlStub[] }[] = [];
-const tabs: { display(): void; hide(): void; containerEl: ElementStub }[] = [];
+const rows: { name: string; nameEl: ElementStub; descEl: ElementStub; settingEl: ElementStub; controlEl: ElementStub; buttons: ControlStub[]; controls: ControlStub[] }[] = [];
+const tabs: { display(): void; refresh(): void; hide(): void; isVisible: boolean; containerEl: ElementStub }[] = [];
 const links: ElementStub[] = [];
 
 vi.mock("obsidian", async (importOriginal) => ({
@@ -105,6 +112,7 @@ vi.mock("obsidian", async (importOriginal) => ({
   PluginSettingTab: class { containerEl = new ElementStub(); },
   Setting: class {
     name = "";
+    nameEl = new ElementStub();
     descEl = new ElementStub();
     settingEl = new ElementStub();
     controlEl = new ElementStub();
@@ -140,7 +148,7 @@ vi.mock("obsidian", async (importOriginal) => ({
     };
     async loadData() { return harness.persisted; }
     async saveData(data: unknown) { harness.persisted = structuredClone(data); }
-    addSettingTab(tab: { display(): void; hide(): void; containerEl: ElementStub }) { tabs.push(tab); }
+    addSettingTab(tab: { display(): void; refresh(): void; hide(): void; isVisible: boolean; containerEl: ElementStub }) { tabs.push(tab); }
     addStatusBarItem() { return new ElementStub(); }
     registerObsidianProtocolHandler(_action: string, callback: (params: Record<string, string>) => void) {
       harness.protocolHandler = callback;
@@ -161,6 +169,7 @@ vi.mock("../src/storage/persistence.js", () => ({
       database: {
         recoverInterruptedTasks() {}, taskCounts: () => ({ queued: 0, failed: 0 }),
         listFailedTasks: () => [], getLastSuccessfulSync: () => undefined,
+        isBindingConfirmed: () => true,
       },
     }); },
   },
@@ -182,6 +191,8 @@ import YunpanSyncPlugin from "../src/main.js";
 import { DEFAULT_SETTINGS } from "../src/settings.js";
 import { AUTH_SECRET_ID, LEGACY_AUTH_SECRET_ID, MOBILE_PENDING_OAUTH_SECRET_ID } from "../src/auth/secrets.js";
 import { SyncPreflightError } from "../src/sync/quota.js";
+import { SyncEngine } from "../src/sync/engine.js";
+import { normalizeAccountProfile } from "../src/account/profile.js";
 
 async function loadPlugin() {
   const plugin = new YunpanSyncPlugin({} as never, {} as never);
@@ -209,13 +220,237 @@ describe("login settings and installation lifecycle", () => {
       clearInterval: (...args: Parameters<typeof clearInterval>) => clearInterval(...args),
       setTimeout: (...args: Parameters<typeof setTimeout>) => setTimeout(...args),
       clearTimeout: (...args: Parameters<typeof clearTimeout>) => clearTimeout(...args) });
-    vi.stubGlobal("document", {});
-    vi.stubGlobal("navigator", { clipboard: { writeText: harness.copy } });
+    vi.stubGlobal("document", { createElement: () => new ElementStub() });
+    vi.stubGlobal("navigator", { clipboard: { writeText: harness.copy }, onLine: true, connection: { type: "wifi" } });
   });
   afterEach(() => { vi.restoreAllMocks(); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
   const storedAuth = () => ({ accessToken: "saved-access", qid: "42", token: "saved-token",
     expiresAt: Date.now() + 3_600_000, oauthCode: "saved-code" });
+
+  it("deletes the displayed failed task from the settings error summary", async () => {
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
+    const plugin = await loadPlugin();
+    Object.assign(plugin, { status: { phase: "error", message: "同步失败", queued: 0, failed: 1,
+      lastError: "具体原因：具体原因：ENOENT: missing",
+      failedTasks: [{ id: "missing-file", kind: "upload", path: "missing.md", state: "failed" }] } });
+    const remove = vi.spyOn(plugin, "removeFailedTask").mockResolvedValue(undefined);
+    tabs.at(-1)!.refresh();
+    const status = rows.filter(row => row.name === "同步状态").at(-1)!;
+    expect(status.descEl.textContent).toContain("具体原因：ENOENT: missing");
+    expect(status.descEl.textContent).not.toContain("具体原因：具体原因：");
+    const action = status.descEl.all().find(el => el.classes.has("yunpan-sync-status-error-action"))!;
+    action.fire("click");
+    expect(remove).toHaveBeenCalledExactlyOnceWith("missing-file");
+  });
+
+  const expiredDetails = () => ({ is_vip: 1, vip_desc: "高级会员", expire: Math.floor(Date.now() / 1000) - 60,
+    name: "test-account", used_size: 10, total_size: 100 });
+  const renewedDetails = () => ({ ...expiredDetails(), expire: Math.floor(Date.now() / 1000) + 86400 });
+  async function expiredProfileFixture() {
+    const plugin = await loadPlugin();
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
+    const api = { call: vi.fn() };
+    const engine = { isRunning: () => false, clearMembershipRestriction: vi.fn() };
+    Object.assign(plugin, { api, engine, accountProfile: normalizeAccountProfile(expiredDetails(), "42"),
+      status: { phase: "error", queued: 2, failed: 0, message: "您的会员套餐已过期", lastError: "您的会员套餐已过期",
+        restriction: { kind: "membership", message: "您的会员套餐已过期" } } });
+    const tab = tabs.at(-1)!;
+    const accountRows = () => rows.filter(row => row.settingEl.parent?.attributes["aria-label"] === "账号设置");
+    const refreshButton = () => accountRows().at(-1)?.buttons.find(button => button.tooltip === "刷新会员状态");
+    const membershipLabelEl = () => accountRows().at(-1)?.nameEl.all()
+      .find(el => el.className.split(" ").includes("yunpan-sync-membership-label"));
+    const membershipIconEl = () => accountRows().at(-1)?.nameEl.all()
+      .find(el => el.className === "yunpan-sync-membership-icon");
+    return { plugin, api, engine, tab, refreshButton, accountRows, membershipLabelEl, membershipIconEl };
+  }
+
+  it.each([false, true])("reloads personal details on each settings entry without requesting again on redraw (mobile=%s)", async mobile => {
+    harness.platform.isMobileApp = mobile;
+    const { plugin, api, engine, tab, refreshButton, membershipLabelEl, membershipIconEl } = await expiredProfileFixture();
+    let complete!: (data: unknown) => void;
+    api.call.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+    tab.display();
+    expect(api.call).toHaveBeenCalledExactlyOnceWith("User.getUserDetail", {});
+    expect(refreshButton()).toMatchObject({ icon: "refresh-cw", disabled: true });
+    expect(membershipLabelEl()).toMatchObject({ textContent: "会员已过期", hidden: true });
+    expect(refreshButton()!.buttonEl.classes.has("clickable-icon")).toBe(true);
+    expect(refreshButton()!.buttonEl.classes.has("yunpan-sync-membership-refresh")).toBe(true);
+    expect(refreshButton()!.buttonEl.parent).toBe(membershipLabelEl()!.parent);
+    expect(membershipLabelEl()!.parent!.children).toEqual([membershipLabelEl(), refreshButton()!.buttonEl]);
+    const sameRequest = plugin.refreshAccountProfile(false);
+    expect(api.call).toHaveBeenCalledTimes(1);
+    complete(renewedDetails()); await sameRequest;
+    expect(plugin.profile?.expiresAt).toBeGreaterThan(Date.now());
+    expect(refreshButton()).toBeUndefined();
+    expect(membershipLabelEl()).toMatchObject({ textContent: "高级会员", hidden: false });
+    expect(membershipIconEl()?.src).toMatch(/^data:image\/png;base64,/);
+    expect(plugin.currentStatus).toMatchObject({ phase: "idle", queued: 2, failed: 0,
+      message: "会员状态已更新，可继续同步", restriction: undefined, lastError: undefined });
+    expect(engine.clearMembershipRestriction).toHaveBeenCalledOnce();
+    tab.refresh(); await plugin.saveSettings();
+    expect(api.call).toHaveBeenCalledTimes(1);
+    api.call.mockResolvedValue(renewedDetails());
+    tab.hide(); tab.display(); await plugin.refreshAccountProfile(false);
+    expect(api.call).toHaveBeenCalledTimes(2);
+    await plugin.onunload();
+  });
+
+  it("retains the expired profile and refresh action on failure, then updates after an explicit retry", async () => {
+    const { plugin, api, tab, refreshButton, accountRows, membershipLabelEl } = await expiredProfileFixture();
+    api.call.mockRejectedValueOnce(new Error("network unavailable"));
+    tab.display(); await plugin.refreshAccountProfile(false);
+    expect(plugin.currentStatus.restriction?.kind).toBe("membership");
+    expect(refreshButton()).toMatchObject({ disabled: false });
+    expect(membershipLabelEl()).toMatchObject({ textContent: "会员已过期", hidden: false });
+    expect(accountRows().at(-1)!.descEl.children[0]?.textContent).toContain("network unavailable");
+    let complete!: (data: unknown) => void;
+    api.call.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+    const retry = refreshButton()!.click!();
+    expect(refreshButton()?.disabled).toBe(true);
+    expect(membershipLabelEl()?.hidden).toBe(true);
+    complete(renewedDetails()); await retry;
+    expect(plugin.profileError).toBeUndefined();
+    expect(refreshButton()).toBeUndefined();
+    expect(api.call).toHaveBeenCalledTimes(2);
+    await plugin.onunload();
+  });
+
+  it("keeps the refresh icon when the server still reports expiry and does not auto-start synchronization", async () => {
+    const { plugin, api, tab, refreshButton, engine, membershipLabelEl } = await expiredProfileFixture();
+    const sync = vi.spyOn(plugin, "syncNow");
+    api.call.mockResolvedValue(expiredDetails());
+    tab.display();
+    expect(membershipLabelEl()?.hidden).toBe(true);
+    await plugin.refreshAccountProfile(false);
+    expect(refreshButton()?.disabled).toBe(false);
+    expect(membershipLabelEl()).toMatchObject({ textContent: "会员已过期", hidden: false });
+    expect(plugin.currentStatus.restriction?.kind).toBe("membership");
+    expect(engine.clearMembershipRestriction).not.toHaveBeenCalled();
+    expect(sync).not.toHaveBeenCalled();
+    await plugin.onunload();
+  });
+
+  it("does not reopen hidden settings after a request completes", async () => {
+    const { plugin, api, tab } = await expiredProfileFixture();
+    let complete!: (data: unknown) => void;
+    api.call.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+    tab.display();
+    const pending = plugin.refreshAccountProfile(false);
+    tab.hide(); const count = rows.length;
+    complete(renewedDetails()); await pending;
+    expect(tab.isVisible).toBe(false);
+    expect(rows).toHaveLength(count);
+    await plugin.onunload();
+  });
+
+  it("ignores a previous account's late response without clearing the replacement request's loading state", async () => {
+    const { plugin, api, tab } = await expiredProfileFixture();
+    let oldComplete!: (data: unknown) => void;
+    api.call.mockImplementationOnce(() => new Promise(resolve => { oldComplete = resolve; }));
+    tab.display(); const oldRequest = plugin.refreshAccountProfile(false);
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify({ ...storedAuth(), qid: "99" }));
+    let newComplete!: (data: unknown) => void;
+    const replacementApi = { call: vi.fn(() => new Promise(resolve => { newComplete = resolve; })) };
+    Object.assign(plugin, { api: replacementApi, accountProfile: undefined });
+    const replacementRequest = plugin.refreshAccountProfile(false);
+    oldComplete(renewedDetails()); await oldRequest;
+    expect(plugin.profile).toBeUndefined(); expect(plugin.profileLoading).toBe(true);
+    newComplete({ ...renewedDetails(), name: "new-account" }); await replacementRequest;
+    expect(plugin.profile).toMatchObject({ qid: "99", displayName: "new-account" });
+    expect(plugin.profileLoading).toBe(false);
+    await plugin.onunload();
+  });
+
+  it("preserves a user's pause switch and unrelated capacity restrictions", async () => {
+    const { plugin, api, tab } = await expiredProfileFixture();
+    plugin.settings.paused = true;
+    api.call.mockResolvedValue(renewedDetails());
+    tab.display(); await plugin.refreshAccountProfile(false);
+    expect(plugin.isPaused).toBe(true); expect(plugin.currentStatus.phase).toBe("paused");
+    Object.assign(plugin, { status: { phase: "error", message: "套餐容量不足", restriction: { kind: "capacity" }, queued: 2, failed: 1 } });
+    await plugin.refreshAccountProfile(false);
+    expect(plugin.currentStatus).toMatchObject({ phase: "error", restriction: { kind: "capacity" }, failed: 1 });
+    await plugin.onunload();
+  });
+
+  it.each([false, true])("starts initial detection without a click in automatic mode (mobile=%s)", async mobile => {
+    vi.useFakeTimers();
+    harness.platform.isMobileApp = mobile;
+    harness.persisted = { ...DEFAULT_SETTINGS, mode: "automatic" };
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
+    vi.spyOn(YunpanSyncPlugin.prototype, "refreshAccountProfile").mockResolvedValue();
+    vi.spyOn(SyncEngine.prototype, "needsInitialConfirmation").mockReturnValue(true);
+    const synchronize = vi.spyOn(SyncEngine.prototype, "synchronize").mockResolvedValue(true);
+    const plugin = await loadPlugin();
+    await vi.advanceTimersByTimeAsync(1499);
+    expect(synchronize).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(synchronize).toHaveBeenCalledExactlyOnceWith(false, expect.any(Function));
+    await plugin.onunload();
+  });
+
+  it("offers initial confirmation on an automatic trigger, suppresses repeats after cancel, and allows manual retry", async () => {
+    const plugin = await loadPlugin();
+    const confirm = vi.spyOn(plugin as unknown as { confirmSyncTasks(): Promise<undefined> }, "confirmSyncTasks")
+      .mockResolvedValue(undefined);
+    vi.spyOn(plugin, "showSyncProgress").mockImplementation(() => {});
+    const synchronize = vi.fn(async (_rebuild: boolean, choose?: (tasks: []) => Promise<unknown>) => {
+      await choose?.([]); return false;
+    });
+    Object.assign(plugin, { engine: { synchronize, needsInitialConfirmation: () => true, isRunning: () => false } });
+    await plugin.syncNow(false, false);
+    expect(confirm).toHaveBeenCalledOnce();
+    await plugin.syncNow(false, false);
+    expect(synchronize).toHaveBeenCalledOnce();
+    expect(plugin.currentStatus.message).toBe("等待首次同步确认");
+    await plugin.syncNow();
+    expect(confirm).toHaveBeenCalledTimes(2);
+    await plugin.onunload();
+  });
+
+  it("validates size settings as a pair, waits for a running sync and preserves existing records", async () => {
+    const plugin = await loadPlugin();
+    const order: string[] = [];
+    const engine = { isRunning: () => true, cancel: () => { order.push("cancel"); }, waitForIdle: async () => { order.push("idle"); } };
+    Object.assign(plugin, { engine });
+    expect(await plugin.setFileSizeRange(0, 0)).toBe(false);
+    expect(await plugin.setFileSizeRange(5, 1)).toBe(false);
+    expect(order).toEqual([]);
+    expect(plugin.settings.maxFileSizeMB).toBe(30);
+    expect(await plugin.setFileSizeRange(0.5, 12.5)).toBe(false);
+    expect(await plugin.setFileSizeRange(5, 12)).toBe(true);
+    expect(order).toEqual(["cancel", "idle"]);
+    expect(harness.persisted).toMatchObject({ minFileSizeMB: 5, maxFileSizeMB: 12 });
+    await plugin.setFilterRules([{ id: "mine", enabled: true, action: "exclude", pattern: "**/*.log", caseSensitive: false }]);
+    expect(plugin.settings.filterRules[0]?.id).toBe("mine");
+    // The test database deliberately has no reset method: filter edits must preserve it.
+    await plugin.onunload();
+  });
+
+  it.each([false, true])("saves integer size limits only on blur without replacing the controls (mobile=%s)", async mobile => {
+    harness.platform.isMobileApp = mobile; harness.platform.isIosApp = mobile;
+    const plugin = await loadPlugin();
+    const row = rows.find(item => item.name === "单文件大小范围")!;
+    const [lower, upper] = row.controls;
+    expect(row.buttons).toHaveLength(0);
+    const saves = vi.spyOn(plugin, "saveData");
+    lower!.inputEl.fire("blur");
+    await vi.waitFor(() => expect(plugin.settings.maxFileSizeMB).toBe(30));
+    upper!.change!("500");
+    expect(plugin.settings.maxFileSizeMB).toBe(30);
+    upper!.inputEl.fire("blur");
+    await vi.waitFor(() => expect(saves).toHaveBeenCalledOnce());
+    expect(harness.persisted).toMatchObject({ minFileSizeMB: 0, maxFileSizeMB: 500 });
+    expect(rows.filter(item => item.name === "单文件大小范围")).toEqual([row]);
+    for (const value of ["", "1.5", "501", "-1", "0"]) {
+      upper!.change!(value); upper!.inputEl.fire("blur");
+    }
+    await vi.waitFor(() => expect(harness.notice).toHaveBeenCalledTimes(5));
+    expect(saves).toHaveBeenCalledOnce();
+    expect(plugin.settings.maxFileSizeMB).toBe(500);
+    await plugin.onunload();
+  });
 
   it.each([true, false])("updates repeated automatic restrictions quietly and opens payment only on action (mobile=%s)", async mobile => {
     harness.platform.isMobileApp = mobile;
@@ -404,7 +639,7 @@ describe("login settings and installation lifecycle", () => {
     let plugin = await loadPlugin();
     expect(plugin.auth).toEqual(auth);
     expect(plugin.currentStatus.message).toBe("已登录");
-    expect(refresh).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledTimes(2); // Startup and explicit settings entry.
     for (let reload = 0; reload < 2; reload++) {
       await plugin.onunload();
       expect(harness.secrets.get(AUTH_SECRET_ID)).toBe(JSON.stringify(auth));

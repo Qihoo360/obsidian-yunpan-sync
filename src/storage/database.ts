@@ -1,4 +1,4 @@
-import type { BindParams, Database } from "sql.js";
+import type { BindParams, Database, Statement } from "sql.js";
 import type { SyncSnapshot } from "../domain/planner.js";
 import { normalizeVaultPath } from "../domain/paths.js";
 
@@ -64,6 +64,8 @@ function rowObject<T>(db: Database, sql: string, params: BindParams): T | undefi
 
 export class SyncDatabase {
   private transactionDepth = 0;
+  private enqueueLookup?: Statement;
+  private enqueueInsert?: Statement;
   
 
   constructor(private readonly db: Database) {
@@ -93,6 +95,7 @@ export class SyncDatabase {
         next_run_at INTEGER NOT NULL, payload TEXT NOT NULL, last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS tasks_runnable ON tasks(state, next_run_at);
+      CREATE INDEX IF NOT EXISTS tasks_kind_path_state ON tasks(kind,path,state);
       CREATE TABLE IF NOT EXISTS suppressions (
         path TEXT PRIMARY KEY, operation TEXT NOT NULL, expected_hash TEXT, expires_at INTEGER NOT NULL
       );
@@ -113,6 +116,7 @@ export class SyncDatabase {
       );
       CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
     `);
+    this.db.run("DROP TABLE IF EXISTS remote_nodes_staging");
     const schemaVersion = Number(this.db.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0);
     if (schemaVersion < 1) {
       this.db.run(`
@@ -131,6 +135,7 @@ export class SyncDatabase {
         COMMIT;
       `);
     }
+    this.db.run("CREATE INDEX IF NOT EXISTS remote_nodes_path_nocase ON remote_nodes(path COLLATE NOCASE)");
     // Preserve the previous successful time before retiring legacy storage.
     if (this.db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='logs'").length) {
       this.db.run("INSERT OR IGNORE INTO sync_state(key,value) SELECT 'last_success',MAX(at) FROM logs WHERE level='info' AND phase='idle' AND message IN ('同步完成','已是最新') HAVING MAX(at) IS NOT NULL");
@@ -207,6 +212,46 @@ export class SyncDatabase {
     });
   }
 
+  beginRemoteSnapshot(): void {
+    this.db.run("DROP TABLE IF EXISTS remote_nodes_staging");
+    this.db.run(`CREATE TABLE remote_nodes_staging (
+      nid TEXT PRIMARY KEY,pid TEXT NOT NULL,path TEXT NOT NULL,name TEXT NOT NULL,
+      is_dir INTEGER NOT NULL,version INTEGER NOT NULL,hash TEXT,size INTEGER NOT NULL,mtime INTEGER NOT NULL,status INTEGER)`);
+  }
+
+  stageRemoteNodes(nodes: readonly RemoteNode[]): void {
+    this.transaction(() => {
+      const insert = this.db.prepare("INSERT INTO remote_nodes_staging VALUES(?,?,?,?,?,?,?,?,?,?)");
+      try {
+        for (const node of nodes) insert.run([node.nid,node.pid,node.path,node.name,node.isDir ? 1 : 0,
+          node.version,node.hash ?? null,node.size,node.mtime,node.status ?? null]);
+      } finally { insert.free(); }
+    });
+  }
+
+  publishRemoteSnapshot(cursor: SyncCursor): void {
+    this.transaction(() => {
+      this.db.run("DROP TABLE remote_nodes");
+      this.db.run("ALTER TABLE remote_nodes_staging RENAME TO remote_nodes");
+      this.db.run("CREATE INDEX remote_nodes_path ON remote_nodes(path)");
+      this.db.run("CREATE INDEX remote_nodes_path_nocase ON remote_nodes(path COLLATE NOCASE)");
+      this.setCursor(cursor);
+    });
+  }
+
+  discardRemoteSnapshot(): void { this.db.run("DROP TABLE IF EXISTS remote_nodes_staging"); }
+
+  saveDiagnostics(value: unknown): void {
+    this.db.run("CREATE TABLE IF NOT EXISTS sync_diagnostics (id INTEGER PRIMARY KEY, data TEXT NOT NULL)");
+    this.db.run("INSERT OR REPLACE INTO sync_diagnostics VALUES(1,$data)", { $data: JSON.stringify(value) });
+  }
+
+  getDiagnostics(): unknown {
+    if (!this.db.exec("SELECT name FROM sqlite_master WHERE name='sync_diagnostics'").length) return undefined;
+    const row = rowObject<Record<string, unknown>>(this.db, "SELECT data FROM sync_diagnostics WHERE id=1", {});
+    return row ? JSON.parse(String(row.data)) : undefined;
+  }
+
   upsertRemoteNode(node: RemoteNode): void {
     this.db.run(`INSERT INTO remote_nodes(nid,pid,path,name,is_dir,version,hash,size,mtime,status)
       VALUES($nid,$pid,$path,$name,$dir,$version,$hash,$size,$mtime,$status)
@@ -219,8 +264,9 @@ export class SyncDatabase {
     });
   }
 
-  getRemoteNodes(): RemoteNode[] {
-    const result = this.db.exec("SELECT * FROM remote_nodes ORDER BY path");
+  getRemoteNodes(nid?: string): RemoteNode[] {
+    const result = nid === undefined ? this.db.exec("SELECT * FROM remote_nodes ORDER BY path")
+      : this.db.exec("SELECT * FROM remote_nodes WHERE nid=$nid", { $nid: nid });
     if (!result[0]) return [];
     const { columns, values } = result[0];
     return values.map((valuesRow) => {
@@ -229,6 +275,48 @@ export class SyncDatabase {
         isDir: Number(row.is_dir) === 1, version: Number(row.version), hash: row.hash == null ? undefined : String(row.hash),
         size: Number(row.size), mtime: Number(row.mtime), status: row.status == null ? undefined : Number(row.status) };
     });
+  }
+
+  getRemoteNode(nid: string): RemoteNode | undefined { return this.getRemoteNodes(nid)[0]; }
+
+  hasRemoteDirectory(path: string): boolean {
+    return Boolean(rowObject(this.db, "SELECT nid FROM remote_nodes WHERE path=$path COLLATE NOCASE AND is_dir=1 LIMIT 1",
+      { $path: path.replace(/\/+$/, "") }));
+  }
+
+  async *remoteNodeBatches(root?: string): AsyncGenerator<RemoteNode[]> {
+    let rowid = 0;
+    const prefix = root?.replace(/[\\%_]/g, "\\$&");
+    while (true) {
+      const result = this.db.exec(`SELECT rowid AS _rowid,* FROM remote_nodes WHERE rowid>$rowid
+        ${prefix === undefined ? "" : "AND path LIKE $prefix ESCAPE '\\'"} ORDER BY rowid LIMIT 100`,
+      prefix === undefined ? { $rowid: rowid } : { $rowid: rowid, $prefix: `${prefix}%` })[0];
+      if (!result?.values.length) return;
+      const rows = result.values.map(values => Object.fromEntries(result.columns.map((column, i) => [column, values[i]])));
+      rowid = Number(rows.at(-1)!._rowid);
+      yield rows.map(row => ({ nid: String(row.nid), pid: String(row.pid), path: String(row.path), name: String(row.name),
+        isDir: Number(row.is_dir) === 1, version: Number(row.version), hash: row.hash == null ? undefined : String(row.hash),
+        size: Number(row.size), mtime: Number(row.mtime), status: row.status == null ? undefined : Number(row.status) }));
+    }
+  }
+
+  async *baseBatches(): AsyncGenerator<Array<[string, SyncSnapshot]>> {
+    let rowid = 0;
+    while (true) {
+      const result = this.db.exec("SELECT rowid AS _rowid,* FROM sync_base WHERE rowid>$rowid ORDER BY rowid LIMIT 100", { $rowid: rowid })[0];
+      if (!result?.values.length) return;
+      const rows = result.values.map(values => Object.fromEntries(result.columns.map((column, i) => [column, values[i]])));
+      rowid = Number(rows.at(-1)!._rowid);
+      yield rows.map(row => [String(row.path), { nid: row.nid == null ? undefined : String(row.nid),
+        hash: row.hash == null ? undefined : String(row.hash), size: Number(row.size), mtime: Number(row.mtime),
+        kind: row.kind as SyncSnapshot["kind"], version: row.version == null ? undefined : Number(row.version) }]);
+    }
+  }
+
+  hasBases(): boolean { return Boolean(rowObject(this.db, "SELECT path FROM sync_base LIMIT 1", {})); }
+
+  hasRemoteTombstones(): boolean {
+    return Boolean(rowObject(this.db, "SELECT nid FROM remote_nodes WHERE status IS NOT NULL AND status<>0 LIMIT 1", {}));
   }
 
   /** Remove remote tombstones left by older indexer versions without touching local state. */
@@ -421,7 +509,7 @@ export class SyncDatabase {
   }
 
   retryFailedTasks(): number {
-    this.db.run("UPDATE tasks SET state='retry',next_run_at=0 WHERE state='failed'");
+    this.db.run("UPDATE tasks SET state='retry',next_run_at=0 WHERE state IN ('retry','failed')");
     return this.db.getRowsModified();
   }
 
@@ -535,16 +623,36 @@ export class SyncDatabase {
 
   enqueue(task: NewSyncTask): void {
     const normalizedPath = normalizeVaultPath(task.path);
-    const existing = rowObject<Record<string, unknown>>(this.db,
+    let existing: unknown;
+    if (this.enqueueLookup) {
+      this.enqueueLookup.bind({ $kind: task.kind, $path: normalizedPath });
+      existing = this.enqueueLookup.step();
+      this.enqueueLookup.reset();
+    } else existing = rowObject<Record<string, unknown>>(this.db,
       "SELECT id FROM tasks WHERE kind=$kind AND path=$path AND state IN ('queued','running','retry','failed') LIMIT 1",
       { $kind: task.kind, $path: normalizedPath });
     if (existing) return;
-    this.db.run(`INSERT INTO tasks(id,kind,path,nid,state,expected_local_hash,expected_remote_version,attempt,next_run_at,payload)
+    const sql = `INSERT INTO tasks(id,kind,path,nid,state,expected_local_hash,expected_remote_version,attempt,next_run_at,payload)
       VALUES($id,$kind,$path,$nid,'queued',$hash,$version,0,$next,$payload)
-      ON CONFLICT(id) DO NOTHING`, {
+      ON CONFLICT(id) DO NOTHING`;
+    const params = {
       $id: task.id, $kind: task.kind, $path: normalizedPath, $nid: task.nid ?? null,
       $hash: task.expectedLocalHash ?? null, $version: task.expectedRemoteVersion ?? null,
       $next: task.nextRunAt ?? Date.now(), $payload: JSON.stringify(task.payload ?? {}),
+    };
+    if (this.enqueueInsert) this.enqueueInsert.run(params);
+    else this.db.run(sql, params);
+  }
+
+  taskBatch(work: () => void): void {
+    this.transaction(() => {
+      this.enqueueLookup = this.db.prepare("SELECT id FROM tasks WHERE kind=$kind AND path=$path AND state IN ('queued','running','retry','failed') LIMIT 1");
+      this.enqueueInsert = this.db.prepare(`INSERT INTO tasks(id,kind,path,nid,state,expected_local_hash,expected_remote_version,attempt,next_run_at,payload)
+        VALUES($id,$kind,$path,$nid,'queued',$hash,$version,0,$next,$payload) ON CONFLICT(id) DO NOTHING`);
+      try { work(); } finally {
+        this.enqueueLookup.free(); this.enqueueInsert.free();
+        this.enqueueLookup = undefined; this.enqueueInsert = undefined;
+      }
     });
   }
 
@@ -592,7 +700,9 @@ export class SyncDatabase {
     let restored = 0;
     this.transaction(() => {
       for (const task of tasks) {
-        const key = normalizeVaultPath(task.path).toLocaleLowerCase("en-US");
+        let key: string;
+        try { key = normalizeVaultPath(task.path).toLocaleLowerCase("en-US"); }
+        catch { continue; } // Historical completed records cannot block a new scan.
         if (!task.nid || remote.get(key) !== task.nid || local.has(key)) continue;
         const payload = task.payload as { remote?: SyncSnapshot; base?: SyncSnapshot };
         const snapshot = payload.remote ?? payload.base;
@@ -676,6 +786,22 @@ export class SyncDatabase {
     });
   }
 
+  skipRunningTask(id: string): void {
+    this.transaction(() => {
+      const children = new Map<string, string[]>();
+      for (const task of this.listPendingTasks()) {
+        const parent = (task.payload as { derivedFrom?: string }).derivedFrom;
+        if (parent) { const group = children.get(parent) ?? []; group.push(task.id); children.set(parent, group); }
+      }
+      const ids = new Set([id]);
+      for (const current of ids) for (const child of children.get(current) ?? []) ids.add(child);
+      for (const current of ids) {
+        this.clearTransfer(current);
+        this.db.run("DELETE FROM tasks WHERE id=$id AND state IN ('running','queued','retry','failed')", { $id: current });
+      }
+    });
+  }
+
   nextRunnableTask(now = Date.now(), kinds?: TaskKind[]): SyncTask | undefined {
     const kindClause = kinds?.length ? ` AND kind IN (${kinds.map((_, index) => `$kind${index}`).join(",")})` : "";
     const params: Record<string, string | number> = { $now: now };
@@ -687,7 +813,9 @@ export class SyncDatabase {
   }
 
   private taskFromRow(row: Record<string, unknown>): SyncTask {
-    return { id: String(row.id), kind: row.kind as TaskKind, path: normalizeVaultPath(String(row.path)),
+    // Historical invalid names must remain readable for identity-based replanning.
+    // Execution validates paths separately; never silently sanitize them here.
+    return { id: String(row.id), kind: row.kind as TaskKind, path: String(row.path),
       nid: row.nid == null ? undefined : String(row.nid), state: row.state as TaskState,
       expectedLocalHash: row.expected_local_hash == null ? undefined : String(row.expected_local_hash),
       expectedRemoteVersion: row.expected_remote_version == null ? undefined : Number(row.expected_remote_version),

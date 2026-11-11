@@ -10,6 +10,19 @@ export interface SyncErrorGuidance {
   detail: string;
 }
 
+function safeRawErrorDetail(value: string): string | undefined {
+  // Some call sites persist an already user-facing detail and the classifier
+  // adds the label again. Strip any existing labels before adding one below.
+  const trimmed = value.trim().replace(/^(?:具体原因\s*[：:]\s*)+/u, "").trim();
+  if (!trimmed || trimmed === "Error" || trimmed === "[object Object]") return undefined;
+  // Error messages can occasionally contain a request URL. Keep the useful
+  // server/client detail while preventing credentials from appearing in the UI.
+  const sanitized = trimmed
+    .replace(/([?&](?:access_token|oauth_code|token|cloud_token|sign)=)[^&\s]+/gi, "$1***")
+    .replace(/(Bearer\s+)[^\s]+/gi, "$1***");
+  return sanitized || undefined;
+}
+
 export function classifySyncError(error: unknown): SyncErrorGuidance {
   const detail = error instanceof Error ? error.message : String(error);
   const value = detail.toLowerCase();
@@ -23,7 +36,8 @@ export function classifySyncError(error: unknown): SyncErrorGuidance {
   }
   if (error instanceof WindowsPathError) {
     if (error.issue === "invalid-character") {
-      const characters = error.characters.length > 0 ? error.characters.join(" ") : "未知";
+      if (!error.characters.length) return { category: "windows-path", title: "文件名不合法", detail: error.message };
+      const characters = error.characters.join(" ");
       return { category: "windows-path", title: "文件名不兼容 Windows",
         detail: `文件名包含 Windows 不支持的字符：${characters}` };
     }
@@ -37,8 +51,11 @@ export function classifySyncError(error: unknown): SyncErrorGuidance {
     if (error.issue === "trailing-space-or-dot") return { category: "windows-path", title: "文件名不兼容 Windows",
       detail: "文件名不能以空格或句点结尾。" };
     if (error.issue === "segment-too-long") return { category: "windows-path", title: "文件名不兼容 Windows",
-      detail: "Windows 路径段超过 255 个字符。" };
+      detail: error.message.includes("字节") ? "文件名超过文件系统支持的 255 字节，请缩短名称后重试。" : "Windows 路径段超过 255 个字符。" };
   }
+  if (/enametoolong|file ?name too long|路径过长|文件名过长/.test(value)) return {
+    category: "windows-path", title: "文件名或路径过长", detail: "请缩短云端文件或父目录名称，再点击重试重新检测。",
+  };
   if ((error instanceof Error && error.name === "WindowsPathError") ||
       /远端路径不兼容 windows|windows 不支持|保留设备名|文件名不能以空格或句点结尾|路径段超过 255/.test(value)) {
     const invalid = detail.match(/文件名包含 Windows 不支持的字符[：:](.+)$/u);
@@ -76,7 +93,8 @@ export function classifySyncError(error: unknown): SyncErrorGuidance {
     title: "存在同名文件",
     detail: "同一目录中存在仅大小写不同的同名文件，请重命名后再同步。",
   };
-  if (/[\u3400-\u9fff]/u.test(detail)) return { category: "unknown", title: "同步失败", detail };
+  const rawDetail = safeRawErrorDetail(detail);
+  if (rawDetail) return { category: "unknown", title: "同步失败", detail: `具体原因：${rawDetail}` };
   return {
     category: "unknown",
     title: "同步失败",

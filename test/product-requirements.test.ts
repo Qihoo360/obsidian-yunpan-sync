@@ -226,7 +226,15 @@ describe("product requirement helpers", () => {
     expect(classifySyncError(new Error("2 sync tasks failed")).detail)
       .toBe("有 2 个文件同步失败，请检查失败文件后重试。");
     expect(classifySyncError(new Error("unknown backend exception")).detail)
-      .toBe("同步过程中出现错误，请稍后重试。若问题持续出现，请稍后重试或检查同步状态。");
+      .toBe("具体原因：unknown backend exception");
+    expect(classifySyncError(new Error("具体原因：具体原因： ENOENT: no such file or directory")).detail)
+      .toBe("具体原因：ENOENT: no such file or directory");
+    expect(classifySyncError(" 具体原因: 具体原因：具体原因: ENOENT: missing").detail)
+      .toBe("具体原因：ENOENT: missing");
+    const classified = classifySyncError("ENOENT: missing?token=secret");
+    expect(classifySyncError(classified.detail)).toEqual(classified);
+    expect(classifySyncError(new Error("Store upload failed?token=secret&sign=private")).detail)
+      .toBe("具体原因：Store upload failed?token=***&sign=***");
   });
 
   it("shows only real synchronization progress and aligns section titles with card content", () => {
@@ -263,6 +271,23 @@ describe("product requirement helpers", () => {
     expect(androidRule).toContain("padding-top: max(32px");
     expect(androidRule).toContain("env(safe-area-inset-top");
     expect(androidRule).toContain("scroll-padding-top: 24px");
+  });
+
+  it("gives mobile file-size inputs full-width two-row controls", () => {
+    const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+    expect(source).toContain('containerEl.addClass("yunpan-sync-mobile-settings")');
+    expect(source).toContain('createDiv({ cls: "yunpan-sync-size-bound yunpan-sync-size-lower" })');
+    expect(source).toContain('createDiv({ cls: "yunpan-sync-size-bound yunpan-sync-size-upper" })');
+    expect(source).toContain('text.inputEl.max = "500"; text.inputEl.step = "1";');
+    expect(source).toContain('text.inputEl.addEventListener("blur", () => { void saveRange(); });');
+    expect(source).not.toContain('setButtonText("保存范围")');
+    expect(source).toContain('setName("单文件大小范围")');
+    const mobileRange = styles.match(/\.yunpan-sync-mobile-settings \.yunpan-sync-size-setting \.yunpan-sync-size-range\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(mobileRange).toContain('"lower"');
+    expect(mobileRange).toContain('"upper"');
+    expect(mobileRange).toContain("width: 100%;");
+    expect(mobileRange).toContain("max-width: none;");
   });
 
   it("offers all sync modes on mobile while defaulting new installs to automatic", () => {

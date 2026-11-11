@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { TransferProgressTracker, summarizeTransfers } from "../src/sync/progress.js";
+import { TransferProgressTracker, summarizeTransfers, overallTransferProgress, groupTransfers, transferPresentation,
+  type FileTransferProgress } from "../src/sync/progress.js";
 
 describe("per-file transfer progress", () => {
   it("tracks queued, transferring, completed, and failed files without exceeding their size", () => {
@@ -55,5 +56,48 @@ describe("per-file transfer progress", () => {
       completedCount: 1,
       failedCount: 0,
     });
+  });
+});
+
+describe("whole-run progress presentation", () => {
+  const running = { phase: "transfer", message: "正在执行同步任务" };
+  const transfer = (id: string, state: FileTransferProgress["state"], completedBytes = 0, totalBytes = 100): FileTransferProgress =>
+    ({ id, path: `${id}.md`, state, direction: "upload", completedBytes, totalBytes });
+
+  it("aggregates all uploads and downloads independently of list filters or active file order", () => {
+    const items = [transfer("small", "completed", 10, 10),
+      { ...transfer("big", "transferring", 45, 90), direction: "download" as const }, transfer("empty", "queued", 0, 0)];
+    expect(overallTransferProgress(items, running).percent).toBe(55);
+    expect(overallTransferProgress([...items].reverse(), running).percent).toBe(55);
+  });
+
+  it("does not show 100% before verification, saving, failures or cancellation are resolved", () => {
+    for (const state of ["queued", "transferring", "failed", "completed"] as const) {
+      for (const phase of ["transfer", "verify", "save", "error", "paused"]) {
+        expect(overallTransferProgress([transfer("one", state, 100)], { phase, message: "working" }).percent).toBe(99);
+      }
+    }
+    expect(overallTransferProgress([transfer("one", "completed", 100)], { phase: "idle", message: "同步完成" }).percent).toBe(100);
+    expect(overallTransferProgress([transfer("one", "failed", 100)], { phase: "idle", message: "同步完成" }).percent).toBe(99);
+  });
+
+  it("uses completed file counts for all-empty files and leaves unknown totals indeterminate", () => {
+    expect(overallTransferProgress([], { phase: "local-scan", message: "扫描本地" }).percent).toBeUndefined();
+    expect(overallTransferProgress([], { phase: "idle", message: "已是最新" }).percent).toBe(100);
+    const items = [transfer("one", "completed", 0, 0), transfer("two", "queued", 0, 0)];
+    expect(overallTransferProgress(items, running).percent).toBe(50);
+    expect(overallTransferProgress([items[1]!], running).percent).toBe(0);
+  });
+
+  it("keeps stable state groups and searches completed and unfinished files together", () => {
+    const items = [transfer("done", "completed"), transfer("queue", "queued"), transfer("bad", "failed"),
+      transfer("active1", "transferring"), transfer("active2", "transferring")];
+    expect(groupTransfers(items).pending.map(item => item.id)).toEqual(["active1", "active2", "queue", "bad"]);
+    expect(groupTransfers(items).completed.map(item => item.id)).toEqual(["done"]);
+    expect(groupTransfers(items, "DONE")).toMatchObject({ pending: [], completed: [items[0]] });
+    expect(transferPresentation(transfer("done", "completed")).label).toBe("已完成");
+    expect(transferPresentation(transfer("queue", "queued", 100)).percent).toBe(0);
+    expect(transferPresentation(transfer("active", "transferring", 100)).percent).toBe(99);
+    expect(transferPresentation(transfer("bad", "failed", 35)).label).toBe("失败");
   });
 });

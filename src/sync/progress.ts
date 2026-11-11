@@ -1,3 +1,5 @@
+import { isSuccessfulSyncMessage } from "./outcome.js";
+
 export type TransferDirection = "upload" | "download";
 export type TransferState = "queued" | "transferring" | "completed" | "failed";
 
@@ -31,13 +33,42 @@ export function summarizeTransfers(transfers: readonly FileTransferProgress[]): 
   return {
     totalBytes,
     completedBytes,
-    percent: totalBytes === 0 ? (transfers.length === 0 ? 0 : 100) : Math.round(completedBytes / totalBytes * 100),
+    percent: totalBytes === 0 ? (transfers.length === 0 ? 0
+      : Math.round(transfers.filter(item => item.state === "completed").length / transfers.length * 100))
+      : Math.round(completedBytes / totalBytes * 100),
     activePath: active?.path,
     queuedCount: transfers.filter((item) => item.state === "queued").length,
     activeCount: transfers.filter((item) => item.state === "transferring").length,
     completedCount: transfers.filter((item) => item.state === "completed").length,
     failedCount: transfers.filter((item) => item.state === "failed").length,
   };
+}
+
+/** One display value for the whole run; byte delivery alone does not finish a sync. */
+export function overallTransferProgress(transfers: readonly FileTransferProgress[], status: { phase: string; message: string }):
+  { summary: TransferSummary; percent: number | undefined } {
+  const summary = summarizeTransfers(transfers);
+  const completed = status.phase === "idle" && isSuccessfulSyncMessage(status.message) && summary.completedCount === transfers.length;
+  return { summary, percent: completed ? 100 : transfers.length ? Math.min(99, summary.percent) : undefined };
+}
+
+export function transferPresentation(transfer: FileTransferProgress): { percent: number; label: string; icon: string } {
+  const percent = transfer.state === "completed" ? 100 : transfer.state === "queued" || transfer.totalBytes <= 0 ? 0
+    : Math.min(99, Math.max(0, Math.round(transfer.completedBytes / transfer.totalBytes * 100)));
+  const labels: Record<TransferState, string> = { queued: "等待中", transferring: "同步中", failed: "失败", completed: "已完成" };
+  const icons: Record<TransferState, string> = { queued: "clock", transferring: "refresh-cw", failed: "circle-alert", completed: "circle-check" };
+  return { percent, label: labels[transfer.state], icon: icons[transfer.state] };
+}
+
+/** Stable linear partition: active files stay above queued/failed files and finished history. */
+export function groupTransfers(transfers: readonly FileTransferProgress[], query = ""):
+  { pending: FileTransferProgress[]; completed: FileTransferProgress[] } {
+  const groups: Record<TransferState, FileTransferProgress[]> = { transferring: [], queued: [], failed: [], completed: [] };
+  const normalized = query.trim().toLowerCase();
+  for (const item of transfers) {
+    if (!normalized || item.path.toLowerCase().includes(normalized)) groups[item.state].push(item);
+  }
+  return { pending: [...groups.transferring, ...groups.queued, ...groups.failed], completed: groups.completed };
 }
 
 export class TransferProgressTracker {

@@ -12,6 +12,7 @@ class MemoryAdapter {
   failReplacement = false;
   activeWrites = 0;
   peakWrites = 0;
+  writes = 0;
 
   async exists(path: string): Promise<boolean> { return this.files.has(path); }
   async readBinary(path: string): Promise<ArrayBuffer> {
@@ -20,6 +21,7 @@ class MemoryAdapter {
     return value.slice().buffer;
   }
   async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+    this.writes++;
     this.activeWrites++;
     this.peakWrites = Math.max(this.peakWrites, this.activeWrites);
     await new Promise((resolve) => setTimeout(resolve, 1));
@@ -48,9 +50,35 @@ describe("database file persistence", () => {
     await Promise.all([persistence.save(), persistence.save(), persistence.save()]);
 
     expect(adapter.peakWrites).toBe(1);
+    expect(adapter.writes).toBe(1);
     expect(adapter.files.has(".obsidian/plugins/yunpan-sync/sync.sqlite")).toBe(true);
     expect(adapter.files.has(".obsidian/plugins/yunpan-sync/sync.sqlite.tmp")).toBe(false);
     expect(adapter.files.has(".obsidian/plugins/yunpan-sync/sync.sqlite.backup")).toBe(false);
+  });
+
+  it("covers mutations requested during a write with a subsequent durable snapshot", async () => {
+    const adapter = new MemoryAdapter();
+    const persistence = await DatabasePersistence.open(adapter as never, ".obsidian/plugins/yunpan-sync");
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const writing = new Promise<void>(resolve => { started = resolve; });
+    const write = adapter.writeBinary.bind(adapter);
+    let firstWrite = true;
+    adapter.writeBinary = async (path, data) => {
+      if (firstWrite) { firstWrite = false; started(); await gate; }
+      await write(path, data);
+    };
+    const first = persistence.save();
+    await writing;
+    persistence.database.setLastSuccessfulSync(200);
+    const second = persistence.save();
+    release();
+    await second; await first;
+    expect(adapter.writes).toBe(2);
+    const restored = await DatabasePersistence.open(adapter as never, ".obsidian/plugins/yunpan-sync");
+    expect(restored.database.getLastSuccessfulSync()).toBe(200);
+    expect(adapter.peakWrites).toBe(1);
   });
 
   it("restores the previous database when atomic replacement fails", async () => {

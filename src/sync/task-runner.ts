@@ -1,6 +1,7 @@
 import { SyncDatabase, type SyncTask, type TaskKind } from "../storage/database.js";
 import { OpenApiError } from "../net/openapi-client.js";
 import { syncRestrictionError } from "./quota.js";
+import { TaskSkippedError } from "./file-policy.js";
 
 export type TaskExecutor = (task: SyncTask) => Promise<void>;
 
@@ -25,6 +26,7 @@ export class TaskRunner {
   private readonly shouldCancel: () => boolean;
   private readonly concurrency: number;
   private stopped = false;
+  private skipped = 0;
 
   constructor(
     private readonly database: SyncDatabase,
@@ -62,6 +64,18 @@ export class TaskRunner {
       
       await this.checkpoint();
     } catch (error) {
+      if (error instanceof TaskSkippedError) {
+        this.database.skipRunningTask(task.id);
+        this.skipped++;
+        await this.checkpoint();
+        return true;
+      }
+      if (this.shouldCancel()) {
+        this.stopped = true;
+        this.database.deferTask(task.id, "同步已停止");
+        await this.checkpoint();
+        return true;
+      }
       const restriction = syncRestrictionError(error);
       if (restriction) {
         this.stopped = true;
@@ -88,6 +102,7 @@ export class TaskRunner {
 
   async drain(limit = Number.POSITIVE_INFINITY): Promise<number> {
     this.stopped = false;
+    const skippedBefore = this.skipped;
     let reserved = 0;
     let processed = 0;
     const worker = async (): Promise<void> => {
@@ -103,7 +118,7 @@ export class TaskRunner {
     const outcomes = await Promise.allSettled(Array.from({ length: this.concurrency }, () => worker()));
     const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
     if (failure) throw failure.reason;
-    return processed;
+    return processed - (this.skipped - skippedBefore);
   }
 
   assertSettled(): void {

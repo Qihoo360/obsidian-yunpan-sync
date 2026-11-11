@@ -109,20 +109,13 @@ export function accountDisplayIdentity(
 
 export function formatBytes(bytes: number | undefined): string {
   if (bytes === undefined) return "未知";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  const units = ["B", "KB", "MB", "GB", "TB"];
   let value = bytes;
   let unit = 0;
   while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
-  return `${value.toFixed(unit === 0 ? 0 : 2)} ${units[unit]}`;
+  return `${Number(value.toFixed(unit === 0 ? 0 : 2))}${units[unit]}`;
 }
 
 export function formatStorageCapacity(bytes: number | undefined): string {
-  if (bytes === undefined) return "未知";
-  const mebibyte = 1024 ** 2;
-  const gibibyte = 1024 ** 3;
-  const tebibyte = 1024 ** 4;
-  if (bytes < gibibyte) return `${(bytes / mebibyte).toFixed(2)}MB`;
-  const value = bytes >= tebibyte ? bytes / tebibyte : bytes / gibibyte;
-  const unit = bytes >= tebibyte ? "TB" : "GB";
-  return `${Number(value.toFixed(2))}${unit}`;
+  return formatBytes(bytes);
 }

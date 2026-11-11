@@ -19,6 +19,80 @@
   border-radius: 16px;
 }
 
+.yunpan-sync-size-setting {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "info"
+    "control";
+  row-gap: 8px;
+  align-items: start;
+}
+.yunpan-sync-size-setting .setting-item-info { grid-area: info; }
+.yunpan-sync-size-setting .setting-item-control {
+  grid-area: control;
+  width: 100%;
+  justify-content: flex-start;
+}
+.yunpan-sync-size-setting .yunpan-sync-size-range {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  white-space: nowrap;
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-normal);
+}
+.yunpan-sync-size-setting .yunpan-sync-size-bound {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.yunpan-sync-size-range > span { white-space: nowrap; }
+.yunpan-sync-size-setting .yunpan-sync-size-range input[type="number"] {
+  width: 72px;
+  min-width: 0;
+  max-width: 72px;
+  font-size: inherit;
+}
+.yunpan-sync-size-setting .yunpan-sync-size-range .yunpan-sync-size-bound input[type="number"] {
+  flex: 0 1 72px;
+}
+.yunpan-sync-mobile-settings .yunpan-sync-size-setting .yunpan-sync-size-range {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "lower"
+    "upper";
+  width: 100%;
+  max-width: none;
+  gap: 10px;
+  white-space: normal;
+}
+.yunpan-sync-mobile-settings .yunpan-sync-size-setting .yunpan-sync-size-lower { grid-area: lower; }
+.yunpan-sync-mobile-settings .yunpan-sync-size-setting .yunpan-sync-size-upper { grid-area: upper; }
+.yunpan-sync-mobile-settings .yunpan-sync-size-setting .yunpan-sync-size-separator { display: none; }
+.yunpan-sync-mobile-settings .yunpan-sync-size-setting .yunpan-sync-size-bound {
+  width: 100%;
+  min-width: 0;
+  justify-content: flex-start;
+}
+.yunpan-sync-mobile-settings .yunpan-sync-size-setting .yunpan-sync-size-bound input[type="number"] {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+}
+.yunpan-sync-skipped-files { margin-block: 12px; }
+.yunpan-sync-skipped-files summary { cursor: pointer; color: var(--text-muted); }
+.yunpan-sync-skipped-file { padding-block: 6px; overflow-wrap: anywhere; border-bottom: 1px solid var(--background-modifier-border); }
+.yunpan-sync-skipped-file-path { overflow-wrap: anywhere; }
+.yunpan-sync-skipped-file-size { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+
 /* Android's settings sheet can clip the first row beneath its top inset. */
 .yunpan-sync-settings-page.yunpan-sync-android-settings {
   padding-top: max(32px, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
@@ -313,6 +387,7 @@
     flex: 1;
   }
 
+
   .yunpan-sync-remote-root-setting {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
@@ -389,6 +464,21 @@
   font-size: var(--font-ui-small);
 }
 
+.yunpan-sync-status-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.yunpan-sync-status-error-action {
+  width: auto;
+  min-width: max-content;
+  min-height: 26px;
+  padding: 2px 8px;
+  font-size: var(--font-ui-smaller);
+}
+
 .yunpan-sync-membership-icon {
   width: 20px;
   height: 20px;
@@ -399,6 +489,19 @@
 
 .yunpan-sync-membership-label {
   vertical-align: middle;
+}
+
+.yunpan-sync-membership-label.is-expired {
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-normal);
+}
+
+.yunpan-sync-membership-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: middle;
+  white-space: nowrap;
 }
 
 .yunpan-sync-product-links {
@@ -651,20 +754,34 @@
 }
 
 .yunpan-sync-modal-progress-fill {
-  display: flex;
   height: 100%;
   min-width: 0;
-  align-items: center;
-  justify-content: flex-end;
   transition: width 160ms ease;
-  color: var(--text-on-accent);
   background: var(--interactive-accent);
 }
 
-.yunpan-sync-modal-progress-fill span {
-  padding-right: 4px;
-  font-size: 11px;
+.yunpan-sync-total-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.yunpan-sync-total-percent {
+  flex: 0 0 auto;
+  min-width: 4ch;
+  white-space: nowrap;
+  color: var(--text-normal);
+  font-variant-numeric: tabular-nums;
   font-weight: var(--font-semibold);
+}
+
+.yunpan-sync-total-detail {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  overflow-wrap: anywhere;
 }
 
 .yunpan-sync-modal-transfer-list {
@@ -701,6 +818,73 @@
 .yunpan-sync-modal-message.is-error {
   color: var(--text-error);
 }
+
+/* Explicit track/fill styling is shared by desktop and mobile, in either theme. */
+.yunpan-sync-file-row.yunpan-sync-modal-transfer,
+.yunpan-sync-file-row.yunpan-sync-side-transfer {
+  display: block;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.yunpan-sync-file-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.yunpan-sync-file-state-icon,
+.yunpan-sync-file-direction {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--text-muted);
+}
+
+.yunpan-sync-file-state-icon svg { width: 18px; height: 18px; }
+
+.yunpan-sync-file-detail {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  margin: 6px 0;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+}
+
+.yunpan-sync-file-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: var(--background-modifier-border);
+}
+
+.yunpan-sync-file-fill {
+  height: 100%;
+  transition: width 160ms ease;
+  background: var(--interactive-accent);
+}
+
+.is-queued .yunpan-sync-file-fill { background: transparent; }
+.is-transferring .yunpan-sync-file-state,
+.is-transferring .yunpan-sync-file-state-icon { color: var(--interactive-accent); }
+.is-failed .yunpan-sync-file-state,
+.is-failed .yunpan-sync-file-state-icon { color: var(--text-error); }
+.is-failed .yunpan-sync-file-fill { background: var(--text-error); }
+.is-completed .yunpan-sync-file-state,
+.is-completed .yunpan-sync-file-state-icon { color: var(--color-green); }
+.is-completed .yunpan-sync-file-fill { background: var(--color-green); }
+
+.yunpan-sync-completed-toggle {
+  width: 100%;
+  justify-content: flex-start;
+  margin-bottom: 8px;
+}
+.yunpan-sync-completed-toggle::before { content: "▸"; margin-right: 8px; }
+.yunpan-sync-completed-toggle[aria-expanded="true"]::before { content: "▾"; }
+.yunpan-sync-side-transfer-list { margin-top: 18px; }
 
 .yunpan-sync-modal-message.is-error strong,
 .yunpan-sync-modal-message.is-error div {
@@ -1296,4 +1480,47 @@ body .yunpan-sync-settings-page button.yunpan-sync-cancel-login.mobile-tap:not(:
 
 body .yunpan-sync-settings-page button.yunpan-sync-cancel-login[hidden] {
   display: none;
+}
+
+/* Keep the inline refresh icon independent of desktop and mobile button styles. */
+body .yunpan-sync-settings-page button.yunpan-sync-membership-refresh.clickable-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 24px;
+  width: 24px;
+  min-width: 24px;
+  max-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  padding: 2px;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  vertical-align: middle;
+}
+
+body .yunpan-sync-settings-page button.yunpan-sync-membership-refresh.clickable-icon:not(:disabled):not([aria-disabled="true"]):is(:hover, :active, .mobile-tap) {
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-normal);
+}
+
+.yunpan-sync-membership-refresh svg {
+  width: 16px;
+  height: 16px;
+}
+
+.yunpan-sync-membership-refresh.is-loading svg {
+  animation: yunpan-sync-spin 1.2s linear infinite;
+}
+.yunpan-sync-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 8px;
 }

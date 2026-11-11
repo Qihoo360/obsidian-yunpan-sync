@@ -1,5 +1,13 @@
 export type SyncMode = "manual" | "automatic" | "scheduled";
 export type Environment = "production";
+export const FILE_SIZE_MB = 1024 * 1024;
+export const MOBILE_FILTER_VERSION = 1;
+export const MOBILE_EXCLUDED_EXTENSIONS = (
+  "dwg dxf dgn step stp iges igs stl obj fbx blend skp rvt ifc " +
+  "mp4 mov mkv avi wmv webm flv m4v 3gp " +
+  "mp3 wav m4a aac flac ogg opus wma amr " +
+  "zip rar 7z tar gz bz2 xz exe msi dmg pkg apk aab ipa iso"
+).split(" ");
 
 export const AUTOMATIC_INTERVAL_MINUTES = 3;
 export const MIN_SCHEDULED_INTERVAL_MINUTES = AUTOMATIC_INTERVAL_MINUTES + 1;
@@ -45,6 +53,9 @@ export interface PluginSettings {
   syncObsidianConfig: boolean;
   excludedExtensions: string;
   filterRules: FilterRule[];
+  minFileSizeMB: number;
+  maxFileSizeMB: number;
+  mobileFilterVersion: number;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -60,7 +71,15 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   syncObsidianConfig: false,
   excludedExtensions: "",
   filterRules: DEFAULT_FILTER_RULES.map((rule) => ({ ...rule })),
+  minFileSizeMB: 0,
+  maxFileSizeMB: 30,
+  mobileFilterVersion: 0,
 };
+
+export function validFileSizeRange(min: number, max: number): boolean {
+  return Number.isInteger(min) && Number.isInteger(max) && min >= 0 && max <= 500 && min < max &&
+    max * FILE_SIZE_MB <= Number.MAX_SAFE_INTEGER;
+}
 
 function normalizeFilterRules(value: unknown): FilterRule[] | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -83,26 +102,40 @@ function legacyExtensionRules(value: string): FilterRule[] {
       pattern: `**/*.${extension}`, caseSensitive: false }));
 }
 
-export function normalizeSettings(input: Partial<PluginSettings> | null | undefined): PluginSettings {
+export function normalizeSettings(input: Partial<PluginSettings> | null | undefined, mobile = false): PluginSettings {
   const environment = "production" as const;
   const mode: SyncMode = ["manual", "automatic", "scheduled"].includes(input?.mode ?? "")
     ? input!.mode! : "automatic";
   const intervalMinutes = normalizeScheduledInterval(input?.intervalMinutes);
   const excludedExtensions = typeof input?.excludedExtensions === "string" ? input.excludedExtensions : "";
   const persistedRules = normalizeFilterRules(input?.filterRules);
-  const filterRules = persistedRules ?? [
+  let filterRules = persistedRules ?? [
     ...DEFAULT_FILTER_RULES.map((rule) => ({ ...rule })),
     ...legacyExtensionRules(excludedExtensions),
   ];
+  const mobileFilterVersion = Number(input?.mobileFilterVersion) || 0;
+  if (mobile && mobileFilterVersion < MOBILE_FILTER_VERSION) {
+    filterRules = [...MOBILE_EXCLUDED_EXTENSIONS.map(extension => ({ id: `mobile-v1-${extension}`,
+      enabled: true, action: "exclude" as const, pattern: `**/*.${extension}`, caseSensitive: false })), ...filterRules];
+  }
+  const min = input?.minFileSizeMB ?? DEFAULT_SETTINGS.minFileSizeMB;
+  const max = input?.maxFileSizeMB ?? DEFAULT_SETTINGS.maxFileSizeMB;
+  const validRange = validFileSizeRange(min, max);
+  const { mobileNetworkPolicy: _legacyMobileNetworkPolicy, ...persistedSettings } = (input ?? {}) as Partial<PluginSettings> & {
+    mobileNetworkPolicy?: unknown;
+  };
   return {
     ...DEFAULT_SETTINGS,
-    ...input,
+    ...persistedSettings,
     environment,
     mode,
     intervalMinutes,
     syncObsidianConfig: input?.syncObsidianConfig === true,
     excludedExtensions,
     filterRules,
+    minFileSizeMB: validRange ? min : DEFAULT_SETTINGS.minFileSizeMB,
+    maxFileSizeMB: validRange ? max : DEFAULT_SETTINGS.maxFileSizeMB,
+    mobileFilterVersion: mobile ? Math.max(MOBILE_FILTER_VERSION, mobileFilterVersion) : mobileFilterVersion,
     openapiBaseUrl: "https://openapi.eyun.360.cn/intf.php",
   };
 }

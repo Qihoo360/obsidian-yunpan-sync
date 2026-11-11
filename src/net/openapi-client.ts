@@ -76,7 +76,6 @@ export interface OpenApiClientOptions {
   signingSecret: () => string;
   transport: HttpTransport;
   retries?: number;
-  
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -110,7 +109,6 @@ export class OpenApiClient {
         });
         status = response.status;
         if (response.status === 401 && !refreshed && this.options.refreshAccessToken) {
-          
           await this.options.refreshAccessToken();
           refreshed = true;
           continue;

@@ -127,6 +127,15 @@ describe("OpenAPI client", () => {
 });
 
 describe("sync database", () => {
+  it("ignores completed deletion records whose names fail newer path validation", async () => {
+    const SQL = await initSqlJs({ locateFile: () => "node_modules/sql.js/dist/sql-wasm.wasm" });
+    const raw = new SQL.Database();
+    const database = new SyncDatabase(raw);
+    database.enqueue({ id: "legacy-done", kind: "recycle", path: "old.md", nid: "1", payload: { remote: { kind: "file", size: 1 } } });
+    database.completeTask("legacy-done");
+    raw.run("UPDATE tasks SET path=$path WHERE id='legacy-done'", { $path: `${"文".repeat(86)}.md` });
+    expect(database.requeueStaleCompletedRecycleTasks(new Map(), new Set())).toBe(0);
+  });
   it("stores cursors, nodes, baselines, and recovers running tasks", async () => {
     const SQL = await initSqlJs({ locateFile: () => "node_modules/sql.js/dist/sql-wasm.wasm" });
     const database = new SyncDatabase(new SQL.Database());

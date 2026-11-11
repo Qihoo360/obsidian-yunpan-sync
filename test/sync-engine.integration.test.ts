@@ -1,11 +1,13 @@
 import initSqlJs from "sql.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { TAbstractFile, TFile, TFolder } from "obsidian";
 import { SyncEngine } from "../src/sync/engine.js";
 import { SyncDatabase } from "../src/storage/database.js";
-import { DEFAULT_SETTINGS, type PluginSettings } from "../src/settings.js";
+import { DEFAULT_SETTINGS, FILE_SIZE_MB, type PluginSettings } from "../src/settings.js";
 import { cloudFileHashes } from "../src/transfer/hashes.js";
 import type { SyncQuota } from "../src/sync/quota.js";
+import { DownloadMachine } from "../src/transfer/download.js";
+import { OpenApiError } from "../src/net/openapi-client.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -137,6 +139,7 @@ class MemoryCloud {
   beforeRename?: () => void;
   renameError?: string;
   readonly calls: string[] = [];
+  readonly listPaths: string[] = [];
 
   constructor() {
     this.entries.set("/Obsidian", { nid: "1", pid: "0", path: "/Obsidian", isDir: true, version: 1, mtime: 0 });
@@ -190,6 +193,16 @@ class MemoryCloud {
     if (method === "User.getUserDetail") return { is_vip: 1, available_size: this.quota.availableBytes } as T;
     if (method === "Enterprise.getListByUser") return {} as T;
     if (method === "User.getVersion") return { ver: this.version } as T;
+    if (method === "File.getList") {
+      const path = String(input.path).replace(/\/$/, "");
+      this.listPaths.push(String(input.path));
+      if (!this.entries.get(path)?.isDir) throw new OpenApiError("源文件不存在", 3008);
+      const children = [...this.entries.values()].filter(entry => entry.path.slice(0, entry.path.lastIndexOf("/")) === path)
+        .sort((a, b) => a.path.localeCompare(b.path));
+      const offset = (Number(input.page) - 1) * Number(input.page_size);
+      return { node_list: await this.raw(children.slice(offset, offset + Number(input.page_size))),
+        total: children.length, has_next_page: offset + Number(input.page_size) < children.length } as T;
+    }
     if (method === "Incr.getBgsp") return { bgsp: "1", gsp: "1", ver: this.version, total: this.entries.size } as T;
     if (method === "Incr.getGlobalNodes") return { node_list: await this.raw([...this.entries.values()]), retnum: this.entries.size, gsp: "1", spnid: "0" } as T;
     if (method === "Incr.getIncrGlobal") {
@@ -260,13 +273,249 @@ async function synchronize(engine: SyncEngine): Promise<void> {
 }
 
 describe("complete in-memory two-way synchronization", () => {
+  it("ignores 20,000 unrelated account nodes on first and subsequent scoped scans", async () => {
+    const { vault, cloud, engine, db } = await harness();
+    for (let i = 0; i < 20_000; i++) {
+      cloud.entries.set(`/Unrelated/file${i}`, { nid: `outside${i}`, pid: "outside", path: `/Unrelated/file${i}`,
+        isDir: false, version: 1, mtime: 1 });
+    }
+    cloud.mkdir("/Obsidian/notes");
+    for (let i = 0; i < 100; i++) await cloud.putFile(`/Obsidian/notes/file${i}.md`, "note");
+    await synchronize(engine);
+    expect(vault.paths().filter(path => path.endsWith(".md"))).toHaveLength(100);
+    expect(cloud.listPaths).toEqual(["/Obsidian/", "/Obsidian/notes/"]);
+    expect(db.getRemoteNodes()).toHaveLength(101);
+    const before = cloud.listPaths.length;
+    await synchronize(engine);
+    expect(cloud.listPaths).toHaveLength(before);
+    cloud.version++; // An unrelated account change may invalidate the cheap version check.
+    await synchronize(engine);
+    expect(cloud.listPaths.slice(before)).toEqual(["/Obsidian/", "/Obsidian/notes/"]);
+    expect(cloud.calls.some(method => method.startsWith("Incr."))).toBe(false);
+    expect(db.getDiagnostics()).toMatchObject({ remoteNodes: 101, matchedNodes: 101 });
+  });
+
+  it("preserves local files and baseline when an existing bound root disappears", async () => {
+    const { vault, cloud, engine, db } = await harness();
+    vault.putFile("note.md", "keep"); await synchronize(engine);
+    const base = db.getBase("note.md");
+    const snapshot = db.getRemoteNodes();
+    cloud.remove("/Obsidian");
+    await expect(synchronize(engine)).rejects.toThrow("源文件不存在");
+    expect(vault.text("note.md")).toBe("keep");
+    expect(db.getBase("note.md")).toEqual(base);
+    expect(db.getRemoteNodes()).toEqual(snapshot);
+  });
+
+  it("can create a new missing bound directory without enumerating account parents", async () => {
+    const { vault, cloud, engine, settings } = await harness();
+    settings.remoteRoot = "/New/Nested/"; vault.putFile("note.md", "new");
+    await synchronize(engine);
+    expect(cloud.text("/New/Nested/note.md")).toBe("new");
+    expect(cloud.listPaths).toEqual(["/New/Nested/"]);
+    expect(cloud.calls.some(method => method.startsWith("Incr."))).toBe(false);
+  });
+
+  it("does not confirm a binding or transfer files if stopped while awaiting initial confirmation", async () => {
+    const { vault, cloud, engine, db } = await harness();
+    vault.putFile("local.md", "local");
+    await cloud.putFile("/Obsidian/remote.md", "remote");
+    const upload = vi.spyOn(cloud.uploader, "upload");
+    const download = vi.spyOn(cloud.downloader, "download");
+    expect(await engine.synchronize(false, async tasks => {
+      engine.cancel();
+      return new Set(tasks.map(task => task.id));
+    })).toBe(false);
+    expect(db.isBindingConfirmed("42:vault")).toBe(false);
+    expect(upload).not.toHaveBeenCalled();
+    expect(download).not.toHaveBeenCalled();
+    expect(vault.text("remote.md")).toBeUndefined();
+  });
+
+  it("recovers a persisted illegal task name by node identity after restart", async () => {
+    const { vault, cloud, engine, settings, db } = await harness();
+    const nid = await cloud.putFile("/Obsidian/bad:name.md", "content"); await synchronize(engine);
+    db.enqueue({ id: "legacy", kind: "download", path: "placeholder.md", nid,
+      payload: { remote: { nid, kind: "file", size: 7 } } });
+    db.failTask("legacy", "ENAMETOOLONG");
+    const SQL = await initSqlJs({ locateFile: () => "node_modules/sql.js/dist/sql-wasm.wasm" });
+    const raw = new SQL.Database(db.export());
+    raw.run("UPDATE tasks SET path=$path WHERE id='legacy'", { $path: "bad:name.md" });
+    const restored = new SyncDatabase(new SQL.Database(raw.export()));
+    expect(restored.listFailedTasks()[0]?.path).toBe("bad:name.md");
+    cloud.rename("/Obsidian/bad:name.md", "/Obsidian/fixed.md");
+    const restarted = new SyncEngine(vault as never, restored, cloud.api as never, cloud.uploader as never, cloud.downloader as never,
+      () => settings, "42:vault", () => undefined, undefined, undefined, async () => cloud.quota);
+    expect(restarted.retryFailed()).toBe(1); await synchronize(restarted);
+    expect(vault.text("fixed.md")).toBe("content");
+    expect(restored.taskCounts()).toEqual({ queued: 0, failed: 0 });
+  });
+
+  it("does not let a deleted node's old retry overwrite its replacement or local original", async () => {
+    const { vault, cloud, engine, db, statuses } = await harness();
+    const nid = await cloud.putFile("/Obsidian/note.md", "original"); await synchronize(engine);
+    const base = db.getBase("note.md");
+    db.enqueue({ id: "old", kind: "download", path: "note.md", nid, payload: { local: base, remote: base, base } });
+    db.failTask("old", "文件名不合法");
+    cloud.remove("/Obsidian/note.md"); await cloud.putFile("/Obsidian/note.md", "replacement");
+    expect(engine.retryFailed()).toBe(1); await synchronize(engine);
+    expect(vault.text("note.md")).toBe("original"); expect(cloud.text("/Obsidian/note.md")).toBe("replacement");
+    expect(db.getBase("note.md")).toEqual(base);
+    expect(statuses.at(-1)?.skippedFiles).toContainEqual(expect.objectContaining({ path: "note.md", reason: expect.stringContaining("不存在") }));
+  });
+
+  it("validates changed download metadata before moving a local conflict copy", async () => {
+    const { vault, cloud, engine, db, settings } = await harness();
+    vault.putFile("note.md", "b"); await synchronize(engine);
+    vault.putFile("note.md", "LL"); await cloud.putFile("/Obsidian/note.md", "RR");
+    settings.maxFileSizeMB = 4 / FILE_SIZE_MB;
+    const store = { download: vi.fn(), callJson: vi.fn() };
+    const downloader = new DownloadMachine({ call: vi.fn().mockResolvedValue({
+      http: "https://dl1.yunpan.360.cn/intf.php", fhash: "a".repeat(40), fsize: 50,
+    }) }, () => store);
+    const guarded = new SyncEngine(vault as never, db, cloud.api as never, cloud.uploader as never, downloader,
+      () => settings, "42:vault", () => undefined, undefined, undefined, async () => cloud.quota);
+    await synchronize(guarded);
+    expect(vault.paths()).toEqual(["note.md"]); expect(vault.text("note.md")).toBe("LL");
+    expect(cloud.text("/Obsidian/note.md")).toBe("RR");
+    expect(db.unresolvedConflictCount()).toBe(0); expect(db.taskCounts()).toEqual({ queued: 0, failed: 0 });
+    expect(store.download).not.toHaveBeenCalled(); expect(store.callJson).not.toHaveBeenCalled();
+  });
+
+  it("excludes both directions before reading contents and resumes after expanding the range", async () => {
+    const { vault, cloud, engine, settings, statuses, db } = await harness();
+    settings.minFileSizeMB = 2 / FILE_SIZE_MB; settings.maxFileSizeMB = 4 / FILE_SIZE_MB;
+    vault.putFile("too-small.md", "x"); vault.putFile("too-large.pdf", "12345");
+    await cloud.putFile("/Obsidian/remote.pdf", "12345");
+    vault.putFile("boundary.docx", "1234");
+    const read = vi.spyOn(vault.adapter, "readBinary");
+    await synchronize(engine);
+    expect(read.mock.calls.map(call => call[0])).toEqual(["boundary.docx", "boundary.docx"]);
+    expect(cloud.text("/Obsidian/too-large.pdf")).toBeUndefined();
+    expect(vault.text("remote.pdf")).toBeUndefined();
+    expect(db.listFailedTasks()).toEqual([]);
+    expect(statuses.at(-1)?.skippedFiles).toHaveLength(3);
+    expect(statuses.at(-1)?.skippedFiles).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "too-small.md", source: "local", size: 1 }),
+      expect.objectContaining({ path: "too-large.pdf", source: "local", size: 5 }),
+      expect.objectContaining({ path: "remote.pdf", source: "remote", size: 5 }),
+    ]));
+    settings.minFileSizeMB = 0; settings.maxFileSizeMB = 30;
+    await synchronize(engine);
+    expect(vault.text("remote.pdf")).toBe("12345");
+    expect(cloud.text("/Obsidian/too-large.pdf")).toBe("12345");
+  });
+
+  it.each(["local", "remote"])("retains an excluded %s file and baseline when the other side is missing", async side => {
+    const { vault, cloud, engine, settings, db } = await harness();
+    vault.putFile("large.pdf", "12345"); await synchronize(engine);
+    const base = db.getBase("large.pdf");
+    settings.maxFileSizeMB = 4 / FILE_SIZE_MB;
+    if (side === "local") cloud.remove("/Obsidian/large.pdf"); else vault.delete("large.pdf");
+    await synchronize(engine);
+    expect(side === "local" ? vault.text("large.pdf") : cloud.text("/Obsidian/large.pdf")).toBe("12345");
+    expect(db.getBase("large.pdf")).toEqual(base);
+    expect(db.listPendingTasks()).toEqual([]);
+  });
+
+  it("protects a recursive cloud delete containing an excluded descendant", async () => {
+    const { vault, cloud, engine, settings, db } = await harness();
+    vault.mkdir("folder"); vault.putFile("folder/large.pdf", "12345"); vault.putFile("folder/small.md", "x");
+    await synchronize(engine);
+    const base = db.getBase("folder/large.pdf");
+    vault.delete("folder"); settings.maxFileSizeMB = 4 / FILE_SIZE_MB;
+    await synchronize(engine);
+    expect(cloud.text("/Obsidian/folder/large.pdf")).toBe("12345");
+    expect(cloud.entries.get("/Obsidian/folder")?.isDir).toBe(true);
+    expect(db.getBase("folder/large.pdf")).toEqual(base);
+  });
+
+  it("does not move an excluded descendant with a remotely renamed directory", async () => {
+    const { vault, cloud, engine, settings, db } = await harness();
+    vault.mkdir("folder"); vault.putFile("folder/large.pdf", "12345"); await synchronize(engine);
+    const base = db.getBase("folder/large.pdf");
+    settings.maxFileSizeMB = 4 / FILE_SIZE_MB;
+    cloud.rename("/Obsidian/folder", "/Obsidian/renamed");
+    await synchronize(engine);
+    expect(vault.text("folder/large.pdf")).toBe("12345");
+    expect(vault.text("renamed/large.pdf")).toBeUndefined();
+    expect(db.getBase("folder/large.pdf")).toEqual(base);
+  });
+
+  it("retires excluded historical queued work without turning it into a failure", async () => {
+    const { vault, engine, db, settings, cloud } = await harness();
+    vault.putFile("large.pdf", "12345"); settings.maxFileSizeMB = 4 / FILE_SIZE_MB;
+    db.enqueue({ id: "old-upload", kind: "upload", path: "large.pdf", payload: { local: { kind: "file", size: 5 } } });
+    await synchronize(engine);
+    expect(db.listPendingTasks()).toEqual([]); expect(db.listFailedTasks()).toEqual([]);
+    expect(cloud.text("/Obsidian/large.pdf")).toBeUndefined(); expect(vault.text("large.pdf")).toBe("12345");
+  });
+
+  it("skips a file that grows after confirmation and releases its running task", async () => {
+    const { vault, cloud, engine, settings, db, statuses } = await harness();
+    settings.maxFileSizeMB = 4 / FILE_SIZE_MB; vault.putFile("growing.md", "x");
+    await engine.synchronize(false, async tasks => {
+      vault.putFile("growing.md", "12345"); return new Set(tasks.map(task => task.id));
+    });
+    expect(db.taskCounts()).toEqual({ queued: 0, failed: 0 });
+    expect(cloud.text("/Obsidian/growing.md")).toBeUndefined();
+    expect(statuses.at(-1)?.skippedFiles).toContainEqual(expect.objectContaining({ path: "growing.md" }));
+  });
+
+  it.each(["bad:name.pdf", "CON.pdf", "a".repeat(256), "文".repeat(86), "emoji😀.md"])("refreshes scan-only errors after remotely renaming %s", async bad => {
+    const { vault, cloud, engine, statuses } = await harness();
+    const nid = await cloud.putFile(`/Obsidian/${bad}`, "content");
+    await synchronize(engine);
+    const failure = statuses.at(-1)?.fileFailures?.[0];
+    expect(failure).toMatchObject({ nid, source: "remote" });
+    expect(vault.paths()).toEqual([]);
+    const oldVersion = cloud.version;
+    cloud.rename(`/Obsidian/${bad}`, "/Obsidian/fixed.pdf");
+    cloud.version = oldVersion; // Proves retry bypasses the unchanged-version fast path.
+    expect(engine.retryTask(failure!.id!)).toBe(true);
+    const start = cloud.calls.length;
+    await synchronize(engine);
+    expect(cloud.calls.slice(start)).toContain("File.getList");
+    expect(vault.text("fixed.pdf")).toBe("content");
+    expect(statuses.at(-1)?.fileFailures).toEqual([]);
+  });
+
+  it("protects baseline identity under an invalid parent and retries after the parent is fixed", async () => {
+    const { vault, cloud, engine, db, statuses } = await harness();
+    vault.mkdir("folder"); vault.putFile("folder/note.md", "base"); await synchronize(engine);
+    const base = db.getBase("folder/note.md");
+    cloud.rename("/Obsidian/folder", "/Obsidian/bad:folder");
+    await synchronize(engine);
+    expect(vault.text("folder/note.md")).toBe("base");
+    expect(db.getBase("folder/note.md")).toEqual(base);
+    cloud.rename("/Obsidian/bad:folder", "/Obsidian/fixed");
+    expect(engine.retryFailed()).toBeGreaterThan(0);
+    await synchronize(engine);
+    expect(vault.text("fixed/note.md")).toBe("base");
+    expect(statuses.at(-1)?.fileFailures).toEqual([]);
+  });
+
+  it("keeps scan failures actionable if retry metadata refresh fails", async () => {
+    const { cloud, engine, statuses } = await harness();
+    await cloud.putFile("/Obsidian/bad:name.md", "x"); await synchronize(engine);
+    expect(engine.retryFailed()).toBe(1);
+    const call = cloud.api.call;
+    vi.spyOn(cloud.api, "call").mockImplementation(async (method, input) => {
+      if (method === "File.getList") throw new Error("network unavailable");
+      return call(method, input);
+    });
+    await expect(synchronize(engine)).rejects.toThrow("network unavailable");
+    expect(statuses.at(-1)?.fileFailures).toHaveLength(1);
+    expect(engine.retryFailed()).toBe(1);
+  });
+
   it("preflights before any file operations, preserves pending tasks and resumes after expansion", async () => {
     const { vault, cloud, engine, db } = await harness();
     vault.putFile("new.md", "12345");
     cloud.quota.availableBytes = 4;
     await expect(synchronize(engine)).rejects.toMatchObject({ kind: "capacity", remainingBytes: 4, requiredBytes: 5 });
     expect(cloud.paths()).toEqual([]);
-    expect(cloud.calls.filter(method => method.startsWith("File."))).toEqual([]);
+    expect(cloud.calls.filter(method => method.startsWith("File.") && method !== "File.getList")).toEqual([]);
     expect(db.getLastSuccessfulSync()).toBeUndefined();
     expect(db.listPendingTasks()).toHaveLength(1);
     expect(db.listFailedTasks()).toHaveLength(0);
@@ -326,19 +575,23 @@ describe("complete in-memory two-way synchronization", () => {
     vault.putFile("note", "1"); cloud.quota = { isVip: true };
     const callCount = cloud.calls.length;
     await expect(synchronize(engine)).rejects.toMatchObject({ kind: "unknown" });
-    expect(cloud.calls.slice(callCount).filter(c => c.startsWith("File."))).toEqual([]);
+    expect(cloud.calls.slice(callCount).filter(c => c.startsWith("File.") && c !== "File.getList")).toEqual([]);
     cloud.quota.availableBytes = 0; await synchronize(engine);
     expect(cloud.text("/Obsidian/note")).toBe("1");
   });
 
   it("does not guess an overwrite size when the remote index omits file metadata", async () => {
-    const { vault, cloud, engine } = await harness();
+    const { vault, cloud, engine, statuses, db } = await harness();
     vault.putFile("note", "base"); await synchronize(engine);
+    const base = db.getBase("note");
     vault.putFile("note", "growth"); cloud.omitFileSizes = true;
     const callCount = cloud.calls.length;
-    await expect(engine.synchronize(true)).rejects.toMatchObject({ kind: "unknown" });
-    expect(cloud.calls.slice(callCount).filter(c => c.startsWith("File."))).toEqual([]);
+    await expect(engine.synchronize(true)).resolves.toBe(true);
+    expect(cloud.calls.slice(callCount).filter(c => c.startsWith("File.") && c !== "File.getList")).toEqual([]);
     expect(cloud.text("/Obsidian/note")).toBe("base");
+    expect(vault.text("note")).toBe("growth");
+    expect(db.getBase("note")).toEqual(base);
+    expect(statuses.at(-1)?.skippedFiles).toContainEqual(expect.objectContaining({ path: "note" }));
   });
 
   it("budgets a conflict copy once before preserving it", async () => {

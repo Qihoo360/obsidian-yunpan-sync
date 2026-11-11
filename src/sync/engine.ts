@@ -1,5 +1,5 @@
 import { TFile, TFolder, type TAbstractFile, type Vault } from "obsidian";
-import { buildConflictPath, joinRemotePath, normalizeVaultPath, remoteToVaultPath, shouldIgnorePath, WindowsPathError,
+import { buildConflictPath, explainIgnoredPath, joinRemotePath, normalizeVaultPath, remoteToVaultPath, shouldIgnorePath, WindowsPathError, compilePathFilter, validateWindowsPathSegment,
   type PathFilterOptions } from "../domain/paths.js";
 import { planThreeWay, snapshotsEqual, type SyncSnapshot } from "../domain/planner.js";
 import { OpenApiError, type OpenApiMethod } from "../net/openapi-client.js";
@@ -7,24 +7,27 @@ import type { PluginSettings } from "../settings.js";
 import { SyncDatabase, type RemoteNode, type SyncTask } from "../storage/database.js";
 import type { UploadMachine } from "../transfer/upload.js";
 import type { DownloadMachine } from "../transfer/download.js";
-import { cloudFileHashes } from "../transfer/hashes.js";
+import { hashSource } from "../transfer/hashes.js";
+import { memorySource, openDesktopSource, openDesktopSink } from "../transfer/file-io.js";
+import { WorkScheduler, cooperativeSort, type SyncDiagnostics } from "./work-scheduler.js";
 import { TaskRunner } from "./task-runner.js";
-import { RemoteIndexer } from "./remote-indexer.js";
+import { RemoteIndexer, directorySnapshotScope } from "./remote-indexer.js";
 import { TransferProgressTracker, type FileTransferProgress } from "./progress.js";
 import { syncCompletionMessage } from "./outcome.js";
 import { assertSyncQuota, syncRestrictionError, type SyncQuota, type SyncRestriction } from "./quota.js";
 import { normalizeAccountProfile } from "../account/profile.js";
+import { fileSizeExclusion, ProtectedPaths, TaskSkippedError, type SkippedFile, type SkippedFileSource } from "./file-policy.js";
 
 interface Api { call<T>(method: OpenApiMethod, input: Record<string, string | number | boolean | null | undefined>): Promise<T> }
 export interface EngineStatus { phase: string; message: string; queued: number; failed: number; completed?: number;
   conflicts?: number; lastSuccess?: number; lastError?: string; failedTasks?: SyncTask[]; fileFailures?: SyncFileFailure[];
-  warnings?: string[]; restriction?: SyncRestriction }
-export interface SyncFileFailure { path: string; error: WindowsPathError }
+  warnings?: string[]; restriction?: SyncRestriction; diagnostics?: SyncDiagnostics; skippedFiles?: SkippedFile[] }
+export interface SyncFileFailure { id?: string; source?: "local" | "remote"; nid?: string; path: string; error: WindowsPathError }
 export type ConfirmSyncTasks = (tasks: readonly SyncTask[]) => Promise<ReadonlySet<string> | undefined>;
 
 export class SyncCancelledError extends Error {
-  constructor() {
-    super("同步已停止");
+  constructor(message = "同步已停止") {
+    super(message);
     this.name = "SyncCancelledError";
   }
 }
@@ -40,6 +43,9 @@ function bytesBuffer(bytes: Uint8Array): ArrayBuffer {
 
 interface PathSnapshot { path: string; snapshot: SyncSnapshot; sourcePath?: string; derivedFrom?: string }
 function pathKey(path: string): string { return path.normalize("NFC").toLocaleLowerCase("en-US"); }
+function validateTaskPath(path: string): void {
+  if (!path || normalizeVaultPath(path) !== path) throw new Error("旧任务路径需要重新检测");
+}
 
 interface LocalRenamePayload {
   destination: string;
@@ -76,7 +82,9 @@ export class SyncEngine {
   private lastError?: string;
   private readonly transfers = new TransferProgressTracker();
   private fileFailures: SyncFileFailure[] = [];
+  private pendingValidationFailures: SyncFileFailure[] = [];
   private cancelled = false;
+  private stopReason = "同步已停止";
   private idleWaiters: Array<() => void> = [];
   private completed = 0;
   private warnings: string[] = [];
@@ -84,6 +92,19 @@ export class SyncEngine {
   private restriction?: SyncRestriction;
   private readonly discardAfterPreflight = new Set<string>();
   private planTaskIndex = new Map<string, SyncTask>();
+  private conflictPaths = new Set<string>();
+  private work = new WorkScheduler(() => this.throwIfCancelled());
+  private compiledFilter?: PathFilterOptions;
+  private progressTimer?: ReturnType<typeof setTimeout>;
+  private lastProgressReport = 0;
+  private lastTransferReport = 0;
+  private diagnostic?: SyncDiagnostics;
+  private stage = "";
+  private stageStarted = 0;
+  private protectedPaths = new ProtectedPaths();
+  private protectedNids = new Set<string>();
+  private refreshForRetry = false;
+  private runSettings?: PluginSettings;
 
   constructor(
     private readonly vault: Vault,
@@ -102,19 +123,37 @@ export class SyncEngine {
   }
 
   isRunning(): boolean { return this.running; }
-  cancel(): void { this.cancelled = true; }
+  cancel(message = "同步已停止"): void { this.cancelled = true; this.stopReason = message; }
+  checkContinuing(): void { if (this.running) this.throwIfCancelled(); }
   waitForIdle(): Promise<void> {
     if (!this.running) return Promise.resolve();
     return new Promise((resolve) => this.idleWaiters.push(resolve));
   }
   needsInitialConfirmation(): boolean { return !this.database.isBindingConfirmed(this.accountKey); }
 
+  clearMembershipRestriction(): void {
+    if (this.running || this.restriction?.kind !== "membership") return;
+    this.restriction = undefined;
+    this.lastError = undefined;
+  }
+
   async synchronize(rebuild = false, confirmTasks?: ConfirmSyncTasks): Promise<boolean> {
     if (this.running || this.settings().paused) return false;
     this.running = true;
+    this.pendingValidationFailures = [...this.fileFailures];
+    this.runSettings = { ...this.settings(), filterRules: this.settings().filterRules.map(rule => ({ ...rule })) };
+    this.protectedPaths = new ProtectedPaths();
+    this.protectedNids.clear();
+    this.completed = 0;
+    this.compiledFilter = undefined;
+    this.work = new WorkScheduler(() => this.throwIfCancelled());
+    this.diagnostic = { startedAt: Date.now(), durationMs: 0, stages: {}, remoteNodes: 0,
+      matchedNodes: 0, localFiles: 0, localBytes: 0, longestBatchMs: 0 };
+    this.stage = "";
+    this.stageStarted = performance.now();
     this.cancelled = false;
+    this.stopReason = "同步已停止";
     this.lastError = undefined;
-    this.fileFailures = [];
     this.warnings = [];
     this.restriction = undefined;
     this.discardAfterPreflight.clear();
@@ -126,34 +165,46 @@ export class SyncEngine {
     
     try {
       this.throwIfCancelled();
-      if (!this.database.getCursor(this.accountKey) && this.database.getBases().size > 0) {
+      if (!this.database.getCursor(this.accountKey) && this.database.hasBases()) {
         this.database.resetSyncState();
       }
       this.emit("account", "正在检查会员状态与云盘容量");
-      const quota = await this.currentQuota();
+      const quota = await this.work.waitFor(() => this.currentQuota());
       assertSyncQuota(quota, []);
       this.throwIfCancelled();
-      this.bindKnownRenameIdentities();
+      rebuild ||= this.refreshForRetry;
+      if (!rebuild) await this.bindKnownRenameIdentities();
       this.emit("remote-index", rebuild ? "正在重新检查云端目录" : "正在检查远端变化");
-      const indexer = new RemoteIndexer(this.api, this.database, this.accountKey);
+      const indexer = new RemoteIndexer(this.api, this.database, this.accountKey, 200, {
+        check: () => this.throwIfCancelled(), work: this.work, remoteRoot: this.runSettings.remoteRoot,
+        progress: (stage, count) => {
+          if (this.diagnostic) this.diagnostic.remoteNodes = count;
+          this.progress(stage, `${stage === "remote-request" ? "正在读取绑定目录" : "正在处理绑定目录"}，已获取 ${count} 项`);
+        },
+      });
       if (rebuild) {
-        this.database.clearRemoteIndex(this.accountKey);
         await indexer.rebuild();
       } else await indexer.update();
       this.throwIfCancelled();
-      await this.reconcileLocalRenames();
+      this.refreshForRetry = false;
+      this.fileFailures = [];
+      this.protectedPaths = new ProtectedPaths();
+      this.protectedNids.clear();
       const structural = new TaskRunner(this.database, {
-        "local-rename": (task) => this.renameLocal(task),
-        rename: (task) => this.renameRemote(task), move: (task) => this.moveRemote(task),
-      }, { kinds: ["local-rename", "rename", "move"], propagateErrors: true, checkpoint: this.checkpoint });
+        "local-rename": (task) => this.executeChecked(task, () => this.renameLocal(task)),
+        rename: (task) => this.executeChecked(task, () => this.renameRemote(task)),
+        move: (task) => this.executeChecked(task, () => this.moveRemote(task)),
+      }, { kinds: ["local-rename", "rename", "move"], propagateErrors: true, checkpoint: this.checkpoint, shouldCancel: () => this.cancelled });
       let appliedChanges = 0;
       this.emit("compare", "正在比较本地、远端和同步基线");
       await this.planTasks();
+      this.pendingValidationFailures = [];
       const planned = this.pendingPlanTasks();
       const initialConfirmation = this.needsInitialConfirmation();
       let selectedTasks = planned;
       if (confirmTasks && (planned.length > 0 || initialConfirmation)) {
         const selected = await confirmTasks(planned);
+        this.throwIfCancelled();
         if (!selected || (planned.length > 0 && selected.size === 0)) throw new SyncCancelledError();
         selectedTasks = planned.filter((task) => selected.has(task.id));
         selectedTasks = selectedTasks.filter(task => {
@@ -162,8 +213,9 @@ export class SyncEngine {
         });
       }
       await this.checkQuota(quota, selectedTasks);
+      const selectedIds = new Set(selectedTasks.map(task => task.id));
       this.database.removeTasks([...this.discardAfterPreflight,
-        ...planned.filter(task => !selectedTasks.some(selected => selected.id === task.id)).map(task => task.id)]);
+        ...planned.filter(task => !selectedIds.has(task.id)).map(task => task.id)]);
       this.discardAfterPreflight.clear();
       await this.checkpoint();
       if (this.needsInitialConfirmation()) {
@@ -176,20 +228,20 @@ export class SyncEngine {
       const blockedStructure = this.database.listPendingTasks().filter(task => ["local-rename", "rename", "move"].includes(task.kind));
       if (blockedStructure.length) throw new Error(`${blockedStructure.length} sync tasks are still queued`);
       appliedChanges += await this.ensureRemoteRoot();
-      this.queueTransferProgress();
+      await this.queueTransferProgress();
       this.emit("transfer", "正在执行同步任务");
       const preparation = new TaskRunner(this.database, {
-        mkdir: (task) => this.createRemoteDirectory(task),
-        recycle: (task) => this.recycleRemote(task),
+        mkdir: (task) => this.executeChecked(task, () => this.createRemoteDirectory(task)),
+        recycle: (task) => this.executeChecked(task, () => this.recycleRemote(task)),
       }, { kinds: ["mkdir", "recycle"], checkpoint: this.checkpoint, shouldCancel: () => this.cancelled });
       appliedChanges += await preparation.drain();
       this.throwIfCancelled();
       appliedChanges += await new TaskRunner(this.database, {
-        download: (task) => this.download(task),
+        download: (task) => this.executeChecked(task, () => this.download(task)),
       }, { kinds: ["download"], checkpoint: this.checkpoint, shouldCancel: () => this.cancelled }).drain();
       this.throwIfCancelled();
       const runner = new TaskRunner(this.database, {
-        upload: (task) => this.upload(task),
+        upload: (task) => this.executeChecked(task, () => this.upload(task)),
       }, { kinds: ["upload"], concurrency: 5, checkpoint: this.checkpoint, shouldCancel: () => this.cancelled });
       appliedChanges += await runner.drain();
       this.throwIfCancelled();
@@ -207,8 +259,10 @@ export class SyncEngine {
       
       return true;
     } catch (error) {
+      this.fileFailures = this.visibleFileFailures();
+      this.pendingValidationFailures = [];
       if (error instanceof SyncCancelledError) {
-        this.emit("paused", "同步已停止");
+        this.emit("paused", error.message);
         
         return false;
       }
@@ -224,9 +278,24 @@ export class SyncEngine {
       
       throw restriction ?? error;
     } finally {
-      
-      this.running = false;
-      for (const resolve of this.idleWaiters.splice(0)) resolve();
+      try {
+        const pendingTransferIds = new Set(this.database.listTransferTasks().map(task => task.id));
+        for (const transfer of this.transfers.snapshot()) {
+          if (transfer.state !== "completed" && !pendingTransferIds.has(transfer.id)) this.transfers.remove(transfer.id);
+        }
+        this.publishTransfers(true);
+        this.finishStage();
+        if (this.diagnostic) {
+          this.diagnostic.durationMs = Date.now() - this.diagnostic.startedAt;
+          this.diagnostic.longestBatchMs = this.work.longestBatchMs;
+          this.database.saveDiagnostics(this.diagnostic);
+        }
+        await this.checkpoint();
+      } finally {
+        this.running = false;
+        this.runSettings = undefined;
+        for (const resolve of this.idleWaiters.splice(0)) resolve();
+      }
     }
   }
 
@@ -236,22 +305,48 @@ export class SyncEngine {
   }
 
   private pendingPlanTasks(): SyncTask[] {
-    return this.database.listPendingTasks().filter(task => !this.discardAfterPreflight.has(task.id));
+    const tasks = this.database.listPendingTasks();
+    if (this.discardAfterPreflight.size) {
+      const children = new Map<string, string[]>();
+      for (const task of tasks) {
+        const parent = (task.payload as { derivedFrom?: string }).derivedFrom;
+        if (parent) { const group = children.get(parent) ?? []; group.push(task.id); children.set(parent, group); }
+      }
+      const queue = [...this.discardAfterPreflight];
+      for (let index = 0; index < queue.length; index++) {
+        for (const id of children.get(queue[index]!) ?? []) {
+          if (!this.discardAfterPreflight.has(id)) { this.discardAfterPreflight.add(id); queue.push(id); }
+        }
+      }
+    }
+    return tasks.filter(task => !this.discardAfterPreflight.has(task.id));
   }
 
   private async checkQuota(quota: SyncQuota, tasks: readonly SyncTask[]): Promise<void> {
-    const current = await Promise.all(tasks.map(async task => {
+    const current: SyncTask[] = [];
+    for (const task of tasks) {
+      await this.work.step();
       const payload = task.payload as { sourcePath?: string; local?: SyncSnapshot };
-      if (task.kind !== "upload") return task;
+      if (task.kind !== "upload") { current.push(task); continue; }
       const stat = await this.vault.adapter.stat(payload.sourcePath ?? task.path);
-      return { ...task, payload: { ...payload, local: stat?.type === "file"
-        ? { ...payload.local, kind: "file", size: stat.size } : undefined } };
-    }));
+      current.push({ ...task, payload: { ...payload, local: stat?.type === "file"
+        ? { ...payload.local, kind: "file", size: stat.size } : undefined } });
+    }
     assertSyncQuota(quota, current);
   }
 
-  retryFailed(): number { return this.database.retryFailedTasks(); }
-  retryTask(id: string): boolean { return this.database.retryTask(id); }
+  retryFailed(): number {
+    if (this.running) return 0;
+    this.refreshForRetry = true;
+    return this.database.retryFailedTasks() + this.fileFailures.length;
+  }
+  retryTask(id: string): boolean {
+    if (this.running) return false;
+    const scan = this.fileFailures.some(failure => failure.id === id);
+    const retried = scan || this.database.retryTask(id);
+    if (retried) this.refreshForRetry = true;
+    return retried;
+  }
   removeFailedTask(id: string): boolean {
     if (this.running) return false;
     const removed = this.database.removeFailedTask(id);
@@ -290,9 +385,13 @@ export class SyncEngine {
 
   consumeSuppression(path: string): boolean { return this.database.consumeSuppression(normalizeVaultPath(path)); }
 
-  private bindKnownRenameIdentities(): void {
-    const remote = this.remoteMap();
-    for (const task of this.database.listPendingTasks()) {
+  private async bindKnownRenameIdentities(): Promise<void> {
+    const tasks = this.database.listPendingTasks().filter(task => task.kind === "rename" || task.kind === "move");
+    if (!tasks.length) return;
+    const remote = await this.remoteMap();
+    for (const task of tasks) {
+      await this.work.step();
+      if (this.discardAfterPreflight.has(task.id) || this.taskProtected(task)) continue;
       if (task.kind !== "rename" && task.kind !== "move") continue;
       const payload = task.payload as RemoteRenamePayload;
       const base = payload.base ?? this.database.getBase(task.path);
@@ -304,8 +403,9 @@ export class SyncEngine {
   }
 
   private async reconcileLocalRenames(): Promise<void> {
-    this.bindKnownRenameIdentities();
+    await this.bindKnownRenameIdentities();
     for (const task of this.database.listPendingTasks()) {
+      if (this.discardAfterPreflight.has(task.id) || this.taskProtected(task)) continue;
       if (task.kind !== "rename" && task.kind !== "move") continue;
       const resolution = await this.renameResolution(task);
       if (resolution === "execute") continue;
@@ -318,7 +418,7 @@ export class SyncEngine {
   private async renameResolution(task: SyncTask): Promise<SyncTask | "execute" | undefined> {
     const payload = task.payload as RemoteRenamePayload;
     const destination = normalizeVaultPath(payload.destination);
-    const remote = this.remoteMap();
+    const remote = await this.remoteMap();
     const source = remote.get(pathKey(task.path));
     const base = payload.base ?? this.database.getBase(task.path);
     const nid = task.nid ?? base?.nid;
@@ -347,7 +447,7 @@ export class SyncEngine {
     const local = await this.scanLocal();
     const localEntry = local.get(pathKey(destination));
     if (!localEntry) throw new Error(`本地重命名目标不存在: ${destination}`);
-    if (this.destinationOccupied(local, pathKey(destination), pathKey(current.path))) {
+    if (await this.destinationOccupied(local, pathKey(destination), pathKey(current.path))) {
       throw new Error(`Local rename destination already exists: ${current.path}`);
     }
     if ((base && localEntry.snapshot.kind !== base.kind) || localEntry.snapshot.kind !== current.snapshot.kind) {
@@ -359,6 +459,8 @@ export class SyncEngine {
   }
 
   private emit(phase: string, message: string, traceId?: string): void {
+    if (["idle", "paused", "error"].includes(phase)) this.publishTransfers(true);
+    if (phase !== this.stage) { this.finishStage(); this.stage = phase; this.stageStarted = performance.now(); }
     const counts = this.database.taskCounts();
     const failedTasks = this.database.listFailedTasks();
     const failureCount = this.failureCount(failedTasks);
@@ -366,27 +468,72 @@ export class SyncEngine {
     
     this.report({ phase, message: displayMessage, queued: counts.queued, failed: failureCount, completed: this.completed,
       conflicts: this.database.unresolvedConflictCount(), lastSuccess: this.lastSuccess, lastError: this.lastError,
-      failedTasks, fileFailures: [...this.fileFailures], warnings: [...this.warnings], restriction: this.restriction });
+      failedTasks, fileFailures: this.visibleFileFailures(), warnings: [...this.warnings], restriction: this.restriction,
+      skippedFiles: this.protectedPaths.entries(),
+      diagnostics: this.diagnostic });
+  }
+
+  private finishStage(): void {
+    if (this.diagnostic && this.stage) this.diagnostic.stages[this.stage] =
+      (this.diagnostic.stages[this.stage] ?? 0) + performance.now() - this.stageStarted;
+    this.stageStarted = performance.now();
+  }
+
+  private progress(phase: string, message: string): void {
+    if (phase !== this.stage) { this.finishStage(); this.stage = phase; }
+    if (Date.now() - this.lastProgressReport < 200) return;
+    this.lastProgressReport = Date.now();
+    this.emit(phase, message);
   }
 
   private failureCount(failedTasks = this.database.listFailedTasks()): number {
-    return new Set([...failedTasks.map((task) => pathKey(task.path)), ...this.fileFailures.map((failure) => pathKey(failure.path))]).size;
+    return new Set([...failedTasks.map((task) => pathKey(task.path)), ...this.visibleFileFailures().map((failure) => pathKey(failure.path))]).size;
+  }
+
+  private visibleFileFailures(): SyncFileFailure[] {
+    return [...new Map([...this.pendingValidationFailures, ...this.fileFailures]
+      .map(failure => [failure.id ?? pathKey(failure.path), failure])).values()];
   }
 
   private fileFailureCount(): number { return this.failureCount([]); }
 
   private pathFilter(): PathFilterOptions {
-    const settings = this.settings();
-    return { syncObsidianConfig: settings.syncObsidianConfig,
-      filterRules: settings.filterRules, pluginId: "yunpan-sync" };
+    if (this.compiledFilter && this.running) return this.compiledFilter;
+    const settings = this.runSettings ?? this.settings();
+    const filter = compilePathFilter({ syncObsidianConfig: settings.syncObsidianConfig,
+      filterRules: settings.filterRules, pluginId: "yunpan-sync" });
+    if (this.running) this.compiledFilter = filter;
+    return filter;
+  }
+
+  private async localSnapshot(path: string, read: () => Promise<ArrayBuffer>, stat: { size: number; mtime: number }): Promise<SyncSnapshot> {
+    const current = await this.work.waitFor(() => this.vault.adapter.stat(path));
+    if (current?.type === "file" && this.excludeSize(path, current.size, "local")) throw new TaskSkippedError("本地文件大小不在同步范围内");
+    const before = { size: stat.size, mtime: stat.mtime };
+    const source = await this.work.waitFor(() => openDesktopSource(this.vault.adapter, path))
+      ?? memorySource(new Uint8Array(await this.work.waitFor(read)));
+    try {
+      if (this.excludeSize(path, source.size, "local")) throw new TaskSkippedError("本地文件大小不在同步范围内");
+      const hashed = await hashSource(source, () => this.throwIfCancelled(), bytes => {
+        this.progress("local-scan", `正在扫描本地：${path}（${bytes}/${source.size} 字节）`);
+      }, this.work);
+      const after = await this.work.waitFor(() => this.vault.adapter.stat(path));
+      if (!after || after.type !== "file" || after.size !== before.size || after.mtime !== before.mtime || source.size !== before.size) {
+        throw new Error(`Local file changed while scanning: ${path}`);
+      }
+      if (this.diagnostic) { this.diagnostic.localFiles++; this.diagnostic.localBytes += source.size; }
+      return { hash: hashed.fileHash, ...before, kind: "file" };
+    } finally { await source.close(); }
   }
 
   private async scanLocal(): Promise<Map<string, PathSnapshot>> {
     const result = new Map<string, PathSnapshot>();
     const filter = this.pathFilter();
-    const entries = this.vault.getAllLoadedFiles().filter((entry) => Boolean(entry.path));
-    entries.sort((left, right) => left.path.localeCompare(right.path));
+    const entries = await cooperativeSort(this.vault.getAllLoadedFiles().filter((entry) => Boolean(entry.path)),
+      (left, right) => left.path.localeCompare(right.path), this.work);
     for (const entry of entries) {
+      await this.work.step();
+      this.progress("local-scan", `正在扫描本地：${entry.path}`);
       try {
         if (entry.path.includes("\\")) {
           throw new WindowsPathError("invalid-character", "\\", "文件名包含 Windows 不支持的字符", ["\\"]);
@@ -399,27 +546,34 @@ export class SyncEngine {
         }
         throw error;
       }
-      if (shouldIgnorePath(entry.path, filter)) continue;
+      if (shouldIgnorePath(entry.path, filter)) { this.protectedPaths.add(entry.path, explainIgnoredPath(entry.path, filter) ?? "路径过滤规则", "local"); continue; }
+      if (this.protectedPaths.has(entry.path)) continue;
       if (entry instanceof TFolder) {
         if (result.has(pathKey(entry.path))) throw new Error(`Local vault contains a case-insensitive path collision: ${entry.path}`);
         result.set(pathKey(entry.path), { path: entry.path, snapshot: { size: 0, mtime: 0, kind: "directory" } });
       } else if (entry instanceof TFile) {
+        if (this.excludeSize(entry.path, entry.stat.size, "local")) continue;
         if (result.has(pathKey(entry.path))) throw new Error(`Local vault contains a case-insensitive path collision: ${entry.path}`);
-        const bytes = new Uint8Array(await this.vault.readBinary(entry));
-        result.set(pathKey(entry.path), { path: entry.path, snapshot: { hash: (await cloudFileHashes(bytes)).fileHash,
-          size: entry.stat.size, mtime: entry.stat.mtime, kind: "file" } });
+        try {
+          result.set(pathKey(entry.path), { path: entry.path,
+            snapshot: await this.localSnapshot(entry.path, () => this.vault.readBinary(entry), entry.stat) });
+        } catch (error) { if (!(error instanceof TaskSkippedError)) throw error; }
       }
     }
     if (filter.syncObsidianConfig) await this.scanObsidianConfig(result, filter);
     return result;
   }
 
-  private recordFileFailure(path: string, error: WindowsPathError, prefix?: string): void {
+  private recordFileFailure(path: string, error: WindowsPathError, prefix?: string, nid?: string): void {
     const wrapped = new WindowsPathError(error.issue, error.segment,
       prefix ? `${prefix}：${path}。${error.message}` : error.message, error.characters);
     if (!this.fileFailures.some((failure) => pathKey(failure.path) === pathKey(path))) {
-      this.fileFailures.push({ path, error: wrapped });
+      this.fileFailures.push({ id: `scan:${nid ? `remote:${nid}` : `local:${path}`}`, source: nid ? "remote" : "local", nid, path, error: wrapped });
     }
+    if (nid) this.protectedNids.add(nid);
+    const root = this.settings().remoteRoot;
+    const relative = nid && path.toLowerCase().startsWith(root.toLowerCase()) ? path.slice(root.length) : path;
+    this.protectedPaths.add(relative, wrapped.message, nid ? "remote" : "local");
   }
 
   private async scanObsidianConfig(result: Map<string, PathSnapshot>, filter: PathFilterOptions): Promise<void> {
@@ -428,67 +582,110 @@ export class SyncEngine {
     const walk = async (directory: string): Promise<void> => {
       const listed = await this.vault.adapter.list(directory);
       for (const rawPath of listed.folders) {
+        await this.work.step();
         const path = rawPath.replaceAll("\\", "/");
         try { normalizeVaultPath(path); }
         catch (error) {
           if (error instanceof WindowsPathError) { this.recordFileFailure(path, error, "本地路径不支持同步"); continue; }
           throw error;
         }
-        if (shouldIgnorePath(path, filter)) continue;
+        if (shouldIgnorePath(path, filter)) { this.protectedPaths.add(path, explainIgnoredPath(path, filter) ?? "路径过滤规则", "local"); continue; }
+        if (this.protectedPaths.has(path)) continue;
         result.set(pathKey(path), { path, snapshot: { size: 0, mtime: 0, kind: "directory" } });
         await walk(path);
       }
       for (const rawPath of listed.files) {
+        await this.work.step();
         const path = rawPath.replaceAll("\\", "/");
         try { normalizeVaultPath(path); }
         catch (error) {
           if (error instanceof WindowsPathError) { this.recordFileFailure(path, error, "本地路径不支持同步"); continue; }
           throw error;
         }
-        if (shouldIgnorePath(path, filter)) continue;
+        if (shouldIgnorePath(path, filter)) { this.protectedPaths.add(path, explainIgnoredPath(path, filter) ?? "路径过滤规则", "local"); continue; }
+        if (this.protectedPaths.has(path)) continue;
         const stat = await this.vault.adapter.stat(path);
         if (!stat || stat.type !== "file") continue;
-        const bytes = new Uint8Array(await this.vault.adapter.readBinary(path));
-        result.set(pathKey(path), { path, snapshot: { hash: (await cloudFileHashes(bytes)).fileHash,
-          size: stat.size, mtime: stat.mtime, kind: "file" } });
+        if (this.excludeSize(path, stat.size, "local")) continue;
+        try {
+          result.set(pathKey(path), { path, snapshot: await this.localSnapshot(path, () => this.vault.adapter.readBinary(path), stat) });
+        } catch (error) { if (!(error instanceof TaskSkippedError)) throw error; }
       }
     };
     await walk(".obsidian");
   }
 
-  private remoteMap(): Map<string, PathSnapshot> {
+  private async remoteMap(): Promise<Map<string, PathSnapshot>> {
     const result = new Map<string, PathSnapshot>();
-    for (const node of this.database.getRemoteNodes()) {
-      let path: string | undefined;
-      try {
-        path = remoteToVaultPath(this.settings().remoteRoot, node.path);
-      } catch (error) {
-        if (error instanceof Error && error.message === "Remote path is outside the bound root") continue;
-        if (error instanceof WindowsPathError) {
-          this.recordFileFailure(node.path, error, "远端路径不兼容 Windows");
-          continue;
-        }
-        throw error;
+    const nameIssues = new Map<string, WindowsPathError | null>();
+    const nameIssue = (node: RemoteNode): WindowsPathError | undefined => {
+      const chain: RemoteNode[] = [];
+      let current: RemoteNode | undefined = node;
+      const seen = new Set<string>();
+      let issue: WindowsPathError | undefined;
+      while (current && !seen.has(current.nid)) {
+        seen.add(current.nid);
+        if (nameIssues.has(current.nid)) { issue = nameIssues.get(current.nid) ?? undefined; break; }
+        chain.push(current);
+        try { validateWindowsPathSegment(current.name); }
+        catch (error) { if (error instanceof WindowsPathError) { issue = error; break; } throw error; }
+        current = this.database.getRemoteNode(current.pid);
       }
-      if (!path || shouldIgnorePath(path, this.pathFilter())) continue;
-      const key = pathKey(path);
-      if (result.has(key)) throw new Error(`Bound remote directory contains a case-insensitive path collision: ${path}`);
-      result.set(key, { path, snapshot: remoteSnapshot(node) });
+      for (const part of chain) nameIssues.set(part.nid, issue ?? null);
+      return issue;
+    };
+    let total = 0;
+    let matched = 0;
+    for await (const batch of this.database.remoteNodeBatches(this.settings().remoteRoot)) {
+      for (const node of batch) {
+        total++;
+        await this.work.step();
+        if (node.path.toLowerCase().startsWith(this.settings().remoteRoot.toLowerCase())) matched++;
+        if (this.diagnostic) { this.diagnostic.remoteNodes = total; this.diagnostic.matchedNodes = matched; }
+        this.progress("remote-map", `正在比较绑定目录：已处理 ${total} 项`);
+        let path: string | undefined;
+        try {
+          const root = this.settings().remoteRoot.toLowerCase();
+          if (node.path.toLowerCase().startsWith(root)) {
+            const issue = nameIssue(node);
+            if (issue) throw issue;
+          }
+          path = remoteToVaultPath(this.settings().remoteRoot, node.path);
+        } catch (error) {
+          if (error instanceof Error && error.message === "Remote path is outside the bound root") continue;
+          if (error instanceof WindowsPathError) {
+            this.recordFileFailure(node.path, error, "远端路径不支持同步", node.nid);
+            continue;
+          }
+          throw error;
+        }
+        if (!path) continue;
+        if (shouldIgnorePath(path, this.pathFilter())) {
+          this.protectedPaths.add(path, explainIgnoredPath(path, this.pathFilter()) ?? "路径过滤规则", "remote"); this.protectedNids.add(node.nid); continue;
+        }
+        if (!node.isDir && this.excludeSize(path, node.size, "remote")) { this.protectedNids.add(node.nid); continue; }
+        const key = pathKey(path);
+        if (result.has(key)) throw new Error(`Bound remote directory contains a case-insensitive path collision: ${path}`);
+        result.set(key, { path, snapshot: remoteSnapshot(node) });
+      }
     }
+    if (this.diagnostic) this.diagnostic.matchedNodes = matched;
     return result;
   }
 
   private async ensureRemoteRoot(): Promise<number> {
-    const existing = new Set(this.database.getRemoteNodes().filter((node) => node.isDir).map((node) => node.path.replace(/\/$/, "")));
+    const cursor = this.database.getCursor(this.accountKey);
+    if (cursor?.bgsp === directorySnapshotScope(this.settings().remoteRoot) && cursor.gsp?.startsWith("exists:")) return 0;
     const segments = this.settings().remoteRoot.split("/").filter(Boolean);
     let current = "";
     let created = 0;
     for (const segment of segments) {
+      this.throwIfCancelled();
       current += `/${segment}`;
-      if (existing.has(current)) continue;
+      if (this.database.hasRemoteDirectory(current)) continue;
       try {
         await this.api.call("File.mkdir", { fname: `${current}/` });
-        existing.add(current);
+        this.throwIfCancelled();
         created++;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -500,8 +697,66 @@ export class SyncEngine {
 
   private async planTasks(): Promise<void> {
     this.planTaskIndex = new Map(this.database.listPendingTasks().map(task => [`${task.kind}:${pathKey(task.path)}`, task]));
+    const remote = await this.remoteMap();
+    const base = new Map<string, PathSnapshot>();
+    for await (const batch of this.database.baseBatches()) {
+      for (const [path, snapshot] of batch) {
+        await this.work.step();
+        if (base.has(pathKey(path))) throw new Error(`Sync baseline contains a case-insensitive path collision: ${path}`);
+        base.set(pathKey(path), { path, snapshot });
+        if (shouldIgnorePath(path, this.pathFilter())) {
+          this.protectedPaths.add(path, explainIgnoredPath(path, this.pathFilter()) ?? "路径过滤规则", snapshot.nid ? "remote" : "local");
+        } else if (snapshot.nid && this.protectedNids.has(snapshot.nid)) {
+          const failure = this.fileFailures.find(item => item.nid === snapshot.nid);
+          this.protectedPaths.add(path, failure?.error.message ?? "云端文件名不合法，已保留原文件", "remote");
+        } else if (snapshot.kind === "file") this.excludeSize(path, snapshot.size, snapshot.nid ? "remote" : "local");
+      }
+    }
     const local = await this.scanLocal();
-    const remote = this.remoteMap();
+    // Protect both identities when an excluded file was renamed remotely.
+    const protectedBaseNids = new Set([...base.values()].filter(entry => this.protectedPaths.has(entry.path))
+      .map(entry => entry.snapshot.nid).filter(Boolean));
+    for (const entry of remote.values()) {
+      await this.work.step();
+      if (entry.snapshot.nid && protectedBaseNids.has(entry.snapshot.nid)) {
+        this.protectedPaths.add(entry.path, "对应文件不参与同步", "both");
+      }
+    }
+    for (const task of this.database.listPendingTasks()) {
+      await this.work.step();
+      const node = task.nid ? this.database.getRemoteNode(task.nid) : undefined;
+      let invalid = false;
+      try {
+        validateTaskPath(task.path);
+        const payload = task.payload as { destination?: string; sourcePath?: string };
+        if (payload.destination) validateTaskPath(payload.destination);
+        if (payload.sourcePath) normalizeVaultPath(payload.sourcePath);
+      } catch { invalid = true; }
+      const staleRemote = node && ["download", "recycle"].includes(task.kind) &&
+        node.path.replace(/\/+$/, "") !== `${this.settings().remoteRoot}${task.path}`.replace(/\/+$/, "");
+      if (!node && task.nid && ["download", "recycle"].includes(task.kind)) {
+        this.protectedPaths.add(task.path, "旧任务对应的云端文件已不存在，已保留原文件", "both");
+      }
+      if (invalid || staleRemote || this.taskProtected(task)) {
+        this.discardAfterPreflight.add(task.id);
+        if (invalid && !node) this.protectedPaths.add(task.path, "旧文件名任务已失效，请重新检测", "both");
+      }
+    }
+    await this.reconcileLocalRenames();
+    for (const task of this.pendingPlanTasks()) {
+      if (this.taskProtected(task)) this.discardAfterPreflight.add(task.id);
+    }
+    // Excluded subtrees and their ancestors cannot be rewritten as a side effect.
+    for (const map of [local, remote, base]) {
+      for (const [key, entry] of map) {
+        await this.work.step();
+        if (this.protectedPaths.has(entry.path, true)) map.delete(key);
+      }
+    }
+    this.conflictPaths = new Set(this.pendingPlanTasks().flatMap(task => {
+      const path = (task.payload as LocalRenamePayload).conflictPath;
+      return path ? [pathKey(path)] : [];
+    }));
     this.database.requeueStaleCompletedRecycleTasks(
       new Map([...remote].map(([key, entry]) => [key, entry.snapshot.nid ?? ""])),
       new Set(local.keys()),
@@ -509,77 +764,84 @@ export class SyncEngine {
     for (const task of this.pendingPlanTasks()) {
       if (task.kind === "recycle" && !remote.has(pathKey(task.path))) this.discardAfterPreflight.add(task.id);
     }
-    const base = new Map<string, PathSnapshot>();
-    for (const [path, snapshot] of this.database.getBases()) {
-      if (base.has(pathKey(path))) throw new Error(`Sync baseline contains a case-insensitive path collision: ${path}`);
-      base.set(pathKey(path), { path, snapshot });
-    }
-    const deferredBaseKeys = this.projectStructuralTasks(local, remote, base);
-    for (const key of this.planRemoteRenames(local, remote, base)) deferredBaseKeys.add(key);
+    const deferredBaseKeys = await this.projectStructuralTasks(local, remote, base);
+    for (const key of await this.planRemoteRenames(local, remote, base)) deferredBaseKeys.add(key);
     for (const task of this.pendingPlanTasks()) {
       if ((task.kind === "upload" || task.kind === "mkdir") && !local.has(pathKey(task.path)) &&
         !(task.payload as { derivedFrom?: string }).derivedFrom) this.discardAfterPreflight.add(task.id);
     }
     const paths = new Set([...local.keys(), ...remote.keys(), ...base.keys()]);
-    const ordered = [...paths].sort((left, right) => {
+    const ordered = await cooperativeSort([...paths], (left, right) => {
       const directoryDifference = Number(local.get(right)?.snapshot.kind === "directory") - Number(local.get(left)?.snapshot.kind === "directory");
       return directoryDifference || left.split("/").length - right.split("/").length || left.localeCompare(right);
-    });
+    }, this.work);
     const recycledDirectories: string[] = [];
     const protectedDirectories: string[] = [];
-    for (const key of ordered) {
-      if (protectedDirectories.some(prefix => key.startsWith(prefix))) continue;
-      const localEntry = local.get(key);
-      const remoteEntry = remote.get(key);
-      const baseEntry = base.get(key);
-      const path = localEntry?.path ?? remoteEntry?.path ?? baseEntry!.path;
-      if (recycledDirectories.some((prefix) => key.startsWith(prefix))) {
-        if (baseEntry) this.database.deleteBase(baseEntry.path);
-        continue;
-      }
-      if (baseEntry && baseEntry.path !== path) {
-        this.database.deleteBase(baseEntry.path);
-        this.database.putBase(path, baseEntry.snapshot);
-        baseEntry.path = path;
-      }
-      const decision = planThreeWay(baseEntry?.snapshot, localEntry?.snapshot, remoteEntry?.snapshot);
-      const nextKind = decision.action === "upload" ? localEntry?.snapshot.kind === "directory" ? "mkdir" : "upload"
-        : decision.action === "delete-remote" ? "recycle"
-        : ["download", "delete-local", "conflict"].includes(decision.action) ? "download" : undefined;
-      for (const kind of ["upload", "download", "mkdir", "recycle"] as const) {
-        const pending = this.planTaskIndex.get(`${kind}:${key}`);
-        if (pending && kind !== nextKind) this.discardAfterPreflight.add(pending.id);
-      }
-      const id = crypto.randomUUID();
-      const payload = { local: localEntry?.snapshot, sourcePath: localEntry?.sourcePath,
-        derivedFrom: localEntry?.derivedFrom,
-        remote: remoteEntry?.snapshot, base: baseEntry?.snapshot,
-        conflict: decision.action === "conflict", remoteDeleted: decision.action === "conflict" && !remoteEntry };
-      if (decision.action === "upload") this.enqueuePlan({ id, kind: localEntry?.snapshot.kind === "directory" ? "mkdir" : "upload", path, payload });
-      else if (decision.action === "download") this.enqueuePlan({ id, kind: "download", path, nid: remoteEntry?.snapshot.nid, payload });
-      else if (decision.action === "delete-remote") {
-        this.database.enqueue({ id, kind: "recycle", path, nid: remoteEntry?.snapshot.nid, payload });
-        if (remoteEntry?.snapshot.kind === "directory") recycledDirectories.push(`${key}/`);
-      }
-      else if (decision.action === "delete-local") this.enqueuePlan({ id, kind: "download", path, payload: { ...payload, remoteDeleted: true } });
-      else if (decision.action === "conflict") {
-        const task = this.enqueuePlan({ id, kind: "download", path, nid: remoteEntry?.snapshot.nid, payload });
-        if (localEntry) {
-          const conflictPath = this.allocateConflictPath(task, local, remote);
-          this.planConflictUploads(task, local, conflictPath);
-          if (localEntry.snapshot.kind === "directory") {
-            protectedDirectories.push(`${key}/`);
-            for (const pending of this.pendingPlanTasks()) {
-              if (pathKey(pending.path).startsWith(`${key}/`)) this.discardAfterPreflight.add(pending.id);
+    const conflictUploads: Array<{ task: SyncTask; destination: string }> = [];
+    let offset = 0;
+    while (offset < ordered.length) {
+      const started = performance.now();
+      this.database.taskBatch(() => {
+        let processed = 0;
+        while (offset < ordered.length && processed++ < 100 && (processed === 1 || performance.now() - started < 8)) {
+          const key = ordered[offset++]!;
+          if (protectedDirectories.some(prefix => key.startsWith(prefix))) continue;
+          const localEntry = local.get(key);
+          const remoteEntry = remote.get(key);
+          const baseEntry = base.get(key);
+          const path = localEntry?.path ?? remoteEntry?.path ?? baseEntry!.path;
+          if (recycledDirectories.some((prefix) => key.startsWith(prefix))) {
+            if (baseEntry) this.database.deleteBase(baseEntry.path);
+            continue;
+          }
+          if (baseEntry && baseEntry.path !== path) {
+            this.database.deleteBase(baseEntry.path);
+            this.database.putBase(path, baseEntry.snapshot);
+            baseEntry.path = path;
+          }
+          const decision = planThreeWay(baseEntry?.snapshot, localEntry?.snapshot, remoteEntry?.snapshot);
+          const nextKind = decision.action === "upload" ? localEntry?.snapshot.kind === "directory" ? "mkdir" : "upload"
+            : decision.action === "delete-remote" ? "recycle"
+            : ["download", "delete-local", "conflict"].includes(decision.action) ? "download" : undefined;
+          for (const kind of ["upload", "download", "mkdir", "recycle"] as const) {
+            const pending = this.planTaskIndex.get(`${kind}:${key}`);
+            if (pending && kind !== nextKind) this.discardAfterPreflight.add(pending.id);
+          }
+          const id = crypto.randomUUID();
+          const payload = { local: localEntry?.snapshot, sourcePath: localEntry?.sourcePath,
+            derivedFrom: localEntry?.derivedFrom,
+            remote: remoteEntry?.snapshot, base: baseEntry?.snapshot,
+            conflict: decision.action === "conflict", remoteDeleted: decision.action === "conflict" && !remoteEntry };
+          if (decision.action === "upload") this.enqueuePlan({ id, kind: localEntry?.snapshot.kind === "directory" ? "mkdir" : "upload", path, payload });
+          else if (decision.action === "download") this.enqueuePlan({ id, kind: "download", path, nid: remoteEntry?.snapshot.nid, payload });
+          else if (decision.action === "delete-remote") {
+            this.database.enqueue({ id, kind: "recycle", path, nid: remoteEntry?.snapshot.nid, payload });
+            if (remoteEntry?.snapshot.kind === "directory") recycledDirectories.push(`${key}/`);
+          }
+          else if (decision.action === "delete-local") this.enqueuePlan({ id, kind: "download", path, payload: { ...payload, remoteDeleted: true } });
+          else if (decision.action === "conflict") {
+            const task = this.enqueuePlan({ id, kind: "download", path, nid: remoteEntry?.snapshot.nid, payload });
+            if (localEntry) {
+              const conflictPath = this.allocateConflictPath(task, local, remote);
+              conflictUploads.push({ task, destination: conflictPath });
+              if (localEntry.snapshot.kind === "directory") {
+                protectedDirectories.push(`${key}/`);
+                for (const pending of this.pendingPlanTasks()) {
+                  if (pathKey(pending.path).startsWith(`${key}/`)) this.discardAfterPreflight.add(pending.id);
+                }
+              }
             }
           }
+          else if (decision.action === "drop-base") this.database.deleteBase(path);
+          else if (decision.action === "none" && remoteEntry && !deferredBaseKeys.has(key)) {
+            this.database.putBase(path, remoteEntry.snapshot);
+          }
         }
-      }
-      else if (decision.action === "drop-base") this.database.deleteBase(path);
-      else if (decision.action === "none" && remoteEntry && !deferredBaseKeys.has(key)) {
-        this.database.putBase(path, remoteEntry.snapshot);
-      }
+      });
+      this.progress("plan", `正在生成同步任务：${offset}/${ordered.length}`);
+      await this.work.step(true);
     }
+    for (const { task, destination } of conflictUploads) await this.planConflictUploads(task, local, destination);
   }
 
   /** Refresh snapshots without resetting a pending task's retry state. */
@@ -606,8 +868,8 @@ export class SyncEngine {
     if (payload.conflictPath) return payload.conflictPath;
     for (let sequence = 0; sequence < 10_000; sequence++) {
       const path = buildConflictPath(task.path, this.settings().deviceName, new Date(), sequence);
-      if (local.has(pathKey(path)) || remote.has(pathKey(path)) || this.database.listPendingTasks().some(t =>
-        (t.payload as LocalRenamePayload).conflictPath === path)) continue;
+      if (local.has(pathKey(path)) || remote.has(pathKey(path)) || this.conflictPaths.has(pathKey(path))) continue;
+      this.conflictPaths.add(pathKey(path));
       payload.conflictPath = path;
       this.database.updateTaskPayload(task.id, payload);
       return path;
@@ -615,9 +877,12 @@ export class SyncEngine {
     throw new Error(`Unable to allocate conflict path for ${task.path}`);
   }
 
-  private planConflictUploads(task: SyncTask, local: Map<string, PathSnapshot>, destination: string): void {
+  private async planConflictUploads(task: SyncTask, local: Map<string, PathSnapshot>, destination: string): Promise<void> {
     const sourceKey = pathKey(task.path);
-    for (const [key, entry] of local) {
+    const file = local.get(sourceKey);
+    const entries = file?.snapshot.kind === "file" ? [[sourceKey, file] as const] : local;
+    for (const [key, entry] of entries) {
+      await this.work.step();
       if (key !== sourceKey && !key.startsWith(`${sourceKey}/`)) continue;
       this.enqueuePlan({ id: crypto.randomUUID(), kind: entry.snapshot.kind === "directory" ? "mkdir" : "upload",
         path: `${destination}${entry.path.slice(task.path.length)}`,
@@ -628,56 +893,111 @@ export class SyncEngine {
   }
 
   /** Project structural intents onto snapshots; no local or cloud files change here. */
-  private projectStructuralTasks(local: Map<string, PathSnapshot>, remote: Map<string, PathSnapshot>, base: Map<string, PathSnapshot>): Set<string> {
+  private async projectStructuralTasks(local: Map<string, PathSnapshot>, remote: Map<string, PathSnapshot>, base: Map<string, PathSnapshot>): Promise<Set<string>> {
     const deferred = new Set<string>();
     for (const task of this.pendingPlanTasks()) {
+      await this.work.step();
       if (task.kind === "rename" || task.kind === "move") {
         const payload = task.payload as RemoteRenamePayload;
-        this.relocateSnapshotTree(remote, payload.intermediatePath ?? task.path, payload.destination);
-        for (const key of this.relocateSnapshotTree(base, task.path, payload.destination)) deferred.add(key);
+        await this.relocateSnapshotTree(remote, payload.intermediatePath ?? task.path, payload.destination);
+        for (const key of await this.relocateSnapshotTree(base, task.path, payload.destination)) deferred.add(key);
       } else if (task.kind === "local-rename") {
         const payload = task.payload as LocalRenamePayload;
         if (payload.conflict) {
           const destination = this.allocateConflictPath(task, local, remote);
-          this.relocateSnapshotTree(local, task.path, destination, true, task.id);
-          this.removeSnapshotTree(base, pathKey(payload.basePath ?? task.path));
-          this.removeSnapshotTree(base, pathKey(task.path));
+          await this.relocateSnapshotTree(local, task.path, destination, true, task.id);
+          await this.removeSnapshotTree(base, pathKey(payload.basePath ?? task.path));
+          await this.removeSnapshotTree(base, pathKey(task.path));
           this.database.updateTaskPayload(task.id, { ...payload, conflictPlanned: true });
         } else {
-          this.relocateSnapshotTree(local, task.path, payload.destination, true, task.id);
-          for (const key of this.relocateSnapshotTree(base, task.path, payload.destination)) deferred.add(key);
+          await this.relocateSnapshotTree(local, task.path, payload.destination, true, task.id);
+          for (const key of await this.relocateSnapshotTree(base, task.path, payload.destination)) deferred.add(key);
         }
       }
     }
     return deferred;
   }
 
-  private planRemoteRenames(
+  private excludeSize(path: string, size: number | undefined, source: SkippedFileSource = "both"): boolean {
+    const reason = fileSizeExclusion(size, this.runSettings ?? this.settings());
+    if (!reason) return false;
+    this.protectedPaths.add(path, reason, source, size);
+    return true;
+  }
+
+  private taskProtected(task: SyncTask): boolean {
+    const payload = task.payload as LocalRenamePayload & { sourcePath?: string };
+    const paths = [task.path, payload.destination, payload.sourcePath].filter((path): path is string => Boolean(path));
+    return paths.some(path => this.protectedPaths.has(path, true) || shouldIgnorePath(path, this.pathFilter())) ||
+      [payload.local, payload.remote, payload.base].some(snapshot => snapshot?.kind === "file" &&
+        this.excludeSize(task.path, snapshot.size, snapshot.nid ? "remote" : "local"));
+  }
+
+  private async executeChecked(task: SyncTask, execute: () => Promise<void>): Promise<void> {
+    this.throwIfCancelled();
+    validateTaskPath(task.path);
+    const payload = task.payload as LocalRenamePayload & { sourcePath?: string };
+    if (payload.destination) validateTaskPath(payload.destination);
+    if (payload.sourcePath) normalizeVaultPath(payload.sourcePath);
+    const checkLocal = async (path: string, recursive: boolean): Promise<void> => {
+      const stat = await this.vault.adapter.stat(path);
+      if (stat?.type === "file") this.excludeSize(path, stat.size, "local");
+      else if (stat?.type === "folder" && recursive) {
+        const listed = await this.vault.adapter.list(path);
+        for (const child of [...listed.files, ...listed.folders]) {
+          await this.work.step();
+          if (shouldIgnorePath(child, this.pathFilter())) this.protectedPaths.add(child, explainIgnoredPath(child, this.pathFilter()) ?? "路径过滤规则", "local");
+          else await checkLocal(child, true);
+        }
+      }
+    };
+    const recursive = task.kind === "recycle" || task.kind === "local-rename" || task.kind === "rename" || task.kind === "move" ||
+      (task.kind === "download" && Boolean((task.payload as { remoteDeleted?: boolean }).remoteDeleted || payload.conflict));
+    await checkLocal(payload.sourcePath ?? task.path, recursive);
+    if (payload.destination) await checkLocal(payload.destination, recursive);
+    const current = task.nid ? this.database.getRemoteNode(task.nid) : undefined;
+    if (current && !current.isDir) this.excludeSize(task.path, current.size, "remote");
+    if (this.taskProtected(task)) {
+      this.transfers.remove(task.id);
+      this.publishTransfers(true);
+      throw new TaskSkippedError("文件或目录包含不参与同步的内容，已保留两端文件");
+    }
+    this.throwIfCancelled();
+    await execute();
+  }
+
+  private async planRemoteRenames(
     local: Map<string, PathSnapshot>,
     remote: Map<string, PathSnapshot>,
     base: Map<string, PathSnapshot>,
-  ): Set<string> {
+  ): Promise<Set<string>> {
     const remoteByNid = new Map<string, PathSnapshot>();
     for (const entry of remote.values()) {
+      await this.work.step();
       if (entry.snapshot.nid) remoteByNid.set(entry.snapshot.nid, entry);
     }
-    const candidates = [...base.values()].map((baseEntry) => ({
-      baseEntry,
-      remoteEntry: baseEntry.snapshot.nid ? remoteByNid.get(baseEntry.snapshot.nid) : undefined,
-    })).filter(({ baseEntry, remoteEntry }) => remoteEntry && baseEntry.path !== remoteEntry.path &&
-      baseEntry.snapshot.kind === remoteEntry.snapshot.kind)
-      .sort((left, right) => left.baseEntry.path.split("/").length - right.baseEntry.path.split("/").length);
+    const candidates: Array<{ baseEntry: PathSnapshot; remoteEntry: PathSnapshot }> = [];
+    for (const baseEntry of base.values()) {
+      await this.work.step();
+      const remoteEntry = baseEntry.snapshot.nid ? remoteByNid.get(baseEntry.snapshot.nid) : undefined;
+      if (remoteEntry && baseEntry.path !== remoteEntry.path && baseEntry.snapshot.kind === remoteEntry.snapshot.kind) {
+        candidates.push({ baseEntry, remoteEntry });
+      }
+    }
+    const orderedCandidates = await cooperativeSort(candidates,
+      (left, right) => left.baseEntry.path.split("/").length - right.baseEntry.path.split("/").length, this.work);
     const claimedSources: string[] = [];
     const deferredBaseKeys = new Set<string>();
-    for (const { baseEntry, remoteEntry: matchedRemote } of candidates) {
+    for (const { baseEntry, remoteEntry: matchedRemote } of orderedCandidates) {
+      await this.work.step();
       const remoteEntry = matchedRemote!;
       const nid = baseEntry.snapshot.nid;
       const sourceKey = pathKey(baseEntry.path);
       const destinationKey = pathKey(remoteEntry.path);
       if (!nid || claimedSources.some((prefix) => sourceKey.startsWith(prefix))) continue;
       const localEntry = local.get(sourceKey);
-      if (!localEntry || this.destinationOccupied(local, sourceKey, destinationKey)) continue;
-      const localChanged = !this.localTreeMatchesBase(baseEntry.path, local, base);
+      if (!localEntry || await this.destinationOccupied(local, sourceKey, destinationKey)) continue;
+      const localChanged = !await this.localTreeMatchesBase(baseEntry.path, local, base);
 
       const task = this.enqueuePlan({
         id: crypto.randomUUID(), kind: "local-rename", path: baseEntry.path, nid,
@@ -686,59 +1006,70 @@ export class SyncEngine {
       });
       if (localChanged) {
         const destination = this.allocateConflictPath(task, local, remote);
-        this.relocateSnapshotTree(local, baseEntry.path, destination, true, task.id);
-        this.removeSnapshotTree(base, sourceKey);
+        await this.relocateSnapshotTree(local, baseEntry.path, destination, true, task.id);
+        await this.removeSnapshotTree(base, sourceKey);
         this.database.updateTaskPayload(task.id, { ...task.payload as object, conflictPlanned: true });
       } else {
-        this.relocateSnapshotTree(local, baseEntry.path, remoteEntry.path, true, task.id);
-        for (const key of this.relocateSnapshotTree(base, baseEntry.path, remoteEntry.path)) deferredBaseKeys.add(key);
+        await this.relocateSnapshotTree(local, baseEntry.path, remoteEntry.path, true, task.id);
+        for (const key of await this.relocateSnapshotTree(base, baseEntry.path, remoteEntry.path)) deferredBaseKeys.add(key);
       }
       claimedSources.push(`${sourceKey}/`);
     }
     return deferredBaseKeys;
   }
 
-  private localTreeMatchesBase(
+  private async localTreeMatchesBase(
     source: string,
     local: Map<string, PathSnapshot>,
     base: Map<string, PathSnapshot>,
-  ): boolean {
+  ): Promise<boolean> {
     const sourceKey = pathKey(source);
     const sourcePrefix = `${sourceKey}/`;
     for (const [key, candidate] of base) {
+      await this.work.step();
       if (key !== sourceKey && !key.startsWith(sourcePrefix)) continue;
       const localEntry = local.get(key);
       if (!localEntry || !snapshotsEqual(candidate.snapshot, localEntry.snapshot)) return false;
     }
     for (const key of local.keys()) {
+      await this.work.step();
       if ((key === sourceKey || key.startsWith(sourcePrefix)) && !base.has(key)) return false;
     }
     return true;
   }
 
-  private destinationOccupied(local: Map<string, PathSnapshot>, sourceKey: string, destinationKey: string): boolean {
+  private async destinationOccupied(local: Map<string, PathSnapshot>, sourceKey: string, destinationKey: string): Promise<boolean> {
     if (sourceKey === destinationKey) return false;
     const sourcePrefix = `${sourceKey}/`;
     const destinationPrefix = `${destinationKey}/`;
     for (const key of local.keys()) {
+      await this.work.step();
       if ((key === destinationKey || key.startsWith(destinationPrefix)) &&
           key !== sourceKey && !key.startsWith(sourcePrefix)) return true;
     }
     return false;
   }
 
-  private removeSnapshotTree(map: Map<string, PathSnapshot>, sourceKey: string): void {
+  private async removeSnapshotTree(map: Map<string, PathSnapshot>, sourceKey: string): Promise<void> {
     const prefix = `${sourceKey}/`;
-    for (const key of [...map.keys()]) if (key === sourceKey || key.startsWith(prefix)) map.delete(key);
+    for (const key of [...map.keys()]) {
+      await this.work.step();
+      if (key === sourceKey || key.startsWith(prefix)) map.delete(key);
+    }
   }
 
-  private relocateSnapshotTree(map: Map<string, PathSnapshot>, source: string, destination: string, trackSource = false, derivedFrom?: string): string[] {
+  private async relocateSnapshotTree(map: Map<string, PathSnapshot>, source: string, destination: string, trackSource = false, derivedFrom?: string): Promise<string[]> {
     const sourceKey = pathKey(source);
     const prefix = `${sourceKey}/`;
-    const entries = [...map].filter(([key]) => key === sourceKey || key.startsWith(prefix));
+    const entries: Array<[string, PathSnapshot]> = [];
+    for (const entry of map) {
+      await this.work.step();
+      if (entry[0] === sourceKey || entry[0].startsWith(prefix)) entries.push(entry);
+    }
     for (const [key] of entries) map.delete(key);
     const relocated: string[] = [];
     for (const [, entry] of entries) {
+      await this.work.step();
       const suffix = entry.path.length === source.length ? "" : entry.path.slice(source.length);
       const path = `${destination}${suffix}`;
       const key = pathKey(path);
@@ -828,7 +1159,7 @@ export class SyncEngine {
 
   private async recycleRemote(task: SyncTask): Promise<void> {
     const payload = this.payload(task);
-    const indexedNode = task.nid ? this.database.getRemoteNodes().find((node) => node.nid === task.nid) : undefined;
+    const indexedNode = task.nid ? this.database.getRemoteNode(task.nid) : undefined;
     const kind = payload.remote?.kind ?? (indexedNode ? indexedNode.isDir ? "directory" : "file" : undefined)
       ?? payload.base?.kind;
     const joinedPath = joinRemotePath(this.settings().remoteRoot, task.path).replace(/\/+$/, "");
@@ -838,7 +1169,7 @@ export class SyncEngine {
       await this.api.call("File.syncRecycle", { fname: remotePath, owner_qid: this.settings().ownerQid });
     } catch (error) {
       if (!isAlreadyDeletedRemoteError(error)) throw error;
-      if (task.nid && this.database.getRemoteNodes().some((node) => node.nid === task.nid)) throw error;
+      if (task.nid && this.database.getRemoteNode(task.nid)) throw error;
       
     }
     if (kind === "directory") this.database.deleteBaseTree(task.path);
@@ -868,7 +1199,7 @@ export class SyncEngine {
     payload.intermediatePath = intermediate;
     this.database.updateTaskPayload(task.id, payload);
     await this.checkpoint();
-    const indexed = task.nid ? this.database.getRemoteNodes().find(node => node.nid === task.nid) : undefined;
+    const indexed = task.nid ? this.database.getRemoteNode(task.nid) : undefined;
     if (indexed?.path !== intermediateRemote) {
       if (await this.recoverRenameRace(task, () => this.api.call("File.move", { src_name: source, new_name: destinationDirectory }))) return;
       this.database.moveRemoteNodes(source, intermediateRemote);
@@ -887,7 +1218,9 @@ export class SyncEngine {
     catch (error) {
       if (!isAlreadyDeletedRemoteError(error) || this.renameRefreshUsed) throw error;
       this.renameRefreshUsed = true;
-      await new RemoteIndexer(this.api, this.database, this.accountKey).update();
+      await new RemoteIndexer(this.api, this.database, this.accountKey, 200, {
+        remoteRoot: this.settings().remoteRoot, check: () => this.throwIfCancelled(), work: this.work,
+      }).rebuild();
       const resolution = await this.renameResolution(task);
       if (resolution === "execute") throw error;
       if (resolution) {
@@ -910,38 +1243,46 @@ export class SyncEngine {
     const root = this.settings().remoteRoot;
     if (!parent) return joinRemotePath(root, "");
 
-    const knownDirectories = new Set(this.database.getRemoteNodes()
-      .filter((node) => node.isDir)
-      .map((node) => node.path.replace(/\/+$/, "")));
     const segments = parent.split("/");
     let current = "";
     for (const segment of segments) {
+      this.throwIfCancelled();
       current = current ? `${current}/${segment}` : segment;
       const remotePath = joinRemotePath(root, current).replace(/\/+$/, "");
-      if (knownDirectories.has(remotePath)) continue;
+      if (this.database.hasRemoteDirectory(remotePath)) continue;
       try {
         await this.api.call("File.mkdir", { fname: `${remotePath}/` });
+        this.throwIfCancelled();
       } catch (error) {
         if (!isAlreadyExistingRemoteNodeError(error)) throw error;
       }
-      knownDirectories.add(remotePath);
     }
     return `${joinRemotePath(root, parent).replace(/\/+$/, "")}/`;
   }
 
   private async upload(task: SyncTask): Promise<void> {
     const file = this.vault.getFileByPath(task.path);
-    const adapterStat = file ? undefined : await this.vault.adapter.stat(task.path);
-    const stat = file?.stat ?? adapterStat;
+    const adapterStat = await this.vault.adapter.stat(task.path);
+    const stat = adapterStat ?? file?.stat;
     if (!stat || (!file && adapterStat?.type !== "file")) throw new Error(`Local file disappeared: ${task.path}`);
-    const bytes = new Uint8Array(file ? await this.vault.readBinary(file) : await this.vault.adapter.readBinary(task.path));
-    this.transfers.queue(task.id, "upload", task.path, bytes.byteLength);
+    if (this.excludeSize(task.path, stat.size, "local")) throw new TaskSkippedError("上传文件大小不在同步范围内");
+    const before = { size: stat.size, mtime: stat.mtime };
+    const source = await openDesktopSource(this.vault.adapter, task.path);
+    if (source && this.excludeSize(task.path, source.size, "local")) {
+      await source.close();
+      this.transfers.remove(task.id);
+      throw new TaskSkippedError("上传文件大小已变化，不在同步范围内");
+    }
+    const bytes = source ? undefined : new Uint8Array(file ? await this.vault.readBinary(file) : await this.vault.adapter.readBinary(task.path));
+    this.transfers.queue(task.id, "upload", task.path, source?.size ?? bytes!.byteLength);
     this.transfers.start(task.id);
     this.publishTransfers();
     try {
-      const before = { size: stat.size, mtime: stat.mtime };
-      const response = await this.uploader.upload({ path: joinRemotePath(this.settings().remoteRoot, task.path), data: bytes,
+      const response = await this.uploader.upload({ path: joinRemotePath(this.settings().remoteRoot, task.path), data: bytes, source,
         ctime: stat.ctime, mtime: stat.mtime, transferId: task.id,
+        expectedHash: this.payload(task).local?.hash,
+        check: () => this.throwIfCancelled(),
+        onHashProgress: completed => this.progress("hash", `正在校验上传文件：${task.path}（${completed}/${stat.size} 字节）`),
         onProgress: (completed, total) => this.updateTransfer(task.id, completed, total) });
       const currentFile = this.vault.getFileByPath(task.path);
       const currentAdapterStat = currentFile ? undefined : await this.vault.adapter.stat(task.path);
@@ -959,7 +1300,7 @@ export class SyncEngine {
     } catch (error) {
       this.failTransfer(task.id, error);
       throw error;
-    }
+    } finally { await source?.close(); }
   }
 
   private async download(task: SyncTask): Promise<void> {
@@ -973,8 +1314,8 @@ export class SyncEngine {
       this.database.deleteBase(task.path);
       return;
     }
-    if (existsInAdapter && payload.conflict) await this.preserveConflict(task.path, payload.local, task);
     if (payload.remote?.kind === "directory") {
+      if (existsInAdapter && payload.conflict) await this.preserveConflict(task.path, payload.local, task);
       if (!existsInAdapter || payload.conflict) await this.createLocalDirectory(task.path);
       this.database.putBase(task.path, payload.remote);
       return;
@@ -982,21 +1323,77 @@ export class SyncEngine {
     this.transfers.queue(task.id, "download", task.path, payload.remote?.size ?? 0);
     this.transfers.start(task.id);
     this.publishTransfers();
+    const before = await this.vault.adapter.stat(task.path);
+    if (!payload.conflict && payload.local && (!before || before.type !== "file" ||
+      before.size !== payload.local.size || before.mtime !== payload.local.mtime)) {
+      throw new Error(`Local file changed since sync planning: ${task.path}`);
+    }
+    if (!payload.local && !payload.conflict && before) {
+      throw new Error(`Local file appeared since sync planning: ${task.path}`);
+    }
+    const checkTarget = async () => {
+      this.throwIfCancelled();
+      const after = await this.vault.adapter.stat(task.path);
+      if (Boolean(before) !== Boolean(after) || (before && after &&
+        (before.type !== after.type || before.size !== after.size || before.mtime !== after.mtime || before.ctime !== after.ctime))) {
+        throw new Error(`Local file changed during download: ${task.path}`);
+      }
+    };
+    const prepareTarget = async () => {
+      await checkTarget();
+      if (existsInAdapter && payload.conflict) await this.preserveConflict(task.path, payload.local, task);
+    };
+    const checkCommit = async () => {
+      if (!payload.conflict) return checkTarget();
+      this.throwIfCancelled();
+      if (await this.vault.adapter.exists(task.path, false)) throw new Error(`Local file appeared during conflict download: ${task.path}`);
+    };
+    let temporary: string | undefined;
+    let sink: Awaited<ReturnType<typeof openDesktopSink>>;
     try {
-      const bytes = await this.downloader.download({ path: joinRemotePath(this.settings().remoteRoot, task.path), nid: task.nid,
-        onProgress: (completed, total) => this.updateTransfer(task.id, completed, total) });
-      await this.atomicWrite(task.path, bytes, payload.remote?.mtime);
+      await this.ensureFolder(task.path);
+      temporary = `${task.path}.yunpan-sync-${crypto.randomUUID()}.part`;
+      sink = await openDesktopSink(this.vault.adapter, temporary);
+      const input = { path: joinRemotePath(this.settings().remoteRoot, task.path), nid: task.nid,
+        check: () => this.throwIfCancelled(),
+        validateSize: (size: number) => {
+          if (this.excludeSize(task.path, size, "remote")) throw new TaskSkippedError("云端文件大小不在同步范围内");
+          if (payload.remote && size !== payload.remote.size) throw new Error("云端文件在检测后已变化，请重新检测");
+        },
+        onStage: (stage: "download" | "verify") => this.progress(stage,
+          `${stage === "verify" ? "正在校验下载文件" : "正在下载"}：${task.path}`),
+        onProgress: (completed: number, total: number) => this.updateTransfer(task.id, completed, total) };
+      if (sink) {
+        await this.downloader.downloadTo(input, sink);
+        const normalizedMtime = payload.remote?.mtime === undefined ? undefined : payload.remote.mtime < 1_000_000_000_000
+          ? payload.remote.mtime * 1000 : payload.remote.mtime;
+        await sink.close(normalizedMtime);
+        await prepareTarget();
+        this.progress("save", `正在保存文件：${task.path}`);
+        await this.commitTemporary(task.path, temporary, checkCommit);
+      } else {
+        const bytes = await this.downloader.download(input);
+        await prepareTarget();
+        await this.atomicWrite(task.path, bytes, payload.remote?.mtime, checkCommit);
+      }
       if (payload.remote) this.database.putBase(task.path, payload.remote);
       this.transfers.complete(task.id);
       this.publishTransfers();
     } catch (error) {
-      this.failTransfer(task.id, error);
+      if (error instanceof TaskSkippedError) { this.transfers.remove(task.id); this.publishTransfers(true); }
+      else this.failTransfer(task.id, error);
       throw error;
+    } finally {
+      try { await sink?.close(); }
+      finally {
+        if (temporary && await this.vault.adapter.exists(temporary, false)) await this.vault.adapter.remove(temporary);
+      }
     }
   }
 
-  private queueTransferProgress(): void {
+  private async queueTransferProgress(): Promise<void> {
     for (const task of this.database.listTransferTasks()) {
+      await this.work.step();
       const payload = this.payload(task);
       if (task.kind === "upload" && payload.local?.kind !== "directory") {
         this.transfers.queue(task.id, "upload", task.path, payload.local?.size ?? 0);
@@ -1018,10 +1415,18 @@ export class SyncEngine {
     this.publishTransfers();
   }
 
-  private publishTransfers(): void { this.reportTransfers(this.transfers.snapshot()); }
+  private publishTransfers(immediate = false): void {
+    if (!immediate && Date.now() - this.lastTransferReport < 200) {
+      this.progressTimer ??= setTimeout(() => { this.progressTimer = undefined; this.publishTransfers(true); }, 200);
+      return;
+    }
+    if (this.progressTimer) { clearTimeout(this.progressTimer); this.progressTimer = undefined; }
+    this.lastTransferReport = Date.now();
+    this.reportTransfers(this.transfers.snapshot());
+  }
 
   private throwIfCancelled(): void {
-    if (this.cancelled) throw new SyncCancelledError();
+    if (this.cancelled) throw new SyncCancelledError(this.stopReason);
   }
 
   private async ensureFolder(path: string): Promise<void> {
@@ -1083,12 +1488,21 @@ export class SyncEngine {
     throw new Error(`Unable to allocate conflict path for ${path}`);
   }
 
-  private async atomicWrite(path: string, bytes: Uint8Array, mtime?: number): Promise<void> {
+  private async atomicWrite(path: string, bytes: Uint8Array, mtime?: number, check?: () => Promise<void>): Promise<void> {
     await this.ensureFolder(path);
     const temporary = `${path}.yunpan-sync-${crypto.randomUUID()}.part`;
-    this.database.suppress(path, "write", undefined, Date.now() + 30_000);
     const normalizedMtime = mtime === undefined ? undefined : mtime < 1_000_000_000_000 ? mtime * 1000 : mtime;
-    await this.vault.adapter.writeBinary(temporary, bytesBuffer(bytes), { mtime: normalizedMtime });
+    try {
+      await this.vault.adapter.writeBinary(temporary, bytesBuffer(bytes), { mtime: normalizedMtime });
+      await this.commitTemporary(path, temporary, check);
+    } finally {
+      if (await this.vault.adapter.exists(temporary, false)) await this.vault.adapter.remove(temporary);
+    }
+  }
+
+  private async commitTemporary(path: string, temporary: string, check?: () => Promise<void>): Promise<void> {
+    await check?.();
+    this.database.suppress(path, "write", undefined, Date.now() + 30_000);
     const existing = await this.vault.adapter.exists(path, false);
     const backup = `${temporary}.backup`;
     try {

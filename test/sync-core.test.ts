@@ -84,7 +84,7 @@ describe("remote index", () => {
     expect(db.getRemoteNodes().map((node) => node.path)).toEqual(["/legacy:remote.txt"]);
   });
 
-  it("skips remote nodes with unsafe names without blocking the snapshot", async () => {
+  it("retains unsafe remote names and identities for validation without blocking the snapshot", async () => {
     const SQL = await initSqlJs({ locateFile: () => "node_modules/sql.js/dist/sql-wasm.wasm" });
     const db = new SyncDatabase(new SQL.Database());
     const api = { call: vi.fn()
@@ -97,7 +97,7 @@ describe("remote index", () => {
 
     await new RemoteIndexer(api, db, "account", 10).rebuild();
 
-    expect(db.getRemoteNodes().map((node) => node.path)).toEqual(["/good.md"]);
+    expect(db.getRemoteNodes().map((node) => node.path)).toEqual(["/", "/good.md"]);
     expect(db.getCursor("account")).toMatchObject({ gsp: "12", snapshotComplete: true });
   });
 
@@ -271,7 +271,7 @@ describe("Windows remote path compatibility", () => {
     const engine = new SyncEngine({} as never, db, {} as never, {} as never, {} as never,
       () => ({ ...DEFAULT_SETTINGS, remoteRoot: "/Obsidian/aa/" }), "account", () => undefined);
 
-    expect((engine as unknown as { remoteMap: () => Map<unknown, unknown> }).remoteMap()).toEqual(new Map());
+    expect(await (engine as unknown as { remoteMap: () => Promise<Map<unknown, unknown>> }).remoteMap()).toEqual(new Map());
     expect((engine as unknown as { fileFailures: Array<{ path: string; error: Error }> }).fileFailures)
       .toEqual([expect.objectContaining({ path: "/Obsidian/aa/CON.txt", error: expect.objectContaining({ issue: "reserved-name" }) })]);
   });
@@ -284,7 +284,7 @@ describe("Windows remote path compatibility", () => {
     const engine = new SyncEngine({} as never, db, {} as never, {} as never, {} as never,
       () => ({ ...DEFAULT_SETTINGS, remoteRoot: "/Obsidian/aa/" }), "account", () => undefined);
 
-    expect((engine as unknown as { remoteMap: () => Map<unknown, unknown> }).remoteMap()).toEqual(new Map());
+    expect(await (engine as unknown as { remoteMap: () => Promise<Map<unknown, unknown>> }).remoteMap()).toEqual(new Map());
   });
 });
 
@@ -739,6 +739,7 @@ describe("task runner", () => {
       isDir: false, version: 2, hash: "remote", size: 6, mtime: 3 }]);
     const paths = new Set(["old.md"]);
     const adapter = {
+      stat: vi.fn(async (path: string) => paths.has(path) ? { type: "file", size: 6, mtime: 3, ctime: 1 } : null),
       exists: vi.fn(async (path: string) => paths.has(path)),
       rename: vi.fn(async (source: string, destination: string) => { paths.delete(source); paths.add(destination); }),
       writeBinary: vi.fn(async (path: string) => { paths.add(path); }),

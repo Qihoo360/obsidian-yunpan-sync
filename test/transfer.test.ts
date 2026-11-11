@@ -93,6 +93,21 @@ describe("upload state machine", () => {
 });
 
 describe("download state machine", () => {
+  it("validates fresh metadata before requesting any content", async () => {
+    const api = { call: vi.fn().mockResolvedValue({ http: "https://dl1.yunpan.360.cn/intf.php", fhash: "a".repeat(40), fsize: 500 * 1024 * 1024 }) };
+    const store = { callJson: vi.fn(), download: vi.fn() };
+    const downloader = new DownloadMachine(api, () => store);
+    await expect(downloader.download({ path: "/Root/video.mp4", validateSize: size => {
+      if (size > 30 * 1024 * 1024) throw new Error("excluded by size");
+    } })).rejects.toThrow("excluded by size");
+    expect(store.download).not.toHaveBeenCalled(); expect(store.callJson).not.toHaveBeenCalled();
+  });
+  it("does not treat missing download size as an empty file", async () => {
+    const api = { call: vi.fn().mockResolvedValue({ http: "https://dl1.yunpan.360.cn/intf.php", fhash: "a".repeat(40) }) };
+    const store = { callJson: vi.fn(), download: vi.fn() };
+    await expect(new DownloadMachine(api, () => store).download({ path: "/Root/a.pdf" })).rejects.toThrow("Invalid download size");
+    expect(store.download).not.toHaveBeenCalled();
+  });
   it("downloads ranges and verifies the cloud file hash", async () => {
     const data = new Uint8Array(600_000).fill(3);
     const { fileHash } = await cloudFileHashes(data);

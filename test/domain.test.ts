@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildConflictPath, normalizeRemoteRoot, normalizeVaultPath, remoteToVaultPath, shouldIgnorePath,
+import { buildConflictPath, explainIgnoredPath, normalizeRemoteRoot, normalizeVaultPath, remoteToVaultPath, shouldIgnorePath,
   validateWindowsPathSegment, WindowsPathError } from "../src/domain/paths.js";
 import { planThreeWay } from "../src/domain/planner.js";
 import { createOpenApiSign } from "../src/net/signing.js";
@@ -32,6 +32,15 @@ describe("sync domain contracts", () => {
     expect(shouldIgnorePath("Private/report.PDF", { filterRules })).toBe(true);
     expect(shouldIgnorePath("private/report.pdf", { filterRules })).toBe(false);
     expect(shouldIgnorePath("notes/readme.md", { filterRules })).toBe(false);
+    expect(explainIgnoredPath("project/.git/config", { filterRules })).toBe("命中排除规则：**/.git");
+    expect(explainIgnoredPath("draft/cache.TMP", { filterRules })).toBe("命中排除规则：**/*.tmp");
+  });
+
+  it("explains built-in exclusions and hides the root as an internal path", () => {
+    expect(explainIgnoredPath("/")).toBe("根目录不参与同步");
+    expect(explainIgnoredPath("notes/file.log", { excludedExtensions: [".log"] })).toBe("命中扩展名排除规则：*.log");
+    expect(explainIgnoredPath(".obsidian/app.json")).toBe("Obsidian 配置目录未开启同步");
+    expect(explainIgnoredPath("notes/file.md~")).toBe("同步临时文件");
   });
 
   it("uses the last matching include or exclude rule", () => {

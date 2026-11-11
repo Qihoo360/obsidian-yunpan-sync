@@ -1,6 +1,7 @@
 import type { FilterRule } from "../settings.js";
 
 const TEMP_FILE_PATTERNS = [
+  /\.yunpan-sync-[^/]+\.(?:part|rename)(?:\.backup)?$/i,
   /(?:^|\/)Thumbs\.db$/i,
   /(?:^|\/)desktop\.ini$/i,
   /(?:^|\/)~\$/,
@@ -24,8 +25,14 @@ function normalizePathText(path: string): string {
 }
 
 export function validateWindowsPathSegment(segment: string): void {
+  if (!segment || segment === "." || segment === "..") {
+    throw new WindowsPathError("invalid-character", segment, "文件名为空或包含不安全的路径段");
+  }
   if (segment.length > 255) {
     throw new WindowsPathError("segment-too-long", segment, "Windows 路径段超过 255 个字符");
+  }
+  if (new TextEncoder().encode(segment).length > 255) {
+    throw new WindowsPathError("segment-too-long", segment, "文件名超过文件系统支持的 255 字节，请缩短名称");
   }
   if (segment.endsWith(" ") || segment.endsWith(".")) {
     throw new WindowsPathError("trailing-space-or-dot", segment, "Windows 文件名不能以空格或句点结尾");
@@ -58,6 +65,14 @@ export interface PathFilterOptions {
   excludedExtensions?: readonly string[];
   filterRules?: readonly FilterRule[];
   pluginId?: string;
+  compiledRules?: readonly { expression: RegExp; action: "exclude" | "include"; pattern: string }[];
+}
+
+export function compilePathFilter(options: PathFilterOptions): PathFilterOptions {
+  return { ...options, compiledRules: (options.filterRules ?? []).flatMap(rule => {
+    const expression = rule.enabled ? globRegex(rule.pattern, rule.caseSensitive) : undefined;
+    return expression ? [{ expression, action: filterRuleAction(rule), pattern: rule.pattern }] : [];
+  }) };
 }
 
 export function filterRuleAction(rule: FilterRule): "exclude" | "include" {
@@ -99,32 +114,51 @@ export function matchesFilterRule(path: string, rule: FilterRule): boolean {
   return false;
 }
 
-export function shouldIgnorePath(path: string, options: PathFilterOptions = {}): boolean {
+function matchedFilterRule(path: string, options: PathFilterOptions): { action: "exclude" | "include"; pattern: string } | undefined {
+  let matched: { action: "exclude" | "include"; pattern: string } | undefined;
+  if (options.compiledRules) {
+    const parts = path.split("/");
+    for (const rule of options.compiledRules) {
+      for (let length = parts.length; length > 0; length--) {
+        if (rule.expression.test(parts.slice(0, length).join("/"))) { matched = rule; break; }
+      }
+    }
+  } else for (const rule of options.filterRules ?? []) {
+    if (matchesFilterRule(path, rule)) matched = { action: filterRuleAction(rule), pattern: rule.pattern };
+  }
+  return matched;
+}
+
+/** Returns the user-facing reason when a path is excluded, otherwise undefined. */
+export function explainIgnoredPath(path: string, options: PathFilterOptions = {}): string | undefined {
   let normalized: string;
   try {
     normalized = normalizeVaultPath(path);
   } catch {
-    return true;
+    return "路径格式无效";
   }
-  if (!normalized) return true;
+  if (!normalized) return "根目录不参与同步";
   const first = (normalized.split("/", 1)[0] || "").toLowerCase();
-  if (first === ".yunpan-sync") return true;
+  if (first === ".yunpan-sync") return "同步临时目录";
   if (first === ".obsidian") {
-    if (!options.syncObsidianConfig) return true;
+    if (!options.syncObsidianConfig) return "Obsidian 配置目录未开启同步";
     const pluginId = options.pluginId ?? "yunpan-sync";
     const ownPlugins = [pluginId, "obsidian-yunpan-sync"].map((id) => `.obsidian/plugins/${id}`.toLowerCase());
     const lowerPath = normalized.toLowerCase();
-    if (ownPlugins.some((plugin) => lowerPath === plugin || lowerPath.startsWith(`${plugin}/`))) return true;
+    if (ownPlugins.some((plugin) => lowerPath === plugin || lowerPath.startsWith(`${plugin}/`))) return "同步插件自身目录";
   }
   const name = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
   const excluded = (options.excludedExtensions ?? []).map((item) => item.toLowerCase().replace(/^\*?\.?/, "")).filter(Boolean);
-  if (excluded.some((extension) => name.endsWith(`.${extension}`))) return true;
-  let matched: "exclude" | "include" | undefined;
-  for (const rule of options.filterRules ?? []) {
-    if (matchesFilterRule(normalized, rule)) matched = filterRuleAction(rule);
-  }
-  if (matched === "exclude") return true;
-  return TEMP_FILE_PATTERNS.some((pattern) => pattern.test(normalized));
+  const extension = excluded.find((candidate) => name.endsWith(`.${candidate}`));
+  if (extension) return `命中扩展名排除规则：*.${extension}`;
+  const matched = matchedFilterRule(normalized, options);
+  if (matched?.action === "exclude") return `命中排除规则：${matched.pattern}`;
+  if (TEMP_FILE_PATTERNS.some((pattern) => pattern.test(normalized))) return "同步临时文件";
+  return undefined;
+}
+
+export function shouldIgnorePath(path: string, options: PathFilterOptions = {}): boolean {
+  return explainIgnoredPath(path, options) !== undefined;
 }
 
 export function normalizeRemoteRoot(root: string): string {

@@ -1,3 +1,6 @@
+/** Network type detection is intentionally absent: Obsidian mobile plugins do
+ * not expose a reliable Wi-Fi/cellular API. Keep only lifecycle helpers. */
+
 export interface ReconnectableSyncEngine {
   isRunning(): boolean;
   waitForIdle(): Promise<void>;

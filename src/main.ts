@@ -27,17 +27,18 @@ import {
 import { OpenApiClient, type HttpRequest } from "./net/openapi-client.js";
 import { DEFAULT_SETTINGS, ensureDeviceId, normalizeSettings, pollIntervalMs,
   normalizeScheduledInterval, MIN_SCHEDULED_INTERVAL_MINUTES, MAX_SCHEDULED_INTERVAL_MINUTES,
+  validFileSizeRange,
   type FilterRule, type PluginSettings } from "./settings.js";
 import { DatabasePersistence } from "./storage/persistence.js";
 import { SyncEngine, type EngineStatus } from "./sync/engine.js";
 import { DownloadMachine } from "./transfer/download.js";
 import { StoreClient } from "./transfer/store-client.js";
 import { UploadMachine } from "./transfer/upload.js";
-import { normalizeRemoteRoot, shouldIgnorePath } from "./domain/paths.js";
+import { normalizeRemoteRoot, shouldIgnorePath, parseExcludedExtensions } from "./domain/paths.js";
 import { OPENAPI_SIGNING_SECRET } from "./config/openapi.js";
 import { initialStatus, restoredStatus } from "./status.js";
 import { completionNotice, isSuccessfulSyncMessage } from "./sync/outcome.js";
-import { summarizeTransfers, type FileTransferProgress } from "./sync/progress.js";
+import { overallTransferProgress, summarizeTransfers, type FileTransferProgress } from "./sync/progress.js";
 import { SyncProgressModal, SyncTaskPreviewModal } from "./ui/sync-modal.js";
 import { openPluginSettings } from "./ui/plugin-settings.js";
 import type { SyncConflict, SyncTask } from "./storage/database.js";
@@ -48,13 +49,14 @@ import { openFeedbackLink, openProductLink, openMembershipPayment } from "./ui/p
 import { SyncPreflightError } from "./sync/quota.js";
 
 
-import { hasActiveMembership, membershipIcon, membershipLabel } from "./ui/account-membership.js";
+import { hasActiveMembership, hasExpiredMembership, membershipIcon, membershipLabel } from "./ui/account-membership.js";
 import { FilterRulesModal } from "./ui/filter-rules-modal.js";
 import { RELOGIN_MESSAGE, statusBarDestination } from "./ui/auth-state.js";
 import { interruptSyncForDisconnect, resumeSyncAfterReconnect } from "./sync/connectivity.js";
 import { PluginLifecycleTimers, settleForPause } from "./lifecycle.js";
 import { openVaultPath } from "./ui/open-vault-path.js";
 import { dismissKeyboardOnBlankTap } from "./ui/dismiss-keyboard.js";
+import { renderFailedRecordAction } from "./ui/failed-record-action.js";
 
 const DEBOUNCE_MS = 1500;
 
@@ -72,6 +74,7 @@ export default class YunpanSyncPlugin extends Plugin {
   private authRefresh?: AuthRefreshCoordinator;
   private accountProfile?: AccountProfile;
   private accountProfileLoading = false;
+  private accountProfileRequest?: { api: OpenApiClient; promise: Promise<void> };
   private accountProfileError?: string;
   private transfers: FileTransferProgress[] = [];
   private syncModal?: SyncProgressModal;
@@ -87,6 +90,10 @@ export default class YunpanSyncPlugin extends Plugin {
   private loginAttempt?: AbortController;
   private loginGeneration = 0;
   private unloading = false;
+  private uiTimer?: ReturnType<typeof setTimeout>;
+  private lastUiRender = 0;
+  private readonly dismissedInitialConfirmations = new WeakSet<SyncEngine>();
+  private taskPreview?: SyncTaskPreviewModal;
   readonly mobileLoginPreparation = new MobileLoginPreparation(async (signal, progress) => {
     const { MobileOAuth } = await import("./auth/oauth-mobile.js");
     if (signal.aborted) throw loginCancelledError();
@@ -99,7 +106,7 @@ export default class YunpanSyncPlugin extends Plugin {
       return;
     }
     const persisted = await this.loadData() as Partial<PluginSettings> | null | undefined;
-    this.settings = normalizeSettings(persisted);
+    this.settings = normalizeSettings(persisted, this.isMobileDevice);
     const createdDeviceId = ensureDeviceId(this.settings);
     this.secrets = new SecretStore(this.app.secretStorage);
     // Obsidian removes plugin settings on uninstall but retains Secret Storage.
@@ -126,7 +133,7 @@ export default class YunpanSyncPlugin extends Plugin {
       await this.persistence.save();
       await this.saveData(this.settings);
       new Notice("服务已更新为生产环境，请重新登录并确认同步目录");
-    } else if (createdDeviceId) await this.saveData(this.settings);
+    } else if (createdDeviceId || JSON.stringify(persisted) !== JSON.stringify(this.settings)) await this.saveData(this.settings);
     this.persistence.database.recoverInterruptedTasks();
     
     await this.persistence.save();
@@ -153,7 +160,7 @@ export default class YunpanSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", (file) => this.onVaultEvent(file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => this.onVaultEvent(file.path)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.onVaultRename(oldPath, file.path)));
-    this.registerDomEvent(window, "offline", () => { interruptSyncForDisconnect(this.engine); });
+    this.registerDomEvent(window, "offline", () => { interruptSyncForDisconnect(this.engine); this.updateStatus({ ...this.status, phase: "paused", message: "网络已断开，同步已暂停" }); });
     this.registerDomEvent(window, "online", () => void resumeSyncAfterReconnect(
       () => this.settings.paused || this.isMobileBackgrounded || this.settings.mode === "manual",
       this.engine,
@@ -168,17 +175,19 @@ export default class YunpanSyncPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     this.unloading = true;
+    this.taskPreview?.cancel();
+    if (this.uiTimer) { clearTimeout(this.uiTimer); this.uiTimer = undefined; }
     this.settingTab?.hide();
     this.endLoginAttempt();
     this.lifecycle.dispose();
-    if (this.isMobileDevice) await settleForPause(true, this.engine);
+    await settleForPause(true, this.engine);
     await this.persistence?.close();
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
     this.configureSchedule();
-    this.settingTab?.display();
+    this.settingTab?.refresh();
   }
 
   get currentStatus(): EngineStatus { return this.status; }
@@ -286,7 +295,7 @@ export default class YunpanSyncPlugin extends Plugin {
           this.mobileLoginWaiter = { resolve, reject, timer };
         });
         this.updateStatus({ phase: "login", message: "等待浏览器授权；若浏览器未打开，可使用下方授权链接", queued: 0, failed: 0 });
-        this.settingTab?.display();
+        this.settingTab?.refresh();
         auth = await authorization;
       } else {
         const { DesktopOAuth } = await import("./auth/oauth-desktop.js");
@@ -306,13 +315,19 @@ export default class YunpanSyncPlugin extends Plugin {
           this.mobileLoginWaiter = { resolve, reject, timer };
         });
         this.updateStatus({ phase: "login", message: "等待浏览器授权", queued: 0, failed: 0 });
-        this.settingTab?.display();
+        this.settingTab?.refresh();
         try { window.open(preparedDesktop.authorizationUrl, "_blank"); }
         catch (error) { throw error instanceof Error ? error : new Error(String(error)); }
         auth = await authorization;
       }
       if (!current()) return;
-      if (previousQid && previousQid !== auth.qid) this.persistence?.database.resetSyncState();
+      if (previousQid && previousQid !== auth.qid) {
+        // The remote root belongs to the account, so never carry the previous
+        // account's selected folder into a replacement login.
+        this.persistence?.database.resetSyncState();
+        this.settings.remoteRoot = DEFAULT_SETTINGS.remoteRoot;
+        await this.saveSettings();
+      }
       this.secrets.setAuth(auth);
       this.mobileLoginPreparation.clear();
       
@@ -320,7 +335,8 @@ export default class YunpanSyncPlugin extends Plugin {
       await this.configureEngine();
       if (!current()) return;
       this.updateStatus({ phase: "idle", message: "已登录", queued: 0, failed: 0 });
-      this.settingTab?.display();
+      this.settingTab?.refresh();
+      this.scheduleInitialSync();
       new Notice("360AI 云盘登录成功");
       await this.refreshAccountProfile(false);
     } catch (error) {
@@ -343,6 +359,7 @@ export default class YunpanSyncPlugin extends Plugin {
 
   async logout(): Promise<void> {
     this.endLoginAttempt();
+    this.taskPreview?.cancel();
     if (this.engine?.isRunning()) {
       this.engine.cancel();
       await this.engine.waitForIdle();
@@ -354,11 +371,15 @@ export default class YunpanSyncPlugin extends Plugin {
     this.accountProfileError = undefined;
     this.updateTransfers([]);
     this.api = undefined;
+    // A selected remote folder is account-specific. Restore the safe default
+    // on logout so the next login cannot inherit the previous account's path.
+    this.settings.remoteRoot = DEFAULT_SETTINGS.remoteRoot;
+    await this.saveSettings();
     this.persistence?.database.resetSyncState();
     await this.persistence?.save();
     this.engine = undefined;
     this.updateStatus({ phase: "idle", message: "未登录", queued: 0, failed: 0 });
-    this.settingTab?.display();
+    this.settingTab?.refresh();
   }
 
   private async handleMobileOAuthCallback(params: Record<string, string>): Promise<void> {
@@ -396,7 +417,8 @@ export default class YunpanSyncPlugin extends Plugin {
         await this.configureEngine();
         if (!current()) return;
         new Notice("360AI 云盘登录成功");
-        this.settingTab?.display();
+        this.settingTab?.refresh();
+        this.scheduleInitialSync();
         await this.refreshAccountProfile(false);
       }
     } catch (error) {
@@ -426,10 +448,11 @@ export default class YunpanSyncPlugin extends Plugin {
     await this.saveSettings();
     await this.configureEngine();
     this.updateStatus({ phase: "idle", message: "远端目录已变更，将在下次同步重建基线", queued: 0, failed: 0 });
+    this.scheduleInitialSync();
   }
 
   async syncNow(rebuild = false, interactive = true): Promise<void> {
-    if (this.isMobileBackgrounded) return;
+    if (this.unloading || this.isMobileBackgrounded || this.engine?.isRunning()) return;
     if (this.removingFailure) {
       if (interactive) new Notice("正在保存失败记录，请稍后同步");
       return;
@@ -451,13 +474,19 @@ export default class YunpanSyncPlugin extends Plugin {
     }
     if (interactive) this.showSyncProgress();
     try {
-      const initialConfirmation = this.engine.needsInitialConfirmation();
-      if (initialConfirmation && !interactive) {
+      const engine = this.engine;
+      const initialConfirmation = engine.needsInitialConfirmation();
+      if (initialConfirmation && !interactive && this.dismissedInitialConfirmations.has(engine)) {
         this.updateStatus({ ...this.status, phase: "paused", message: "等待首次同步确认" });
         return;
       }
-      await this.engine.synchronize(rebuild, initialConfirmation
-        ? (tasks) => this.confirmSyncTasks(tasks, true) : undefined);
+      await engine.synchronize(rebuild, initialConfirmation
+        ? async (tasks) => {
+          if (this.unloading || this.isMobileBackgrounded || this.engine !== engine) return undefined;
+          const selected = await this.confirmSyncTasks(tasks, true);
+          if (!selected || (tasks.length > 0 && selected.size === 0)) this.dismissedInitialConfirmations.add(engine);
+          return selected;
+        } : undefined);
       await this.persistence?.save();
       if (this.status.phase === "idle" && isSuccessfulSyncMessage(this.status.message)) {
         this.displayedSyncWarnings.clear();
@@ -495,28 +524,42 @@ export default class YunpanSyncPlugin extends Plugin {
   }
 
   async refreshAccountProfile(showFailureNotice = true): Promise<void> {
-    if (!this.auth || !this.api || this.accountProfileLoading) return;
+    const api = this.api;
+    const qid = this.auth?.qid;
+    if (!qid || !api || this.unloading) return;
+    if (this.accountProfileRequest?.api === api) return this.accountProfileRequest.promise;
+    const request = { api, promise: Promise.resolve() };
+    this.accountProfileRequest = request;
     this.accountProfileLoading = true;
     this.accountProfileError = undefined;
-    this.settingTab?.display();
-    try {
-      const data = await this.api.call<Record<string, unknown>>("User.getUserDetail", {});
-      const qid = this.auth?.qid;
-      if (!qid) return;
-      this.accountProfile = normalizeAccountProfile(data ?? {}, qid);
-      if (this.status.phase === "idle" && this.status.message.startsWith("已登录")) {
-        this.updateStatus({ ...this.status, message: `已登录 ${accountDisplayIdentity(this.accountProfile)}` });
+    const current = () => !this.unloading && this.api === api && this.auth?.qid === qid;
+    request.promise = (async () => {
+      this.settingTab?.refresh();
+      try {
+        const data = await api.call<Record<string, unknown>>("User.getUserDetail", {});
+        if (!current()) return;
+        this.accountProfile = normalizeAccountProfile(data ?? {}, qid);
+        if (!hasExpiredMembership(this.accountProfile) && this.status.restriction?.kind === "membership" && !this.isSyncing) {
+          this.engine?.clearMembershipRestriction();
+          this.lastRestrictionWarning = undefined;
+          this.updateStatus({ ...this.status, phase: this.isPaused ? "paused" : "idle",
+            message: "会员状态已更新，可继续同步", lastError: undefined, restriction: undefined });
+        } else if (this.status.phase === "idle" && this.status.message.startsWith("已登录")) {
+          this.updateStatus({ ...this.status, message: `已登录 ${accountDisplayIdentity(this.accountProfile)}` });
+        }
+      } catch (error) {
+        if (!current() || this.handleAuthError(error)) return;
+        this.accountProfileError = messageOf(error);
+        if (showFailureNotice) new Notice(`账户信息刷新失败: ${this.accountProfileError}`);
+      } finally {
+        if (this.accountProfileRequest === request) {
+          this.accountProfileRequest = undefined;
+          this.accountProfileLoading = false;
+          if (current()) this.settingTab?.refresh();
+        }
       }
-      
-    } catch (error) {
-      if (this.handleAuthError(error)) return;
-      this.accountProfileError = messageOf(error);
-      
-      if (showFailureNotice) new Notice(`账户信息刷新失败: ${this.accountProfileError}`);
-    } finally {
-      this.accountProfileLoading = false;
-      this.settingTab?.display();
-    }
+    })();
+    return request.promise;
   }
 
   async retryFailed(): Promise<void> {
@@ -555,6 +598,7 @@ export default class YunpanSyncPlugin extends Plugin {
         : `删除失败记录失败：${messageOf(error)}`);
     } finally {
       this.removingFailure = false;
+      this.settingTab?.renderStatus();
       this.syncModal?.render();
       this.refreshStatusViews();
     }
@@ -563,17 +607,19 @@ export default class YunpanSyncPlugin extends Plugin {
   async resolveConflict(id: number): Promise<void> {
     if (this.persistence?.database.resolveConflict(id)) await this.persistence.save();
     this.refreshStatusViews();
-    this.settingTab?.display();
+    this.settingTab?.refresh();
   }
 
   async setPaused(paused: boolean): Promise<void> {
     this.settings.paused = paused;
+    if (paused) this.taskPreview?.cancel();
     await settleForPause(paused, this.engine);
     await this.saveSettings();
     this.updateStatus({ ...this.status, phase: paused ? "paused" : "idle", message: paused ? "同步已暂停" : "同步已恢复" });
   }
 
   cancelSync(): void {
+    this.taskPreview?.cancel();
     this.engine?.cancel();
     new Notice("将在当前文件安全结束后停止同步");
   }
@@ -593,20 +639,50 @@ export default class YunpanSyncPlugin extends Plugin {
 
   async setSyncObsidianConfig(enabled: boolean): Promise<void> {
     if (enabled === this.settings.syncObsidianConfig) return;
+    await settleForPause(true, this.engine);
     this.settings.syncObsidianConfig = enabled;
-    await this.resetSyncScope("Obsidian 配置同步范围已变更");
+    await this.saveSettings();
+    this.updateStatus({ ...this.status, phase: "paused", message: "配置同步范围已保存，下次同步生效" });
   }
 
   async setExcludedExtensions(value: string): Promise<void> {
     if (value === this.settings.excludedExtensions) return;
+    await settleForPause(true, this.engine);
     this.settings.excludedExtensions = value;
-    await this.resetSyncScope("过滤规则已变更");
+    this.settings.filterRules = [...this.settings.filterRules.filter(rule => !rule.id.startsWith("legacy-extension-")),
+      ...parseExcludedExtensions(value).map((extension, index) => ({ id: `legacy-extension-${index + 1}`,
+        enabled: true, action: "exclude" as const, pattern: `**/*.${extension}`, caseSensitive: false }))];
+    await this.saveSettings();
   }
 
   async setFilterRules(rules: FilterRule[]): Promise<void> {
+    await settleForPause(true, this.engine);
     this.settings.filterRules = rules.map((rule) => ({ ...rule }));
     this.settings.excludedExtensions = "";
-    await this.resetSyncScope("过滤规则已变更");
+    await this.saveSettings();
+    this.updateStatus({ ...this.status, phase: "paused", message: "过滤规则已保存，下次同步生效" });
+  }
+
+  async setFileSizeRange(min: number, max: number): Promise<boolean> {
+    if (!validFileSizeRange(min, max)) {
+      new Notice("请输入 0–500 的整数，下限必须小于上限（单位：MB）");
+      return false;
+    }
+    if (min === this.settings.minFileSizeMB && max === this.settings.maxFileSizeMB) return true;
+    await settleForPause(true, this.engine);
+    const previous = { minFileSizeMB: this.settings.minFileSizeMB, maxFileSizeMB: this.settings.maxFileSizeMB };
+    this.settings.minFileSizeMB = min;
+    this.settings.maxFileSizeMB = max;
+    try {
+      // Size edits do not change scheduling. Preserve the input currently being
+      // edited instead of redrawing the settings page on every blur.
+      await this.saveData(this.settings);
+    } catch (error) {
+      Object.assign(this.settings, previous);
+      throw error;
+    }
+    this.updateStatus({ ...this.status, phase: "paused", message: "文件大小限制已保存，下次同步生效" });
+    return true;
   }
 
   showFilterRules(): void {
@@ -669,6 +745,7 @@ export default class YunpanSyncPlugin extends Plugin {
       },
     });
     this.api = api;
+    const syncApi = api;
     const makeStore = (url: string) => {
       const current = this.secrets.getAuth();
       if (!current) throw new ReloginRequiredError("登录凭据已失效，请重新登录");
@@ -680,20 +757,20 @@ export default class YunpanSyncPlugin extends Plugin {
     };
     const ownerQid = () => this.settings.ownerQid;
     const checkpoint = () => this.persistence!.save();
-    this.engine = new SyncEngine(this.app.vault, this.persistence.database, api,
-      new UploadMachine(api, makeStore, this.persistence.database, ownerQid, checkpoint),
-      new DownloadMachine(api, makeStore, ownerQid), () => this.settings,
+    this.engine = new SyncEngine(this.app.vault, this.persistence.database, syncApi,
+      new UploadMachine(syncApi, makeStore, this.persistence.database, ownerQid, checkpoint),
+      new DownloadMachine(syncApi, makeStore, ownerQid), () => this.settings,
       `${auth.qid}:${this.app.vault.getName()}:${normalizeRemoteRoot(this.settings.remoteRoot)}`,
       (status) => this.updateStatus(status), checkpoint,
       (transfers) => this.updateTransfers(transfers), async () => {
-        const data = await api.call<Record<string, unknown>>("User.getUserDetail", {});
+        const data = await syncApi.call<Record<string, unknown>>("User.getUserDetail", {});
         const qid = this.auth?.qid;
         if (!qid) throw new Error("登录状态已失效，请重新登录");
         // User detail carries the current personal and enterprise (e_*) quotas.
         // An arbitrary enterprise-list row may belong to a different space.
         const profile = normalizeAccountProfile(data ?? {}, qid);
         this.accountProfile = profile;
-        this.settingTab?.display();
+        this.settingTab?.refresh();
         return {
           isVip: profile.isVip,
           expiresAt: profile.expiresAt,
@@ -723,7 +800,7 @@ export default class YunpanSyncPlugin extends Plugin {
     this.accountProfileError = undefined;
     this.updateTransfers([]);
     this.updateStatus({ phase: "error", message: RELOGIN_MESSAGE, queued: 0, failed: 0 });
-    this.settingTab?.display();
+    this.settingTab?.refresh();
     new Notice("请重新登录 360AI 云盘");
   }
 
@@ -746,15 +823,28 @@ export default class YunpanSyncPlugin extends Plugin {
   private configureSchedule(): void {
     this.lifecycle.configurePolling(this.isMobileBackgrounded ? undefined : pollIntervalMs(this.settings),
       () => void this.syncNow(false, false));
+    this.scheduleInitialSync();
+  }
+
+  private scheduleInitialSync(): void {
+    const engine = this.engine;
+    if (this.unloading || this.isMobileBackgrounded || this.settings.paused || this.settings.mode !== "automatic" ||
+      !engine || engine.isRunning() || !engine.needsInitialConfirmation() || this.dismissedInitialConfirmations.has(engine)) return;
+    // Share the file-event debounce so startup events cannot queue a second
+    // initial scan while the first confirmation is being prepared.
+    this.lifecycle.debounce(DEBOUNCE_MS, () => void this.syncNow(false, false));
   }
 
   private async handleVisibilityChange(): Promise<void> {
     if (!this.isMobileDevice) return;
     this.configureSchedule();
     if (document.visibilityState === "hidden") {
+      this.taskPreview?.cancel();
       await settleForPause(true, this.engine);
       await this.persistence?.save();
-    }
+    } else await resumeSyncAfterReconnect(() => this.unloading || this.settings.paused ||
+      this.isMobileBackgrounded || this.settings.mode === "manual", this.engine,
+      () => this.syncNow(false, false));
   }
 
   private onVaultEvent(path: string): void {
@@ -780,18 +870,28 @@ export default class YunpanSyncPlugin extends Plugin {
       if (!this.displayedSyncWarnings.has(warning)) new Notice(warning);
     }
     this.displayedSyncWarnings = new Set(status.warnings ?? []);
-    this.renderStatus();
-    this.settingTab?.renderStatus();
-    this.settingTab?.renderLogin();
-    this.syncModal?.render();
-    this.refreshStatusViews();
+    this.scheduleUi(["idle", "error", "paused"].includes(status.phase));
   }
 
   
 
   private updateTransfers(transfers: FileTransferProgress[]): void {
     this.transfers = transfers;
+    this.scheduleUi();
+  }
+
+  private scheduleUi(immediate = false): void {
+    if (this.unloading) return;
+    const remaining = 200 - (Date.now() - this.lastUiRender);
+    if (!immediate && remaining > 0) {
+      this.uiTimer ??= setTimeout(() => { this.uiTimer = undefined; this.scheduleUi(true); }, remaining);
+      return;
+    }
+    if (this.uiTimer) { clearTimeout(this.uiTimer); this.uiTimer = undefined; }
+    this.lastUiRender = Date.now();
     this.renderStatus();
+    this.settingTab?.renderStatus();
+    this.settingTab?.renderLogin();
     this.settingTab?.renderTransfers();
     this.syncModal?.render();
     this.refreshStatusViews();
@@ -799,27 +899,31 @@ export default class YunpanSyncPlugin extends Plugin {
 
   private renderStatus(): void {
     if (!this.statusBar) return;
+    if (this.status.restriction?.kind === "membership") {
+      this.statusBar.setText("360AI云盘");
+      this.statusBar.toggleClass("yunpan-sync-error", false);
+      return;
+    }
     const queue = this.status.queued ? ` · 队列 ${this.status.queued}` : "";
-    const active = this.transfers.find((transfer) => transfer.state === "transferring");
-    const transfer = active
-      ? ` · ${active.direction === "upload" ? "上传" : "下载"} ${this.transferPercent(active)}%`
-      : "";
+    const { percent } = overallTransferProgress(this.transfers, this.status);
+    const transfer = percent === undefined ? "" : ` · 总进度 ${percent}%`;
     this.statusBar.setText(`360AI云盘: ${this.status.message}${queue}${transfer}`);
     this.statusBar.toggleClass("yunpan-sync-error", this.status.phase === "error");
-  }
-  private transferPercent(transfer: FileTransferProgress): number {
-    if (transfer.state === "completed") return 100;
-    if (transfer.totalBytes <= 0) return 0;
-    return Math.min(100, Math.round(transfer.completedBytes / transfer.totalBytes * 100));
   }
 
   private async confirmSyncTasks(tasks: readonly SyncTask[], initial = false): Promise<ReadonlySet<string> | undefined> {
     this.syncModal?.closeForTransition();
     this.syncModal = undefined;
     if (this.syncUiHidden && !initial) return new Set(tasks.map((task) => task.id));
-    const selected = await new SyncTaskPreviewModal(this, tasks, this.settings.remoteRoot, initial).choose();
-    if (selected?.size) this.showSyncProgress();
-    return selected;
+    const preview = new SyncTaskPreviewModal(this, tasks, this.settings.remoteRoot, initial);
+    this.taskPreview = preview;
+    try {
+      const selected = await preview.choose();
+      if (selected?.size) this.showSyncProgress();
+      return selected;
+    } finally {
+      if (this.taskPreview === preview) this.taskPreview = undefined;
+    }
   }
 
   private refreshStatusViews(): void {
@@ -862,6 +966,18 @@ class YunpanSyncSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly owner: YunpanSyncPlugin) { super(app, owner); }
 
   display(): void {
+    if (this.navigationPending) return;
+    this.render();
+    // Only entry from Obsidian requests fresh data. Internal redraws must not
+    // turn each completed profile request into another network request.
+    void this.owner.refreshAccountProfile(false);
+  }
+
+  refresh(): void {
+    if (this.visible) this.render();
+  }
+
+  private render(): void {
     // Preserve the clicked href until the browser has performed its default
     // action. Replacing this element inside the click handler can cancel it.
     if (this.navigationPending) return;
@@ -875,6 +991,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     this.loginStatusEl = undefined;
     this.authorizationEl = undefined;
     containerEl.addClass("yunpan-sync-settings-page");
+    if (this.owner.isMobileDevice) containerEl.addClass("yunpan-sync-mobile-settings");
     if (Platform.isAndroidApp) containerEl.addClass("yunpan-sync-android-settings");
     
     new Setting(containerEl).setName("账号设置").setHeading();
@@ -922,12 +1039,48 @@ class YunpanSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("过滤规则").setHeading();
     const filterGroup = this.createGroup("过滤规则");
+    let minSize = String(this.owner.settings.minFileSizeMB);
+    let maxSize = String(this.owner.settings.maxFileSizeMB);
+    const sizeSetting = new Setting(filterGroup).setName("单文件大小范围");
+    sizeSetting.settingEl.addClass("yunpan-sync-size-setting");
+    const sizeRange = sizeSetting.controlEl.createDiv({ cls: "yunpan-sync-size-range" });
+    let savingRange = Promise.resolve();
+    const saveRange = () => {
+      const min = minSize.trim() ? Number(minSize) : NaN;
+      const max = maxSize.trim() ? Number(maxSize) : NaN;
+      savingRange = savingRange.then(async () => { await this.owner.setFileSizeRange(min, max); })
+        .catch(error => { new Notice(`文件大小限制保存失败：${messageOf(error)}`); });
+      return savingRange;
+    };
+    const lowerBound = sizeRange.createDiv({ cls: "yunpan-sync-size-bound yunpan-sync-size-lower" });
+    lowerBound.createSpan({ text: "下限" });
+    sizeSetting.addText(text => {
+      text.inputEl.type = "number"; text.inputEl.min = "0"; text.inputEl.max = "500"; text.inputEl.step = "1";
+      text.inputEl.ariaLabel = "单文件大小下限（MB）";
+      text.setValue(minSize).onChange(value => { minSize = value; });
+      lowerBound.append(text.inputEl);
+      text.inputEl.addEventListener("blur", () => { void saveRange(); });
+    });
+    lowerBound.createSpan({ text: "MB" });
+    sizeRange.createSpan({ text: "～", cls: "yunpan-sync-size-separator" });
+    const upperBound = sizeRange.createDiv({ cls: "yunpan-sync-size-bound yunpan-sync-size-upper" });
+    upperBound.createSpan({ text: "上限" });
+    sizeSetting.addText(text => {
+      text.inputEl.type = "number"; text.inputEl.min = "0"; text.inputEl.max = "500"; text.inputEl.step = "1";
+      text.inputEl.ariaLabel = "单文件大小上限（MB）";
+      text.setValue(maxSize).onChange(value => { maxSize = value; });
+      upperBound.append(text.inputEl);
+      text.inputEl.addEventListener("blur", () => { void saveRange(); });
+    });
+    upperBound.createSpan({ text: "MB" });
     new Setting(filterGroup).setName("同步 obsidian 配置")
       .setDesc(".obsidian 为笔记仓库的系统配置，默认关闭，开启后迁移笔记时会自动同步笔记软件配置")
       .addToggle((toggle) => toggle.setValue(this.owner.settings.syncObsidianConfig)
         .onChange((value) => void this.owner.setSyncObsidianConfig(value)));
     new Setting(filterGroup).setName("同步过滤的文件格式")
-      .setDesc("可按文件名、目录或通配符设置不参与同步的内容")
+      .setDesc(this.owner.isMobileDevice
+        ? "手机默认排除工程建模、音视频、压缩包和安装包；保留 Office、PDF、笔记和图片。规则可修改，仍受大小范围限制。"
+        : "可按文件名、目录或通配符设置不参与同步的内容")
       .addButton((button) => button.setButtonText("编辑规则").onClick(() => this.owner.showFilterRules()));
 
     new Setting(containerEl).setName("同步遇到问题？").setHeading();
@@ -988,8 +1141,9 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     const readableError = status.lastError
       ? classifySyncError(status.lastError).detail
       : undefined;
-    this.statusEl.setText(`最新同步时间：${last}（${completed} 项同步成功，${status.failed} 项同步失败）${readableError ? `\n最近错误：${readableError}` : ""}`);
+    this.statusEl.setText(`${status.message}\n最新同步时间：${last}（${completed} 项同步成功，${status.failed} 项同步失败）${readableError ? `\n最近错误：${readableError}` : ""}`);
     this.statusEl.toggleClass("yunpan-sync-error", status.phase === "error");
+    if (readableError && !status.restriction) renderFailedRecordAction(this.statusEl, this.owner.failedTasks, this.owner);
     if (status.restriction) this.statusEl.createEl("button", {
       text: status.restriction.kind === "membership" ? "去续费" : status.restriction.kind === "capacity" ? "去扩容" : "刷新后重试",
       cls: "mod-cta",
@@ -1032,13 +1186,15 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     }
     const profile = this.owner.profile;
     if (!profile) {
-      new Setting(container)
+      const account = new Setting(container)
         .setName(this.owner.profileLoading ? "正在加载账户信息..." : "账号：已登录")
-        .setDesc(this.owner.profileError ? `账户信息加载失败：${this.owner.profileError}` : "")
-        .addButton((button) => button.setButtonText("退出登录").onClick(() => void this.owner.logout()));
+        .setDesc(this.owner.profileError ? `账户信息加载失败：${this.owner.profileError}` : "");
+      if (this.owner.profileError || this.owner.currentStatus.restriction?.kind === "membership") this.addProfileRefresh(account);
+      account.addButton((button) => button.setButtonText("退出登录").onClick(() => void this.owner.logout()));
       return;
     }
     const active = hasActiveMembership(profile);
+    const expired = hasExpiredMembership(profile);
     const identityEl = document.createElement("span");
     identityEl.appendText(`账号：${accountDisplayIdentity(profile)}　`);
     const icon = membershipIcon(profile, active);
@@ -1051,9 +1207,11 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       identityEl.append(image);
     }
     const label = document.createElement("span");
-    label.className = "yunpan-sync-membership-label";
+    label.className = `yunpan-sync-membership-label${expired ? " is-expired" : ""}`;
     label.textContent = membershipLabel(profile);
-    identityEl.append(label);
+    label.hidden = expired && this.owner.profileLoading;
+    const membershipStatus = identityEl.createSpan({ cls: "yunpan-sync-membership-status" });
+    membershipStatus.append(label);
     if (!active) {
       const purchase = identityEl.createEl("button", { text: membershipLabel(profile) === "会员已过期" ? "续费会员" : "购买会员", cls: "yunpan-sync-inline-purchase" });
       purchase.addEventListener("click", () => openMembershipPayment(this.owner.settings.environment, this.owner.isMobileDevice));
@@ -1063,10 +1221,28 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     const storage = totalBytes === undefined
       ? formatStorageCapacity(usedBytes)
       : `${formatStorageCapacity(usedBytes)}/${formatStorageCapacity(totalBytes)}`;
-    const account = new Setting(container).setDesc(`存储空间：${storage}`)
-      .addButton((button) => button.setButtonText("退出登录").onClick(() => void this.owner.logout()));
+    const account = new Setting(container).setDesc(`存储空间：${storage}`);
+    if (expired || this.owner.currentStatus.restriction?.kind === "membership") {
+      this.addProfileRefresh(account, membershipStatus);
+    }
+    account.addButton((button) => button.setButtonText("退出登录").onClick(() => void this.owner.logout()));
+    if (this.owner.profileError) account.descEl.createDiv({
+      text: `账户信息刷新失败：${this.owner.profileError}，当前显示上次信息，请重试。`, cls: "yunpan-sync-profile-error" });
     account.nameEl.empty();
     account.nameEl.append(identityEl);
+  }
+
+  private addProfileRefresh(account: Setting, inline?: HTMLElement): void {
+    account.addButton(button => {
+      button.setIcon("refresh-cw").setTooltip("刷新会员状态")
+        .setDisabled(this.owner.profileLoading).onClick(() => this.owner.refreshAccountProfile());
+      button.buttonEl.addClass("clickable-icon");
+      button.buttonEl.addClass("yunpan-sync-membership-refresh");
+      button.buttonEl.toggleClass("is-loading", this.owner.profileLoading);
+      button.buttonEl.setAttr("aria-label", "刷新会员状态");
+      button.buttonEl.setAttr("aria-busy", String(this.owner.profileLoading));
+      inline?.append(button.buttonEl);
+    });
   }
 
   private startLogin(): Promise<void> {
@@ -1100,7 +1276,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
       this.navigationRefresh = setTimeout(() => {
         this.navigationRefresh = undefined;
         this.navigationPending = false;
-        if (this.visible) this.display();
+        this.refresh();
       }, 0);
     });
     link.addEventListener("keydown", (event) => {

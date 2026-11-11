@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   accountDisplayIdentity,
+  formatBytes,
   formatStorageCapacity,
   maskMobile,
   normalizeAccountProfile,
@@ -104,10 +105,17 @@ describe("account profile", () => {
   it("formats account storage with the same compact GB and TB units as the web client", () => {
     expect(formatStorageCapacity(8.62 * 1024 ** 3)).toBe("8.62GB");
     expect(formatStorageCapacity(6 * 1024 ** 4)).toBe("6TB");
-    expect(formatStorageCapacity(0)).toBe("0.00MB");
-    expect(formatStorageCapacity(8.5 * 1024 ** 2)).toBe("8.50MB");
+    expect(formatStorageCapacity(0)).toBe("0B");
+    expect(formatStorageCapacity(8.5 * 1024 ** 2)).toBe("8.5MB");
     expect(formatStorageCapacity(1024 ** 3 - 1)).toMatch(/MB$/);
     expect(formatStorageCapacity(undefined)).toBe("未知");
+  });
+
+  it("uses compact binary units without the iB suffix", () => {
+    expect(formatBytes(1024 ** 3)).toBe("1GB");
+    expect(formatBytes(500 * 1024 ** 2)).toBe("500MB");
+    expect(formatBytes(140 * 1024)).toBe("140KB");
+    expect(formatBytes(3.28 * 1024)).toBe("3.28KB");
   });
 
   it("distinguishes an expired membership from a normal account", () => {
