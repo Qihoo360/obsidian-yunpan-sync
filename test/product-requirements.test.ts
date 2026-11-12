@@ -60,7 +60,7 @@ describe("product requirement helpers", () => {
     expect(source).toContain('重新检查云端目录和同步记录');
     expect(source).toContain('setButtonText("自动修复")');
     expect(source).not.toContain('setButtonText("重建索引")');
-    expect(engineSource).toContain('rebuild ? "正在重新检查云端目录"');
+    expect(engineSource).toContain('this.emit("remote-index", "正在检查云端文件变化…")');
     expect(engineSource).not.toContain("正在重建远端索引");
   });
 
@@ -221,20 +221,32 @@ describe("product requirement helpers", () => {
     expect(classifySyncError(new Error("network timeout")).category).toBe("network");
     expect(classifySyncError(new OpenApiError("dest node not exist", 3009, "trace"))).toEqual({
       category: "destination", title: "目标云端文件夹不存在",
-      detail: "目标云端文件夹不存在，请确认目标文件夹后重试。",
+      detail: "目标云端文件夹不存在，请确认目标文件夹后重试。（错误码 3009，追踪编号 trace）",
     });
     expect(classifySyncError(new Error("2 sync tasks failed")).detail)
       .toBe("有 2 个文件同步失败，请检查失败文件后重试。");
+    expect(classifySyncError(new OpenApiError("文件由于法律法规原因，无法操作。", 3128, "trace-law"))).toEqual({
+      category: "unknown", title: "文件受到服务端限制",
+      detail: "云端因法律法规或服务规则限制了该文件操作，无法上传。请更换文件或联系云盘支持。（错误码 3128，追踪编号 trace-law）",
+    });
+    expect(classifySyncError("包含违规内容，操作失败 (errno: 3028) (trace_id: trace-policy) (错误码 3028，追踪编号 trace-policy)").detail)
+      .toBe("云端判定文件包含违规内容，无法上传。请确认文件内容后再重试。（错误码 3028，追踪编号 trace-policy）");
     expect(classifySyncError(new Error("unknown backend exception")).detail)
-      .toBe("具体原因：unknown backend exception");
+      .toBe("同步请求未成功，请稍后重试。");
+    const cacheCleanupError = "具体原因：Path is a directory: rm returned EISDIR (is a directory) /Users/example/.yunpan-sync/downloads/hash";
+    expect(classifySyncError(cacheCleanupError)).toEqual({
+      category: "unknown", title: "同步失败",
+      detail: "同步失败，请点击重试。",
+    });
+    expect(classifySyncError(cacheCleanupError).detail).not.toContain("/Users/example");
     expect(classifySyncError(new Error("具体原因：具体原因： ENOENT: no such file or directory")).detail)
-      .toBe("具体原因：ENOENT: no such file or directory");
+      .toBe("同步请求未成功，请稍后重试。");
     expect(classifySyncError(" 具体原因: 具体原因：具体原因: ENOENT: missing").detail)
-      .toBe("具体原因：ENOENT: missing");
+      .toBe("同步请求未成功，请稍后重试。");
     const classified = classifySyncError("ENOENT: missing?token=secret");
     expect(classifySyncError(classified.detail)).toEqual(classified);
     expect(classifySyncError(new Error("Store upload failed?token=secret&sign=private")).detail)
-      .toBe("具体原因：Store upload failed?token=***&sign=***");
+      .toBe("同步请求未成功，请稍后重试。");
   });
 
   it("shows only real synchronization progress and aligns section titles with card content", () => {

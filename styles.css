@@ -877,14 +877,42 @@
 .is-completed .yunpan-sync-file-state-icon { color: var(--color-green); }
 .is-completed .yunpan-sync-file-fill { background: var(--color-green); }
 
-.yunpan-sync-completed-toggle {
+button.yunpan-sync-collapsible-title,
+summary.yunpan-sync-collapsible-title {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
   width: 100%;
+  min-height: 32px;
+  padding: 6px 0;
+  margin: 0 0 8px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-normal);
+  line-height: 1.4;
+  text-align: left;
   justify-content: flex-start;
-  margin-bottom: 8px;
+  white-space: normal;
+  height: auto;
+  cursor: pointer;
+  list-style: none;
 }
-.yunpan-sync-completed-toggle::before { content: "▸"; margin-right: 8px; }
-.yunpan-sync-completed-toggle[aria-expanded="true"]::before { content: "▾"; }
+.yunpan-sync-collapsible-title::before {
+  flex: 0 0 1em;
+  content: "▸";
+  margin-right: 8px;
+  text-align: center;
+}
+.yunpan-sync-collapsible-title[aria-expanded="true"]::before,
+.yunpan-sync-skipped-files[open] > .yunpan-sync-collapsible-title::before { content: "▾"; }
+.yunpan-sync-skipped-files > summary::-webkit-details-marker { display: none; }
+.yunpan-sync-skipped-files > summary { cursor: pointer; }
 .yunpan-sync-side-transfer-list { margin-top: 18px; }
+.yunpan-sync-modal-transfer-list.is-completed-history { padding: 0; border: 0; }
 
 .yunpan-sync-modal-message.is-error strong,
 .yunpan-sync-modal-message.is-error div {
@@ -1243,6 +1271,10 @@
   min-width: 112px;
 }
 
+body .yunpan-sync-modal-footer button[hidden] {
+  display: none;
+}
+
 .yunpan-sync-task-modal .modal-content {
   height: min(620px, calc(100vh - 128px));
   min-height: 0;
@@ -1523,4 +1555,8 @@ body .yunpan-sync-settings-page button.yunpan-sync-membership-refresh.clickable-
   justify-content: center;
   gap: 12px;
   padding: 8px;
+}
+
+.yunpan-sync-pagination[hidden] {
+  display: none;
 }

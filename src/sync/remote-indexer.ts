@@ -1,7 +1,7 @@
 import { OpenApiError, type OpenApiMethod } from "../net/openapi-client.js";
 import { SyncDatabase, type RemoteNode } from "../storage/database.js";
 import { WorkScheduler } from "./work-scheduler.js";
-import { normalizeRemoteRoot } from "../domain/paths.js";
+import { normalizeRemoteRoot, validateWindowsPathSegment, WindowsPathError } from "../domain/paths.js";
 
 // Use the existing cursor columns to distinguish scoped snapshots from legacy
 // global cursors. Migration replaces only the index, never tasks or baselines.
@@ -189,6 +189,7 @@ async function applyNodeChanges(initial: Map<string, RawNode>, changes: RawNode[
 }
 
 export class RemoteIndexer {
+  readonly failures: Array<{ path: string; nid?: string; error: Error }> = [];
   private readonly work: WorkScheduler;
   private fetched = 0;
   constructor(
@@ -299,6 +300,7 @@ export class RemoteIndexer {
     // Offset pagination needs a stable version. Never publish a mixed snapshot
     // that could mistake an item moving between pages for a deletion.
     for (let attempt = 0; attempt < 3; attempt++) {
+      this.failures.length = 0;
       this.fetched = 0;
       const nodes: RemoteNode[] = [];
       const seen = new Set<string>();
@@ -320,6 +322,17 @@ export class RemoteIndexer {
               !this.database.hasBases() && !this.database.isBindingConfirmed(this.accountKey)) {
               rootExists = false;
               break;
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            const context = `读取云端目录失败：${directory.path}（操作 File.getList，节点 ${directory.nid ?? "绑定目录"}）。${message}` +
+              (error instanceof OpenApiError ? `${error.errno === undefined ? "" : ` (errno: ${error.errno})`}${error.traceId ? ` (trace_id: ${error.traceId})` : ""}` : "");
+            if (index > 0 && /无效的文件名|invalid\s+(?:file\s*)?name|file ?name too long/i.test(message)) {
+              this.failures.push({ path: directory.path.replace(/\/+$/, ""), nid: directory.nid,
+                error: new Error(context) });
+              break;
+            }
+            if (index === 0 && /无效的文件名|invalid\s+(?:file\s*)?name/i.test(message)) {
+              throw new Error(context);
             }
             throw error;
           }
@@ -349,7 +362,15 @@ export class RemoteIndexer {
               version: nodeVersion(raw), hash: raw.fhash ?? raw.hash ?? raw.file_hash,
               size: isDir ? 0 : fileSize(raw.fsize ?? raw.size ?? raw.count_size),
               mtime: finiteNumber(raw.fmtime ?? raw.modify_time ?? raw.mtime), status: 0 });
-            if (isDir) directories.push({ path: `${path}/`, nid });
+            if (isDir) {
+              try {
+                validateWindowsPathSegment(name);
+                directories.push({ path: `${path}/`, nid });
+              } catch (error) {
+                if (!(error instanceof WindowsPathError)) throw error;
+                this.failures.push({ path, nid, error });
+              }
+            }
           }
           count += result.nodes.length;
           this.fetched += result.nodes.length;
@@ -365,8 +386,30 @@ export class RemoteIndexer {
       }
       const latestVersion = await this.directoryVersion();
       if (latestVersion !== version) { version = latestVersion; continue; }
+      if (this.failures.length) {
+        const ids = new Set(nodes.map(node => node.nid));
+        const blocked = new Set(this.failures.map(failure => failure.nid).filter((nid): nid is string => Boolean(nid)));
+        const previous = this.database.getRemoteNodes();
+        const children = new Map<string, string[]>();
+        for (const old of previous) {
+          const group = children.get(old.pid) ?? []; group.push(old.nid); children.set(old.pid, group);
+        }
+        const queue = [...blocked];
+        for (let index = 0; index < queue.length; index++) for (const nid of children.get(queue[index]!) ?? []) {
+          if (!blocked.has(nid)) { blocked.add(nid); queue.push(nid); }
+        }
+        for await (const batch of this.database.remoteNodeBatches(root)) {
+          for (const old of batch) {
+            if (!ids.has(old.nid) && (blocked.has(old.nid) || this.failures.some(failure =>
+              old.path.toLowerCase().startsWith(`${failure.path.toLowerCase()}/`)))) {
+              nodes.push(old); ids.add(old.nid);
+            }
+          }
+          await this.work.step(true);
+        }
+      }
       await this.publish(nodes, { accountKey: this.accountKey, bgsp: directorySnapshotScope(root),
-        gsp: `${rootExists ? "exists" : "missing"}:${version}`, remoteVersion: Number(version), snapshotComplete: true });
+        gsp: `${rootExists ? "exists" : "missing"}:${version}`, remoteVersion: Number(version), snapshotComplete: this.failures.length === 0 });
       return;
     }
     throw new Error("云端文件仍在变化，本轮保留上次完整索引，请稍后重试");

@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import initSqlJs from "sql.js";
 import { SyncDatabase } from "../src/storage/database.js";
 import { SyncEngine } from "../src/sync/engine.js";
-import { DEFAULT_SETTINGS } from "../src/settings.js";
+import { DEFAULT_SETTINGS, normalizeSettings, type PluginSettings } from "../src/settings.js";
+import { shouldIgnorePath } from "../src/domain/paths.js";
 
 const notices = vi.hoisted(() => [] as string[]);
 vi.mock("obsidian", async (importOriginal) => ({
@@ -32,6 +33,52 @@ async function harness(save: () => Promise<void> = async () => undefined) {
 }
 
 describe("failed record actions through the plugin", () => {
+  it("persists a full-path exclusion before clearing the failure and lets filters undo it", async () => {
+    const { plugin, database } = await harness();
+    plugin.settings.filterRules = [{ id: "include", pattern: "**/*.md", enabled: true, action: "include", caseSensitive: false }];
+    let saved!: PluginSettings;
+    Object.assign(plugin, { saveData: vi.fn(async (settings: PluginSettings) => { saved = structuredClone(settings); }) });
+    await plugin.ignoreTask("bad");
+    const restored = normalizeSettings(saved);
+    expect(restored.filterRules.at(-1)).toMatchObject({ pattern: "/note.md", action: "exclude", enabled: true });
+    expect(shouldIgnorePath("note.md", { filterRules: restored.filterRules })).toBe(true);
+    expect(shouldIgnorePath("other/note.md", { filterRules: restored.filterRules })).toBe(false);
+    expect(shouldIgnorePath("notes.md", { filterRules: restored.filterRules })).toBe(false);
+    expect(database.listFailedTasks()).toEqual([]);
+    expect(plugin.currentStatus.failed).toBe(0);
+    expect(notices.at(-1)).toContain("后续不再上传或下载");
+    restored.filterRules.at(-1)!.enabled = false;
+    expect(shouldIgnorePath("note.md", { filterRules: normalizeSettings(restored).filterRules })).toBe(false);
+  });
+
+  it("keeps the failure and old rules if saving the exclusion fails", async () => {
+    const { plugin, database } = await harness();
+    const before = plugin.settings.filterRules;
+    Object.assign(plugin, { saveData: vi.fn(async () => { throw new Error("disk full"); }) });
+    await plugin.ignoreTask("bad");
+    expect(plugin.settings.filterRules).toBe(before);
+    expect(database.listFailedTasks().map(task => task.id)).toEqual(["bad"]);
+    expect(notices.at(-1)).toBe("忽略文件失败：disk full");
+    expect(plugin.isSyncing).toBe(false);
+  });
+
+  it("blocks repeated ignores and sync starts while saving an exclusion", async () => {
+    const { plugin, database } = await harness();
+    let release!: () => void;
+    const saving = new Promise<void>(resolve => { release = resolve; });
+    const saveData = vi.fn(() => saving);
+    Object.assign(plugin, { saveData });
+    const ignoring = plugin.ignoreTask("bad");
+    expect(plugin.isSyncing).toBe(true);
+    await plugin.ignoreTask("bad");
+    await plugin.syncNow();
+    expect(saveData).toHaveBeenCalledOnce();
+    expect(database.listFailedTasks()).toHaveLength(1);
+    release(); await ignoring;
+    expect(database.listFailedTasks()).toEqual([]);
+    expect(plugin.isSyncing).toBe(false);
+  });
+
   it("shows a rename recovery warning once across progress updates", async () => {
     const { plugin } = await harness();
     const update = (plugin as unknown as {updateStatus(status: unknown): void}).updateStatus.bind(plugin);

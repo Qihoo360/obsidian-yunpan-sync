@@ -47,22 +47,27 @@
 | 模式 | 行为 | 适合场景 |
 | --- | --- | --- |
 | **手动** | 只在点击“立即同步”或运行命令时同步 | 按需同步 |
-| **自动**（新安装默认） | 本地变化后防抖约 1.5 秒触发同步，同时约每 3 分钟检查云端变化 | 多设备持续同步 |
+| **自动**（新安装默认） | 本地变化停止约 10 秒后触发同步，同时约每 3 分钟检查云端变化；后台同步保持安静，失败时提示 | 多设备持续同步 |
 | **低频自动** | 按设置的分钟间隔执行完整同步，可设 4–1440 分钟，默认 30 分钟 | 希望降低后台请求频率 |
 
-所有模式都保留 **立即同步** 命令。你也可以随时暂停或恢复同步。
+所有模式都保留 **立即同步** 命令。停止或暂停后会持续保持暂停，包括重启和重新联网后；点击恢复才继续。运行期间侧边栏显示停止入口。
+
+断网只会临时中断同步，不会关闭自动同步。恢复网络后，自动和低频自动模式立即继续未完成任务并检查两端变化，之后按原模式运行；手动模式等待操作。移动端在后台联网时，回到 Obsidian 前台后再继续。断网或切后台中断首次任务确认时，恢复后会重新展示确认；用户主动取消仍等待手动操作。
 
 ### 同步过程与恢复
 
 - **远端索引**：首次及后续检测只读取绑定云端目录及其子目录的元数据，每页 200 项、顺序分页，不遍历账号其他目录，不下载文件内容。后续先检查轻量账号版本，版本未变化时复用绑定目录索引；版本变化时只重新读取绑定目录。分页前后校验版本，完整读取后原子切换，失败或停止保留上次完整索引；升级时保留同步基线、任务和上传恢复信息。
 - **任务预览**：首次同步展示上传、下载、新建目录、删除、重命名和移动等计划任务，每页 100 条；搜索防抖 150ms，跨页保留勾选，“全选”覆盖全部搜索结果。首次确认弹窗倒计时 10 秒后自动按当前勾选项执行（包括勾选的删除操作），点击取消可停止。
-- **传输进度**：同步弹窗、状态栏和右侧面板统一显示本轮全部上传、下载的总进度；百分比独立显示，等待、同步中、失败和完成具有明确文字与图标。同步中文件优先，已完成文件放到底部折叠区，两区各自分页；切换文件不重置同步图标动画。
-- **失败重试**：可重试单个失败文件或全部失败任务；持久任务会在插件重新启动后恢复。
+- **传输进度**：手动同步时，弹窗、状态栏和右侧面板统一显示本轮全部上传、下载的总进度；百分比独立显示，等待、同步中、失败和完成具有明确文字与图标。自动和低频后台同步保持界面安静，仍可随时打开同步进度查看当前运行。同步中文件优先，已完成文件放到底部折叠区，两区各自分页；切换文件不重置同步图标动画。
+- **目录选择**：首次登录必须明确选择云端目录，取消后等待操作；选择记录按当前笔记库、账号和云空间保存。缓存目录失效时重新选择。
+- **失败重试**：临时错误等待退避后自动继续，等待可停止，不计入最终失败。取消、断网和关机中断保留任务；自动模式重启后继续，手动模式等待操作。可重试单个或全部最终失败任务。
+- **忽略文件**：失败文件可选择“忽略此文件”，按当前笔记库内的完整路径保存排除规则，后续不再上传或下载该路径，保留两端文件和基线。同名但不同目录的文件不受影响；在“过滤规则”中删除或停用对应排除项并保存可取消忽略。“删除记录”仅清除失败记录，下轮仍会重新检测。
 - **过滤规则**：可按文件名、目录或通配符包含或排除内容，支持启停、调整顺序和区分大小写；规则按列表从上到下匹配，最后命中的规则生效，同时作用于上传、下载和本地变更监听。
 - **完整性校验**：上传和下载使用文件哈希及分块哈希校验，下载完成后再替换目标文件。
-- **同步状态**：状态栏展示当前阶段，内容无变化时会明确提示“本地与云端已是最新”。
-- **响应与阶段**：本地扫描、索引处理和任务生成按最多 100 项或约 8ms 让出主线程；展示云端请求、索引处理、本地扫描、任务生成、传输、校验和保存阶段，以及绑定目录已读取/比较项数、本地当前路径和已处理字节。界面更新合并为最多每 200ms 一次，完成、停止及错误立即刷新。本地数据库仅保留最近一次运行的阶段耗时、数量和最长处理批次，不保存文件内容或认证 URL。
-- **桌面大文件**：哈希与上传按 512 KiB 分块读取，下载范围请求每次最多 1 MiB，逐块写入临时文件并校验后再替换目标；处理中本地文件变化会中止该任务。上传最多 5 个文件并发，下载、索引请求和结构操作各 1 个；上传会话可恢复，下载失败后从头重试。
+- **同步状态**：手动同步时状态栏展示当前阶段，内容无变化时会明确提示“本地与云端已是最新”；后台自动同步保持状态栏稳定，错误仍会提示。
+- **响应与阶段**：本地扫描、索引处理和任务生成按最多 100 项或约 8ms 让出主线程；手动同步展示云端请求、索引处理、本地扫描、任务生成、传输、校验和保存阶段，以及绑定目录已读取/比较项数、本地当前路径和已处理字节。界面更新合并为最多每 200ms 一次，完成、停止及错误立即刷新。本地数据库仅保留最近一次运行的阶段耗时、数量和最长处理批次，不保存文件内容或认证 URL。
+- **文件传输**：上传和下载共享最多 5 个文件槽位，目录、删除、移动和重命名串行；父目录成功后才执行子任务。OpenAPI 元数据请求串行、启动间隔至少 200ms；限流使用账号内共享冷却。
+- **桌面大文件**：哈希与上传按 512 KiB 分块读取，下载范围请求每次最多 1 MiB。下载分块保存在插件管理的缓存中，重启后校验并复用已有块，重新获取凭据，只传输缺失块；云端内容变化或缓存损坏时重新下载相关数据。完整校验后再替换目标，处理中本地文件变化会中止该任务。移动端通过适配器保存下载块，最终文件仍使用整文件写入。
 
 ### 冲突处理
 
@@ -142,21 +147,26 @@ On mobile, wait for sign-in preparation to finish, then tap **登录** to open t
 | Mode | Behavior | Best for |
 | --- | --- | --- |
 | **Manual** | Sync only when you click **Sync now** or run the command | On-demand sync |
-| **Automatic** (default for new installations) | Sync local changes after about 1.5 seconds of debounce and check remote changes about every 3 minutes | Continuous multi-device sync |
+| **Automatic** (default for new installations) | Sync local changes about 10 seconds after editing stops and check remote changes about every 3 minutes; background runs stay quiet and only failures notify you | Continuous multi-device sync |
 | **Scheduled** | Run a full sync every 4–1440 minutes as configured; defaults to 30 minutes | Reducing background request frequency |
 
-The **Sync now** command remains available in every mode. Synchronization can also be paused and resumed at any time.
+The **Sync now** command remains available in every mode. Stop and pause persist across restarts and reconnects until explicitly resumed. The sidebar offers Stop while a run is active.
+
+Going offline temporarily interrupts synchronization without disabling automatic sync. Automatic and scheduled modes resume pending work and check both sides immediately after reconnection, then continue their normal schedules. Manual mode waits for an action. Mobile resumes after returning to the foreground. An initial task preview interrupted by connectivity or backgrounding can reopen on recovery; a user dismissal still requires a manual action.
 
 ### Progress and Recovery
 
-- **Remote index**: Build account-wide metadata before filtering the bound folder. Full and incremental requests read sequential pages of 200 nodes; detection never downloads file contents. Publish the index and cursor atomically, retain the previous complete index on failure or cancellation, and rebuild when a cursor expires.
+- **Remote index**: Read only the bound directory and its descendants, in sequential pages of 200 nodes. Detection never downloads file contents. A filename error protects the affected subtree and baseline while complete branches continue; network failure or cancellation retains the previous index.
 - **Task review**: Preview planned operations in pages of 100. Search uses a 150ms debounce; selection persists across pages and select-all covers every search result.
-- **Transfer progress**: The dialog, status bar, and sidebar share overall progress across all uploads and downloads. Percentages remain fully visible, and file states use explicit text and icons. Active files come first; completed files move into a collapsed history section with separate pagination. Switching files does not restart the sync icon animation.
-- **Retry and resume**: Retry one failed file or all failed tasks; persistent tasks recover after the plugin restarts.
+- **Transfer progress**: Manual sync shows overall progress across all uploads and downloads in the dialog, status bar, and sidebar. Automatic and scheduled background runs stay quiet, while the progress view remains available on demand. Percentages remain fully visible, and file states use explicit text and icons. Active files come first; completed files move into a collapsed history section with separate pagination. Switching files does not restart the sync icon animation.
+- **Directory selection**: Explicitly choose a cloud directory before the first scan. Choices are cached per account and cloud space within this vault; missing directories require a new selection.
+- **Retry and resume**: Temporary errors wait for automatic retry without appearing as final failures. Interrupted tasks and verified download blocks survive restart. Automatic mode resumes pending work; manual mode waits for an action. Stop remains cancellable during retry waits.
+- **Ignore a file**: Failed files offer an ignore action that saves a full-path exclusion in this vault. Later runs skip uploads and downloads for that path, preserving both copies and the baseline. Same-named files in other directories are unaffected. Remove or disable the exclusion in Filter rules and save to resume syncing. Deleting a failure record only clears its history; later runs still detect the file.
 - **Integrity checks**: Verify whole-file and block hashes during transfer, and replace a downloaded target only after validation succeeds.
-- **Clear outcomes**: The status bar reports the current phase and explicitly says when local and cloud content are already up to date.
-- **Responsive processing**: Scanning, indexing, and planning yield after at most 100 items or about 8ms. Progress distinguishes cloud requests, index processing, local scanning, planning, transfer, verification, and saving. It reports account-wide and bound-folder counts, the current local path, and processed bytes. UI refreshes are coalesced to at most once per 200ms, with immediate final, stopped, and error updates. The local database retains only the latest run's phase timings, counts, and longest processing batch, without content or authenticated URLs.
-- **Desktop large files**: Hashing and upload read 512 KiB blocks. Download ranges are capped at 1 MiB and written to a temporary file, then verified before replacing the target. Local changes during processing stop the task. Uploads run up to five files at once; downloads, index requests, and structural operations run one at a time. Upload sessions resume; failed downloads restart from the beginning.
+- **Clear outcomes**: Manual sync uses the status bar to report the current phase and explicitly says when local and cloud content are already up to date. Background errors remain visible without turning successful runs into repeated notifications.
+- **Responsive processing**: Scanning, indexing, and planning yield after at most 100 items or about 8ms. Manual progress distinguishes cloud requests, index processing, local scanning, planning, transfer, verification, and saving. It reports account-wide and bound-folder counts, the current local path, and processed bytes. UI refreshes are coalesced to at most once per 200ms, with immediate final, stopped, and error updates. The local database retains only the latest run's phase timings, counts, and longest processing batch, without content or authenticated URLs.
+- **Transfer scheduling**: Uploads and downloads share five file slots. Directory, delete, move and rename operations remain sequential and respect parent dependencies. Metadata requests start at least 200ms apart and share rate-limit cooldown with file requests.
+- **Desktop large files**: Hashing and upload read 512 KiB blocks. Download ranges are capped at 1 MiB. Verified cached blocks survive interruptions; downloads refresh credentials and fetch missing blocks before whole-file verification and target replacement. Local changes during processing stop the task. Mobile adapters retain download blocks, while final file writes still use whole-file buffers.
 
 ### Conflict Handling
 

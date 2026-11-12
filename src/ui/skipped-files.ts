@@ -16,7 +16,7 @@ export class SkippedFilesList {
     const section = container.createEl("details", { cls: "yunpan-sync-skipped-files" });
     section.open = this.open;
     section.addEventListener("toggle", () => { this.open = section.open; });
-    section.createEl("summary", { text: `已跳过 ${matches.length} 项（保留原文件）` });
+    section.createEl("summary", { text: `已跳过 ${matches.length} 项（保留原文件）`, cls: "yunpan-sync-collapsible-title" });
     const page = pageItems(matches, this.page);
     this.page = page.page;
     renderPager(section, page.page, page.pages, value => { this.page = value; refresh(); });

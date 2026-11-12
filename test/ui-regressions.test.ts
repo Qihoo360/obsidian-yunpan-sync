@@ -16,6 +16,7 @@ const { Element, vaultEvents, makeVault } = vi.hoisted(() => {
     hidden = false;
     scrollTop = 0;
     attributes: Record<string, string> = {};
+    controls: { label: string; click?: () => void }[] = [];
     style = { width: "" };
     constructor(public tag = "div") {}
     createEl(tag: string, options: { text?: string; cls?: string; type?: string; attr?: Record<string, string> } = {}) {
@@ -33,7 +34,8 @@ const { Element, vaultEvents, makeVault } = vi.hoisted(() => {
     toggleClass(name: string, enabled: boolean) { enabled ? this.classes.add(name) : this.classes.delete(name); }
     addEventListener(event: string, listener: () => void) { this.listeners.set(event, listener); }
     setText(text: string) { this.text = text; }
-    empty() { this.children.forEach(child => { child.parent = undefined; }); this.children = []; }
+    setAttr(name: string, value: string) { this.attributes[name] = value; }
+    empty() { this.children.forEach(child => { child.parent = undefined; }); this.children = []; this.controls = []; }
     prepend(child: Element) {
       child.parent!.children = child.parent!.children.filter(item => item !== child);
       child.parent = this;
@@ -69,7 +71,14 @@ vi.mock("obsidian", async (importOriginal) => ({
     close() { (this as unknown as { onClose(): void }).onClose(); }
   },
   Setting: class {
-    addButton() { return this; }
+    constructor(private readonly container: InstanceType<typeof Element>) {}
+    addButton(callback: (button: unknown) => void) {
+      const button = { label: "", disabled: false, click: undefined as (() => void) | undefined,
+        setButtonText(label: string) { this.label = label; return this; },
+        setDisabled(disabled: boolean) { this.disabled = disabled; return this; },
+        setCta() { return this; }, onClick(click: () => void) { this.click = click; return this; } };
+      callback(button); this.container.controls.push(button); return this;
+    }
   },
   setIcon: (element: InstanceType<typeof Element>, name: string) => {
     element.empty(); element.createEl("svg", { attr: { "data-icon": name } });
@@ -87,6 +96,50 @@ import { SkippedFilesList } from "../src/ui/skipped-files.js";
 import { WindowsPathError } from "../src/domain/paths.js";
 
 describe("excluded files and scan retry UI", () => {
+  it("offers directory selection again when the first chooser was dismissed", async () => {
+    const { owner, view, root } = harness();
+    owner.remoteRootSelected = false;
+    await view.onOpen();
+    const controls = root.all().flatMap(element => element.controls);
+    expect(controls.map(control => control.label)).toEqual(["选择同步目录"]);
+    controls[0]!.click!();
+    expect(owner.chooseRemoteRoot).toHaveBeenCalledOnce();
+    await view.onClose();
+  });
+
+  it("hides sync-now while running or stopping, then offers resume and sync-now at the appropriate times", async () => {
+    const { owner, view, root } = harness();
+    const setPaused = vi.fn(); const syncNow = vi.fn();
+    Object.assign(owner, { conflicts: [], isSyncing: true, setPaused, syncNow });
+    await view.onOpen();
+    const controls = () => root.all().flatMap(element => element.controls);
+    expect(controls().map(control => control.label)).toEqual(["停止同步"]);
+    controls()[0]!.click!(); expect(owner.cancelSync).toHaveBeenCalledOnce();
+    owner.isPaused = true; view.render();
+    expect(controls().map(control => control.label)).toEqual(["停止同步"]);
+    owner.isSyncing = false; view.render();
+    expect(controls().map(control => control.label)).toEqual(["恢复"]);
+    controls()[0]!.click!(); expect(setPaused).toHaveBeenCalledWith(false);
+    owner.isPaused = false; view.render();
+    expect(controls().map(control => control.label)).toContain("立即同步");
+    await view.onClose();
+  });
+  it("retains the sidebar stop control through status and byte progress refreshes", async () => {
+    const { owner, view, root } = harness();
+    Object.assign(owner, { isSyncing: true, conflicts: [],
+      currentStatus: { phase: "transfer", message: "正在执行同步任务", queued: 1, failed: 0 } });
+    await view.onOpen();
+    const controls = () => root.all().flatMap(element => element.controls);
+    const stop = controls()[0]!;
+    for (let i = 1; i < 5; i++) {
+      owner.currentStatus.message = `正在下载：${i}.md`;
+      view.render();
+      expect(controls()[0]).toBe(stop);
+    }
+    stop.click!();
+    expect(owner.cancelSync).toHaveBeenCalledOnce();
+    await view.onClose();
+  });
   it("limits skipped rows, preserves expansion and pagination, and searches reasons independently of failures", () => {
     const root = new Element();
     const list = new SkippedFilesList();
@@ -95,6 +148,8 @@ describe("excluded files and scan retry UI", () => {
     const refresh = () => { root.empty(); list.render(root as never, files, query, refresh); };
     refresh();
     const details = () => root.all().find(el => el.tag === "details")! as InstanceType<typeof Element> & { open: boolean };
+    const summary = () => root.all().find(el => el.tag === "summary")!;
+    expect(summary().classes.has("yunpan-sync-collapsible-title")).toBe(true);
     expect(details().open).toBe(false);
     expect(root.all().filter(el => el.classes.has("yunpan-sync-skipped-file"))).toHaveLength(100);
     details().open = true; details().listeners.get("toggle")!();
@@ -111,6 +166,25 @@ describe("excluded files and scan retry UI", () => {
     const root = new Element();
     new SkippedFilesList().render(root as never, [{ path: "folder/file.pdf", reason: "文件大小不在 0–30 MB 范围内", source: "local", size: 2048 }], "", () => undefined);
     expect(root.all().some(el => el.text === " (2KB)" && el.classes.has("yunpan-sync-skipped-file-size"))).toBe(true);
+  });
+
+  it("uses the same collapsible title class for completed and skipped lists", () => {
+    const skippedRoot = new Element();
+    new SkippedFilesList().render(skippedRoot as never,
+      [{ path: "skipped.md", reason: "被过滤规则排除", source: "local" }], "", () => undefined);
+    const skippedTitle = skippedRoot.all().find(el => el.tag === "summary")!;
+    const modal = new SyncProgressModal({
+      app: {}, currentStatus: { phase: "transfer", message: "同步中", queued: 1, failed: 0 },
+      transferProgress: [{ id: "done", path: "done.md", direction: "download", state: "completed", completedBytes: 1, totalBytes: 1 }],
+      failedTasks: [], isSyncing: true, cancelSync: vi.fn(), resumeSync: vi.fn(), hideSyncProgress: vi.fn(),
+      retryTask: vi.fn(async () => undefined), removeFailedTask: vi.fn(async () => undefined), ignoreTask: vi.fn(async () => undefined),
+    } as never);
+    modal.onOpen();
+    const completedTitle = (modal.contentEl as unknown as InstanceType<typeof Element>).all()
+      .find(el => el.classes.has("yunpan-sync-completed-toggle"))!;
+    expect(skippedTitle.classes.has("yunpan-sync-collapsible-title")).toBe(true);
+    expect(completedTitle.classes.has("yunpan-sync-collapsible-title")).toBe(true);
+    modal.onClose();
   });
   it.each([undefined, NaN, Infinity, -1])("omits invalid skipped-file size %s", size => {
     const root = new Element();
@@ -147,6 +221,29 @@ describe("excluded files and scan retry UI", () => {
     expect(removeFailedTask.mock.calls).toEqual(isSyncing ? [] : [["one"], ["two"]]);
     await fixture.view.onClose();
   });
+  it.each(["modal", "sidebar"])("blocks ignoring during sync and duplicate clicks in the %s", async surface => {
+    const ignoreTask = vi.fn(async () => undefined);
+    const fixture = harness();
+    const owner = Object.assign(fixture.owner, { app: {}, isSyncing: true, ignoreTask, conflicts: [], hideSyncProgress: vi.fn(),
+      currentStatus: { phase: "error", message: "部分文件同步失败", queued: 0, failed: 1 },
+      transferProgress: [{ id: "rejected", path: "images/note.jpg", direction: "upload", state: "failed", totalBytes: 100, completedBytes: 0 }],
+      failedTasks: [{ id: "rejected", path: "images/note.jpg", kind: "upload", state: "failed", payload: {} }] });
+    const modal = surface === "modal" ? new SyncProgressModal(owner as never) : undefined;
+    if (modal) modal.onOpen(); else await fixture.view.onOpen();
+    const root = modal ? modal.contentEl as unknown as InstanceType<typeof Element> : fixture.root;
+    const ignore = () => root.all().find(el => el.text === "忽略此文件")!;
+    expect(ignore().disabled).toBe(true);
+    ignore().listeners.get("click")!();
+    expect(ignoreTask).not.toHaveBeenCalled();
+    owner.isSyncing = false;
+    if (modal) modal.render(); else fixture.view.render();
+    const button = ignore();
+    expect(button.disabled).toBe(false);
+    button.listeners.get("click")!();
+    button.listeners.get("click")!();
+    expect(ignoreTask).toHaveBeenCalledExactlyOnceWith("rejected");
+    if (modal) modal.onClose(); else await fixture.view.onClose();
+  });
   it.each(["modal", "sidebar"])("provides a stable scan-only retry action in the %s", async surface => {
     const retryTask = vi.fn(async () => undefined);
     const currentStatus: EngineStatus = { phase: "error", message: "部分文件同步失败", queued: 0, failed: 1,
@@ -169,11 +266,14 @@ describe("excluded files and scan retry UI", () => {
 function harness(hasFile: () => Promise<boolean> = async () => false) {
   const owner = {
     currentStatus: { phase: "idle", message: "已是最新", queued: 0, failed: 0 },
-    isPaused: false, isSyncing: false, transferProgress: [], failedTasks: [],
+    isPaused: false, remoteRootSelected: true, isSyncing: false, transferProgress: [], failedTasks: [],
     conflicts: [{ id: 1, originalPath: "notes/file.md", conflictPath: "notes/file (conflict).md", createdAt: 1 }],
     hasVaultFile: vi.fn(hasFile),
     openVaultPath: vi.fn(async () => undefined),
     resolveConflict: vi.fn(async () => undefined),
+    chooseRemoteRoot: vi.fn(async () => undefined),
+    cancelSync: vi.fn(),
+    ignoreTask: vi.fn(async () => undefined),
   };
   const view = new YunpanStatusView({ app: { vault: makeVault() } } as never, owner as unknown as StatusViewOwner);
   const root = view.contentEl as unknown as InstanceType<typeof Element>;
@@ -407,15 +507,91 @@ describe("whole-run sync progress UI", () => {
     id, path: `${id}.md`, direction: "download", state, completedBytes: bytes, totalBytes: total,
   });
   function progressHarness(items: FileTransferProgress[]) {
-    const owner = { app: {}, currentStatus: { phase: "transfer", message: "正在执行同步任务", queued: items.length, failed: 0 },
-      transferProgress: items, failedTasks: [] as SyncTask[], isSyncing: true, cancelSync: vi.fn(), hideSyncProgress: vi.fn(),
-      retryTask: vi.fn(async () => undefined), removeFailedTask: vi.fn(async () => undefined) };
+    const owner = { app: {}, currentStatus: { phase: "transfer", message: "正在执行同步任务", queued: items.length, failed: 0 } as EngineStatus,
+      transferProgress: items, failedTasks: [] as SyncTask[], isSyncing: true, cancelSync: vi.fn(), resumeSync: vi.fn(), hideSyncProgress: vi.fn(),
+      retryTask: vi.fn(async () => undefined), removeFailedTask: vi.fn(async () => undefined), ignoreTask: vi.fn(async () => undefined) };
     const modal = new SyncProgressModal(owner as never);
     modal.onOpen();
     return { owner, modal, root: modal.contentEl as unknown as InstanceType<typeof Element> };
   }
   const find = (root: InstanceType<typeof Element>, cls: string) => root.all().find(el => el.classes.has(cls))!;
   const rows = (root: InstanceType<typeof Element>) => root.all().filter(el => el.classes.has("yunpan-sync-file-row"));
+
+  async function paginationHarness(surface: "modal" | "side", items: FileTransferProgress[]) {
+    if (surface === "modal") {
+      const { owner, modal, root } = progressHarness(items);
+      return { owner, root, render: () => modal.render(), close: () => modal.onClose() };
+    }
+    const { owner, view, root } = harness();
+    Object.assign(owner, { conflicts: [], isSyncing: true,
+      currentStatus: { phase: "transfer", message: "同步中", queued: items.length, failed: 0 }, transferProgress: items });
+    await view.onOpen();
+    return { owner: owner as unknown as { transferProgress: FileTransferProgress[] }, root,
+      render: () => view.render(), close: () => view.onClose() };
+  }
+
+  it.each(["modal", "side"] as const)("keeps %s pagination targets mounted through progress updates and consecutive clicks", async surface => {
+    const { owner, root, render, close } = await paginationHarness(surface,
+      Array.from({ length: 305 }, (_, i) => file(`download${i}`, "queued")));
+    const section = find(root, `yunpan-sync-${surface}-transfer-list`);
+    const pager = find(section, "yunpan-sync-pagination");
+    const previous = pager.all().find(el => el.text === "上一页")!;
+    const next = pager.all().find(el => el.text === "下一页")!;
+    const click = (button: InstanceType<typeof Element>) => {
+      // Hold the original native event target while a download reports progress
+      // between press and release. A detached target cannot receive the click.
+      expect(root.contains(button)).toBe(true);
+      button.listeners.get("pointerdown")?.();
+      for (let i = 1; i <= 5; i++) {
+        owner.transferProgress[0] = file("download0", "queued", i);
+        render();
+        expect(root.contains(button)).toBe(true);
+        expect(find(section, "yunpan-sync-pagination")).toBe(pager);
+        expect(pager.all().find(el => el.text === "下一页")).toBe(next);
+        expect(pager.all().find(el => el.text === "上一页")).toBe(previous);
+      }
+      button.listeners.get("pointerup")?.();
+      expect(button.disabled).toBe(false);
+      button.listeners.get("click")!();
+    };
+    click(next);
+    expect(pager.all().some(el => el.text === "2 / 4")).toBe(true);
+    expect(find(rows(section)[0]!, "yunpan-sync-transfer-path").text).toBe("download100.md");
+    click(next);
+    expect(pager.all().some(el => el.text === "3 / 4")).toBe(true);
+    click(previous);
+    expect(pager.all().some(el => el.text === "2 / 4")).toBe(true);
+    await close();
+  });
+
+  it.each(["modal", "side"] as const)("clamps the stored %s page when files complete and handles empty lists", async surface => {
+    const { owner, root, render, close } = await paginationHarness(surface,
+      Array.from({ length: 405 }, (_, i) => file(`download${i}`, "queued")));
+    const section = find(root, `yunpan-sync-${surface}-transfer-list`);
+    const pager = find(section, "yunpan-sync-pagination");
+    const previous = pager.all().find(el => el.text === "上一页")!;
+    const next = pager.all().find(el => el.text === "下一页")!;
+    for (let i = 0; i < 4; i++) next.listeners.get("click")!();
+    expect(next.disabled).toBe(true);
+    owner.transferProgress = owner.transferProgress.map((item, i) => i >= 205 ? { ...item, state: "completed" } : item);
+    render();
+    expect(pager.all().some(el => el.text === "3 / 3")).toBe(true);
+    previous.listeners.get("click")!();
+    expect(pager.all().some(el => el.text === "2 / 3")).toBe(true);
+    expect(find(rows(section)[0]!, "yunpan-sync-transfer-path").text).toBe("download100.md");
+    owner.transferProgress = [];
+    render();
+    expect(section.hidden).toBe(true);
+    expect(rows(section)).toHaveLength(0);
+    owner.transferProgress = Array.from({ length: 101 }, (_, i) => file(`new${i}`, "queued"));
+    render();
+    expect(section.hidden).toBe(false);
+    expect(root.contains(next)).toBe(true);
+    expect(previous.disabled).toBe(true);
+    next.listeners.get("click")!();
+    expect(pager.all().some(el => el.text === "2 / 2")).toBe(true);
+    await close();
+  });
 
   it.each([0, 1, 9, 100])("keeps the entire %s%% label outside the fill and agrees with the status bar", percent => {
     const { owner, modal, root } = progressHarness([file("one", percent === 100 ? "completed" : "transferring", percent)]);
@@ -430,6 +606,21 @@ describe("whole-run sync progress UI", () => {
     (plugin as unknown as { renderStatus(): void }).renderStatus();
     expect(statusBar.text).toContain(`总进度 ${percent}%`);
     expect(statusBar.text).not.toContain("下载");
+  });
+
+  it("uses transfer files for the completed count and hides local scan diagnostics", () => {
+    const { owner, modal, root } = progressHarness([
+      file("done", "completed", 100), file("waiting", "queued"), file("failed", "failed"),
+    ]);
+    owner.currentStatus = {
+      phase: "transfer", message: "正在执行同步任务", queued: 2, failed: 1,
+      diagnostics: { startedAt: 1, durationMs: 0, stages: {}, remoteNodes: 2529,
+        matchedNodes: 2529, localFiles: 2, localBytes: 0, longestBatchMs: 0 },
+    };
+    modal.render();
+    expect(find(root, "yunpan-sync-total-detail").text).toContain("已完成 1 / 3 项");
+    expect(root.all().some(el => el.text.includes("本地文件已检查"))).toBe(false);
+    expect(root.all().some(el => el.text.includes("云端文件和文件夹已读取"))).toBe(false);
   });
 
   it("keeps a single rotating SVG during file updates and partial failure, then stops at the run outcome", () => {
@@ -451,6 +642,57 @@ describe("whole-run sync progress UI", () => {
     expect(icon.children[0]!.attributes["data-icon"]).toBe("circle-alert");
     owner.currentStatus = { phase: "idle", message: "同步完成", queued: 0, failed: 0 }; modal.render();
     expect(icon.children[0]!.attributes["data-icon"]).toBe("circle-check");
+  });
+
+  it("keeps stop and hide mounted when progress refreshes between pointer down and click", () => {
+    const { owner, modal, root } = progressHarness([file("one", "transferring", 1)]);
+    const stop = root.all().find(el => el.text === "停止同步")!;
+    const hide = root.all().find(el => el.text === "隐藏")!;
+    for (let i = 2; i < 10; i++) {
+      owner.transferProgress = [file("one", "transferring", i)];
+      modal.render();
+      expect(root.all().find(el => el.text === "停止同步")).toBe(stop);
+      expect(root.all().find(el => el.text === "隐藏")).toBe(hide);
+    }
+    stop.listeners.get("click")!();
+    expect(owner.cancelSync).toHaveBeenCalledOnce();
+    owner.currentStatus = { phase: "stopping", message: "正在停止同步…", queued: 1, failed: 0 };
+    modal.render();
+    expect(root.contains(stop)).toBe(true);
+    expect(stop.disabled).toBe(true);
+    owner.currentStatus = { phase: "paused", message: "同步已停止", queued: 1, failed: 0 };
+    modal.render();
+    expect(stop.hidden).toBe(true);
+    expect(hide.text).toBe("关闭");
+  });
+
+  it("shows an immediate disabled stopping action while the engine is settling", () => {
+    const { owner, modal, root } = progressHarness([file("one", "transferring", 1)]);
+    owner.currentStatus = { phase: "stopping", message: "正在停止同步…", queued: 1, failed: 0 };
+    modal.render();
+    const stop = root.all().find(el => el.text === "正在停止…");
+    expect(stop).toBeDefined();
+    expect(stop!.disabled).toBe(true);
+    expect(root.all().some(el => el.text === "停止同步" && !el.hidden)).toBe(false);
+  });
+
+  it("offers resume after a stopped synchronization", () => {
+    const { owner, modal, root } = progressHarness([file("one", "completed", 100), file("two", "queued")]);
+    owner.currentStatus = { phase: "paused", message: "同步已停止", queued: 1, failed: 0 };
+    owner.isSyncing = false;
+    modal.render();
+    const resume = root.all().find(el => el.text === "恢复同步");
+    expect(resume).toBeDefined();
+    expect(resume!.hidden).toBe(false);
+    expect(root.all().some(el => el.text === "停止同步" && !el.hidden)).toBe(false);
+    resume!.listeners.get("click")!();
+    expect(owner.resumeSync).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the restriction action hidden when no restriction is present", () => {
+    const { modal, root } = progressHarness([file("one", "transferring", 1)]);
+    const action = root.all().find(el => el.classes.has("yunpan-sync-restriction-action"));
+    expect(action?.hidden).toBe(true);
   });
 
   it("sorts unfinished files, folds completed history, preserves scroll and shows state, bytes and errors", () => {
@@ -475,23 +717,33 @@ describe("whole-run sync progress UI", () => {
     expect(retry).toHaveLength(1); expect(retry[0]!.disabled).toBe(false);
     retry[0]!.listeners.get("click")!();
     root.all().find(el => el.text === "删除记录")!.listeners.get("click")!();
+    root.all().find(el => el.text === "忽略此文件")!.listeners.get("click")!();
     expect(owner.retryTask).toHaveBeenCalledWith("bad");
     expect(owner.removeFailedTask).toHaveBeenCalledWith("bad");
+    expect(owner.ignoreTask).toHaveBeenCalledWith("bad");
   });
 
-  it("keeps separate history and unfinished pages, and searches both sections after 150ms", async () => {
+  it.each(["modal", "side"] as const)("keeps separate %s history and unfinished pages, and searches both sections after 150ms", async surface => {
     vi.useFakeTimers();
     try {
-      const { modal, root } = progressHarness([
+      const { render, close, root } = await paginationHarness(surface, [
         ...Array.from({ length: 205 }, (_, i) => file(`queue${i}`, "queued")),
         ...Array.from({ length: 205 }, (_, i) => file(`done${i}`, "completed", 100)),
       ]);
-      const pending = () => root.all().find(el => el.classes.has("yunpan-sync-modal-transfer-list") && !el.classes.has("is-completed-history"))!;
+      const pending = () => root.all().find(el => el.classes.has(`yunpan-sync-${surface}-transfer-list`) && !el.classes.has("is-completed-history"))!;
       const history = () => find(root, "is-completed-history");
-      pending().all().find(el => el.text === "下一页")!.listeners.get("click")!();
-      find(root, "yunpan-sync-completed-toggle").listeners.get("click")!();
-      history().all().find(el => el.text === "下一页")!.listeners.get("click")!();
-      modal.render();
+      const pendingNext = pending().all().find(el => el.text === "下一页")!;
+      const historyNext = history().all().find(el => el.text === "下一页")!;
+      const toggle = find(root, "yunpan-sync-completed-toggle");
+      expect(find(history(), "yunpan-sync-pagination").hidden).toBe(true);
+      pendingNext.listeners.get("click")!();
+      toggle.listeners.get("click")!();
+      historyNext.listeners.get("click")!();
+      render();
+      expect(pending().all().find(el => el.text === "下一页")).toBe(pendingNext);
+      expect(history().all().find(el => el.text === "下一页")).toBe(historyNext);
+      expect(find(root, "yunpan-sync-completed-toggle")).toBe(toggle);
+      expect(find(history(), "yunpan-sync-pagination").hidden).toBe(false);
       expect(rows(pending())).toHaveLength(100); expect(rows(history())).toHaveLength(100);
       expect(find(rows(pending())[0]!, "yunpan-sync-transfer-path").text).toBe("queue100.md");
       expect(find(rows(history())[0]!, "yunpan-sync-transfer-path").text).toBe("done100.md");
@@ -501,13 +753,20 @@ describe("whole-run sync progress UI", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(rows(pending())).toHaveLength(21); expect(rows(history())).toHaveLength(21);
       expect(find(root, "yunpan-sync-completed-toggle").attributes["aria-expanded"]).toBe("true");
-      modal.onClose();
+      expect(find(pending(), "yunpan-sync-pagination").hidden).toBe(true);
+      search.value = ""; search.listeners.get("input")!();
+      await vi.advanceTimersByTimeAsync(150);
+      expect(find(rows(pending())[0]!, "yunpan-sync-transfer-path").text).toBe("queue0.md");
+      expect(find(rows(history())[0]!, "yunpan-sync-transfer-path").text).toBe("done0.md");
+      expect(root.contains(pendingNext)).toBe(true);
+      expect(root.contains(historyNext)).toBe(true);
+      await close();
     } finally { vi.useRealTimers(); }
   });
 
   it("does not invent a percentage while scanning an unknown total", () => {
     const { owner, modal, root } = progressHarness([]);
-    owner.currentStatus = { phase: "local-scan", message: "正在扫描本地", queued: 0, failed: 0 }; modal.render();
+    owner.currentStatus = { phase: "local-scan", message: "正在检查本地文件…", queued: 0, failed: 0 }; modal.render();
     expect(root.all().some(el => el.classes.has("yunpan-sync-total-percent"))).toBe(false);
   });
 

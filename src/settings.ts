@@ -44,6 +44,8 @@ export interface PluginSettings {
   environment: Environment;
   openapiBaseUrl: string;
   remoteRoot: string;
+  remoteRootSelected?: boolean;
+  accountDirectories?: Record<string, string>;
   mode: SyncMode;
   intervalMinutes: number;
   paused: boolean;
@@ -62,6 +64,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   environment: "production",
   openapiBaseUrl: "https://openapi.eyun.360.cn/intf.php",
   remoteRoot: "/Obsidian/",
+  remoteRootSelected: false,
+  accountDirectories: {},
   mode: "automatic",
   intervalMinutes: 30,
   paused: false,
@@ -130,6 +134,9 @@ export function normalizeSettings(input: Partial<PluginSettings> | null | undefi
     environment,
     mode,
     intervalMinutes,
+    accountDirectories: Object.fromEntries(Object.entries(input?.accountDirectories ?? {}).filter(
+      ([key, path]) => key.length < 256 && typeof path === "string" && path.startsWith("/"))),
+    remoteRootSelected: input?.remoteRootSelected ?? Boolean(input?.remoteRoot && input.remoteRoot !== DEFAULT_SETTINGS.remoteRoot),
     syncObsidianConfig: input?.syncObsidianConfig === true,
     excludedExtensions,
     filterRules,

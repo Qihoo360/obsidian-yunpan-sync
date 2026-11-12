@@ -18,6 +18,7 @@ export interface UploadInput {
   check?: () => void;
   onHashProgress?: (completedBytes: number) => void;
   expectedHash?: string;
+  signal?: AbortSignal;
 }
 interface UploadPreflight { http?: string; https?: string; url?: string; tk?: string; autoCommit?: number | boolean; auto_commit?: number | boolean; small_file?: number | boolean; small_limit?: number }
 
@@ -43,7 +44,7 @@ export interface TransferProgress {
 }
 
 export class UploadMachine {
-  constructor(private readonly api: Api, private readonly makeStore: (url: string) => StoreClientLike,
+  constructor(private readonly api: Api, private readonly makeStore: (url: string, signal?: AbortSignal) => StoreClientLike,
     private readonly progress?: TransferProgress, private readonly ownerQid: () => string = () => "0",
     private readonly checkpoint: () => Promise<void> = async () => undefined) {}
 
@@ -101,7 +102,7 @@ export class UploadMachine {
       input.onProgress?.(size, size);
       return result;
     }
-    const store = this.makeStore(endpoint);
+    const store = this.makeStore(endpoint, input.signal);
     const smallLimit = Math.min(DIRECT_UPLOAD_LIMIT, Number(preflight.small_limit ?? DIRECT_UPLOAD_LIMIT));
     if (size <= smallLimit) {
       await check();

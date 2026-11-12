@@ -8,23 +8,28 @@ import { failedTaskPresentation } from "./task-presentation.js";
 import { pageItems, renderPager } from "./list-page.js";
 import { TransferList } from "./transfer-list.js";
 import { SkippedFilesList } from "./skipped-files.js";
-import { renderFailedRecordAction } from "./failed-record-action.js";
+import { renderFailedRecordAction, renderIgnoreFileAction } from "./failed-record-action.js";
+import { formatBytes } from "../account/profile.js";
 
 export const YUNPAN_STATUS_VIEW = "yunpan-sync-status-view";
 
 export interface StatusViewOwner {
   currentStatus: EngineStatus;
   isPaused: boolean;
+  remoteRootSelected: boolean;
   transferProgress: readonly FileTransferProgress[];
   failedTasks: readonly SyncTask[];
   isSyncing: boolean;
   conflicts: readonly SyncConflict[];
   syncNow(): Promise<void>;
+  cancelSync(): void;
   retryFailed(): Promise<void>;
   setPaused(paused: boolean): Promise<void>;
+  chooseRemoteRoot(): Promise<void>;
   showSyncProgress(): void;
   retryTask(id: string): Promise<void>;
   removeFailedTask(id: string): Promise<void>;
+  ignoreTask(id: string): Promise<void>;
   resolveConflict(id: number): Promise<void>;
   hasVaultFile(path: string): Promise<boolean>;
   openVaultPath(path: string): Promise<void>;
@@ -39,6 +44,8 @@ export class YunpanStatusView extends ItemView {
   private readonly transferList = new TransferList();
   private readonly skippedList = new SkippedFilesList();
   private summaryEl?: HTMLElement;
+  private controlsEl?: HTMLElement;
+  private controlsKey?: string;
   private pendingEl?: HTMLElement;
   private recordsEl?: HTMLElement;
   private historyEl?: HTMLElement;
@@ -89,6 +96,7 @@ export class YunpanStatusView extends ItemView {
       this.contentEl.empty();
       this.contentEl.addClass("yunpan-sync-side-view");
       this.summaryEl = this.contentEl.createDiv();
+      this.controlsEl = this.contentEl.createDiv();
       this.searchEl = this.contentEl.createEl("input", { type: "search", placeholder: "按传输路径搜索...",
         attr: { "aria-label": "搜索传输文件" } });
       this.searchEl.addEventListener("input", () => {
@@ -102,7 +110,7 @@ export class YunpanStatusView extends ItemView {
       this.historyEl = this.contentEl.createDiv();
     }
     this.searchEl!.hidden = this.owner.transferProgress.length === 0;
-    this.pendingEl!.empty(); this.recordsEl!.empty(); this.historyEl!.empty();
+    this.recordsEl!.empty();
     let container = this.summaryEl;
     container.empty();
     const heading = container.createDiv({ cls: "yunpan-sync-side-heading" });
@@ -113,11 +121,17 @@ export class YunpanStatusView extends ItemView {
     const status = this.owner.currentStatus;
     const membershipExpired = status.restriction?.kind === "membership";
     if (!membershipExpired) container.createDiv({ text: status.message, cls: `yunpan-sync-side-state is-${status.phase}` });
-    const { summary, percent } = overallTransferProgress(this.owner.transferProgress, status);
+    const { summary, percent, operationTotal, operationCompleted } = overallTransferProgress(this.owner.transferProgress, status);
     const groups = groupTransfers(this.owner.transferProgress, this.query);
     if (percent !== undefined) container.createDiv({ text: `总进度 ${percent}%`, cls: "yunpan-sync-total-percent" });
+    if (operationTotal > 0) {
+      const bytes = summary.totalBytes > 0 ? ` · ${formatBytes(summary.completedBytes)} / ${formatBytes(summary.totalBytes)}` : "";
+      container.createDiv({ text: `已完成 ${operationCompleted} / ${operationTotal} 项${bytes}`, cls: "yunpan-sync-total-detail" });
+    }
     const metrics = container.createDiv({ cls: "yunpan-sync-side-metrics" });
-    for (const [label, value] of [["待同步", status.queued], ["成功", summary.completedCount],
+    const pending = operationTotal > 0 ? Math.max(0, operationTotal - operationCompleted) : status.queued;
+    const succeeded = operationTotal > 0 ? operationCompleted : summary.completedCount;
+    for (const [label, value] of [["待同步", pending], ["成功", succeeded],
       ["失败", status.failed], ["冲突", this.owner.conflicts.length]] as const) {
       const metric = metrics.createDiv(); metric.createSpan({ text: String(value) });
       metric.createEl("small", { text: label });
@@ -134,15 +148,7 @@ export class YunpanStatusView extends ItemView {
       text: status.restriction.kind === "membership" ? "去续费" : status.restriction.kind === "capacity" ? "去扩容" : "刷新后重试" })
       .addEventListener("click", () => void this.owner.resolveSyncRestriction?.());
 
-    const action = sideStatusAction(this.owner.isPaused, status.phase);
-    new Setting(container).addButton((button) => button.setButtonText("立即同步").setCta()
-      .onClick(() => void this.owner.syncNow()))
-      .addButton((button) => button.setButtonText(action.label).onClick(() => {
-        if (action.kind === "resume") void this.owner.setPaused(false);
-        else if (action.kind === "pause") void this.owner.setPaused(true);
-        else if (status.failed > 0) void this.owner.retryFailed();
-        else void this.owner.syncNow();
-      }));
+    this.renderControls();
 
     this.transferList.render(this.pendingEl!, groups.pending, false, this.owner, () => this.render(), "side");
     container = this.recordsEl!;
@@ -161,9 +167,11 @@ export class YunpanStatusView extends ItemView {
         const retry = actions.createEl("button", { text: "重试此文件" });
         retry.disabled = this.owner.isSyncing;
         retry.addEventListener("click", () => void this.owner.retryTask(presentation.retryTaskId));
-        const remove = actions.createEl("button", { text: "删除记录" });
+        const remove = actions.createEl("button", { text: "删除记录",
+          attr: { title: "仅清除失败记录，下次同步仍会重新检测此文件" } });
         remove.disabled = this.owner.isSyncing;
         remove.addEventListener("click", () => void this.owner.removeFailedTask(presentation.retryTaskId));
+        renderIgnoreFileAction(actions, presentation.retryTaskId, this.owner);
       }
     }
     if (status.fileFailures?.length) {
@@ -198,6 +206,38 @@ export class YunpanStatusView extends ItemView {
     }
     this.transferList.render(this.historyEl!, groups.completed, true, this.owner, () => this.render(), "side");
     this.contentEl.scrollTop = scrollTop;
+  }
+
+  private renderControls(): void {
+    const status = this.owner.currentStatus;
+    const action = sideStatusAction(this.owner.isPaused, status.phase);
+    const stopping = status.phase === "stopping";
+    const key = JSON.stringify([this.owner.remoteRootSelected, this.owner.isSyncing, this.owner.isPaused,
+      stopping, this.owner.isSyncing ? "stop" : action.kind]);
+    // Progress refreshes must not detach the button between mouse-down and click.
+    if (key === this.controlsKey) return;
+    this.controlsKey = key;
+    this.controlsEl!.empty();
+    const controls = new Setting(this.controlsEl!);
+    if (!this.owner.remoteRootSelected) {
+      controls.addButton(button => button.setButtonText("选择同步目录").setCta()
+        .onClick(() => void this.owner.chooseRemoteRoot()));
+      return;
+    }
+    if (!this.owner.isSyncing && !this.owner.isPaused) controls.addButton(button => button.setButtonText("立即同步").setCta()
+      .onClick(() => void this.owner.syncNow()));
+    controls.addButton(button => button
+      .setButtonText(stopping ? "正在停止…" : this.owner.isSyncing ? "停止同步" : action.label)
+      .setDisabled(stopping)
+      .onClick(() => {
+        if (this.owner.currentStatus.phase === "stopping") return;
+        if (this.owner.isSyncing) { this.owner.cancelSync(); return; }
+        const current = sideStatusAction(this.owner.isPaused, this.owner.currentStatus.phase);
+        if (current.kind === "resume") void this.owner.setPaused(false);
+        else if (current.kind === "pause") void this.owner.setPaused(true);
+        else if (this.owner.currentStatus.failed > 0) void this.owner.retryFailed();
+        else void this.owner.syncNow();
+      }));
   }
 
   private async renderOriginalAction(actions: HTMLElement, path: string, version: number): Promise<void> {

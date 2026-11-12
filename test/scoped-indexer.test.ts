@@ -22,6 +22,24 @@ async function harness(count = 205) {
 }
 
 describe("bound-directory cloud index", () => {
+  it("isolates a directory filename error, retains its old children and retries incomplete scans", async () => {
+    const { db, call, indexer } = await harness(0);
+    db.upsertRemoteNode({ nid: "old", pid: "dir", path: "/Bound/problem/old.md", name: "old.md", isDir: false,
+      version: 1, hash: "old", size: 3, mtime: 1 });
+    call.mockImplementation(async (method, input) => {
+      if (method === "User.getVersion") return { ver: "12" };
+      if (input.path === "/Bound/problem/") throw new OpenApiError("无效的文件名", 456);
+      return { node_list: [{ nid: "dir", name: "problem", type: 1 }, { nid: "good", name: "good.md", type: 0, size: 3 }], has_next_page: false };
+    });
+    await indexer.update();
+    expect(indexer.failures).toEqual([expect.objectContaining({ path: "/Bound/problem", nid: "dir" })]);
+    expect(db.getRemoteNode("old")?.hash).toBe("old");
+    expect(db.getRemoteNode("good")).toBeDefined();
+    expect(db.getCursor("account")?.snapshotComplete).toBe(false);
+    call.mockClear();
+    await indexer.update();
+    expect(call.mock.calls.some(([, input]) => input.path === "/Bound/problem/")).toBe(true);
+  });
   it("paginates metadata only and preserves list metadata aliases and absolute paths", async () => {
     const { db, call, indexer } = await harness();
     await indexer.update();

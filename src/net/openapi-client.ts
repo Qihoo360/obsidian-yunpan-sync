@@ -1,5 +1,7 @@
 import { assertProductionOpenApiUrl } from "./production-url.js";
 import { createSignedOpenApiParams } from "./signing.js";
+import { RequestScheduler, isRateLimitError } from "./request-scheduler.js";
+import { cancellable } from "./cancellation.js";
 
 
 export type OpenApiMethod =
@@ -76,6 +78,7 @@ export interface OpenApiClientOptions {
   signingSecret: () => string;
   transport: HttpTransport;
   retries?: number;
+  scheduler?: RequestScheduler;
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -83,11 +86,14 @@ function delay(milliseconds: number): Promise<void> {
 }
 
 export class OpenApiClient {
+  private readonly scheduler: RequestScheduler;
   constructor(private readonly options: OpenApiClientOptions) {
     assertProductionOpenApiUrl(options.baseUrl);
+    this.scheduler = options.scheduler ?? new RequestScheduler();
   }
 
-  async call<T>(method: OpenApiMethod, input: Record<string, string | number | boolean | null | undefined>): Promise<T> {
+  async call<T>(method: OpenApiMethod, input: Record<string, string | number | boolean | null | undefined>,
+    check: () => void = () => undefined, signal?: AbortSignal): Promise<T> {
     assertProductionOpenApiUrl(this.options.baseUrl);
     const retries = this.options.retries ?? 2;
     let transientAttempt = 0;
@@ -98,15 +104,25 @@ export class OpenApiClient {
       refreshed = true;
     }
     while (true) {
+      check();
       const startedAt = Date.now();
       let status: number | undefined;
       try {
-        const request = this.createRequest(method, input);
-        const response = await this.options.transport({
-          url: request.url,
-          method: "GET",
-          headers: { "Access-Token": request.accessToken, Accept: "application/json" },
-        });
+        const response = await this.scheduler.metadata(async () => {
+          const request = this.createRequest(method, input);
+          const result = await cancellable(this.options.transport({
+            url: request.url,
+            method: "GET",
+            headers: { "Access-Token": request.accessToken, Accept: "application/json" },
+          }), signal, check);
+          const envelope = result.json as OpenApiEnvelope<T> | undefined;
+          if (result.status === 429 || (envelope?.errno && isRateLimitError(envelope.errmsg ?? ""))) {
+            // Publish cooldown before releasing the metadata queue to another request.
+            this.scheduler.coolDown(transientAttempt);
+          }
+          return result;
+        }, check);
+        check();
         status = response.status;
         if (response.status === 401 && !refreshed && this.options.refreshAccessToken) {
           await this.options.refreshAccessToken();
@@ -127,7 +143,8 @@ export class OpenApiClient {
         
         return envelope.data as T;
       } catch (error) {
-        const retryable = error instanceof OpenApiError && (error.status === 429 || (error.status ?? 0) >= 500);
+        const limited = isRateLimitError(error);
+        const retryable = limited || (error instanceof OpenApiError && (error.status === 429 || (error.status ?? 0) >= 500));
         const traceId = error instanceof OpenApiError ? error.traceId : undefined;
         const errno = error instanceof OpenApiError ? error.errno : undefined;
         const errorStatus = error instanceof OpenApiError ? error.status ?? status : status;
@@ -135,7 +152,11 @@ export class OpenApiClient {
         const retryInMs = terminal ? undefined : 250 * 2 ** transientAttempt;
         
         if (terminal) throw error;
-        await delay(retryInMs!);
+        if (limited) await this.scheduler.wait(check);
+        else {
+          const until = Date.now() + retryInMs!;
+          while (Date.now() < until) { check(); await delay(Math.min(100, until - Date.now())); }
+        }
         transientAttempt++;
       }
     }

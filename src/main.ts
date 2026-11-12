@@ -24,7 +24,7 @@ import {
   normalizeAccountProfile,
   type AccountProfile,
 } from "./account/profile.js";
-import { OpenApiClient, type HttpRequest } from "./net/openapi-client.js";
+import { OpenApiClient, OpenApiError, type HttpRequest } from "./net/openapi-client.js";
 import { DEFAULT_SETTINGS, ensureDeviceId, normalizeSettings, pollIntervalMs,
   normalizeScheduledInterval, MIN_SCHEDULED_INTERVAL_MINUTES, MAX_SCHEDULED_INTERVAL_MINUTES,
   validFileSizeRange,
@@ -34,7 +34,7 @@ import { SyncEngine, type EngineStatus } from "./sync/engine.js";
 import { DownloadMachine } from "./transfer/download.js";
 import { StoreClient } from "./transfer/store-client.js";
 import { UploadMachine } from "./transfer/upload.js";
-import { normalizeRemoteRoot, shouldIgnorePath, parseExcludedExtensions } from "./domain/paths.js";
+import { normalizeRemoteRoot, normalizeVaultPath, shouldIgnorePath, parseExcludedExtensions } from "./domain/paths.js";
 import { OPENAPI_SIGNING_SECRET } from "./config/openapi.js";
 import { initialStatus, restoredStatus } from "./status.js";
 import { completionNotice, isSuccessfulSyncMessage } from "./sync/outcome.js";
@@ -57,8 +57,11 @@ import { PluginLifecycleTimers, settleForPause } from "./lifecycle.js";
 import { openVaultPath } from "./ui/open-vault-path.js";
 import { dismissKeyboardOnBlankTap } from "./ui/dismiss-keyboard.js";
 import { renderFailedRecordAction } from "./ui/failed-record-action.js";
+import { RequestScheduler } from "./net/request-scheduler.js";
+import { DownloadCache, discardDownloads } from "./transfer/download-cache.js";
 
-const DEBOUNCE_MS = 1500;
+const INITIAL_SYNC_DELAY_MS = 1500;
+const FILE_EVENT_DEBOUNCE_MS = 10_000;
 
 function messageOf(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
@@ -79,6 +82,7 @@ export default class YunpanSyncPlugin extends Plugin {
   private transfers: FileTransferProgress[] = [];
   private syncModal?: SyncProgressModal;
   private syncUiHidden = false;
+  private backgroundSync = false;
   private removingFailure = false;
   private displayedSyncWarnings = new Set<string>();
   private lastRestrictionWarning?: string;
@@ -94,6 +98,18 @@ export default class YunpanSyncPlugin extends Plugin {
   private lastUiRender = 0;
   private readonly dismissedInitialConfirmations = new WeakSet<SyncEngine>();
   private taskPreview?: SyncTaskPreviewModal;
+  private pauseTransition: Promise<void> = Promise.resolve();
+  private pauseGeneration = 0;
+  private stoppingRequested = false;
+  private directoryChoice?: Promise<boolean>;
+  private directoryModal?: RemoteDirectoryModal;
+  private syncStarting?: object;
+  private readonly syncRuns = new Set<object>();
+  private interruptionGeneration = 0;
+  private recoveryRequest?: { engine: SyncEngine; api: OpenApiClient | undefined; pauseGeneration: number; interruptionGeneration: number };
+  private recoveryRunning = false;
+  private directoryChoiceDismissed = false;
+  private validatedDirectory?: string;
   readonly mobileLoginPreparation = new MobileLoginPreparation(async (signal, progress) => {
     const { MobileOAuth } = await import("./auth/oauth-mobile.js");
     if (signal.aborted) throw loginCancelledError();
@@ -138,8 +154,9 @@ export default class YunpanSyncPlugin extends Plugin {
     
     await this.persistence.save();
     const restoredCounts = this.persistence.database.taskCounts();
-    const restoredFailures = this.persistence.database.listFailedTasks();
+    const restoredFailures = this.persistence.database.listFailedTasks().filter(task => task.state === "failed");
     this.status = restoredStatus(this.auth, this.persistence.database.getLastSuccessfulSync(), restoredCounts, restoredFailures);
+    if (this.settings.paused) this.status = { ...this.status, phase: "paused", message: "同步已暂停", lastError: undefined };
     this.statusBar = this.addStatusBarItem();
     this.statusBar.addClass("yunpan-sync-status");
     this.statusBar.setAttr("aria-label", "打开 360AI 云盘同步状态");
@@ -160,12 +177,8 @@ export default class YunpanSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", (file) => this.onVaultEvent(file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => this.onVaultEvent(file.path)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.onVaultRename(oldPath, file.path)));
-    this.registerDomEvent(window, "offline", () => { interruptSyncForDisconnect(this.engine); this.updateStatus({ ...this.status, phase: "paused", message: "网络已断开，同步已暂停" }); });
-    this.registerDomEvent(window, "online", () => void resumeSyncAfterReconnect(
-      () => this.settings.paused || this.isMobileBackgrounded || this.settings.mode === "manual",
-      this.engine,
-      () => this.syncNow(false, false),
-    ));
+    this.registerDomEvent(window, "offline", () => this.handleDisconnect());
+    this.registerDomEvent(window, "online", () => void this.requestAutomaticResume());
     this.registerDomEvent(document, "visibilitychange", () => void this.handleVisibilityChange());
     await this.configureEngine();
     this.configureSchedule();
@@ -175,6 +188,7 @@ export default class YunpanSyncPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     this.unloading = true;
+    this.directoryModal?.close();
     this.taskPreview?.cancel();
     if (this.uiTimer) { clearTimeout(this.uiTimer); this.uiTimer = undefined; }
     this.settingTab?.hide();
@@ -185,6 +199,7 @@ export default class YunpanSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    if (this.settings.mode === "manual") this.recoveryRequest = undefined;
     await this.saveData(this.settings);
     this.configureSchedule();
     this.settingTab?.refresh();
@@ -197,7 +212,8 @@ export default class YunpanSyncPlugin extends Plugin {
   get profileLoading(): boolean { return this.accountProfileLoading; }
   get profileError(): string | undefined { return this.accountProfileError; }
   get isPaused(): boolean { return this.settings.paused; }
-  get isSyncing(): boolean { return this.removingFailure || (this.engine?.isRunning() ?? false); }
+  get remoteRootSelected(): boolean { return this.settings.remoteRootSelected === true; }
+  get isSyncing(): boolean { return this.removingFailure || (Boolean(this.syncStarting) && this.remoteRootSelected) || (this.engine?.isRunning() ?? false); }
   get transferProgress(): readonly FileTransferProgress[] { return this.transfers; }
   get conflicts(): readonly SyncConflict[] { return this.persistence?.database.listUnresolvedConflicts() ?? []; }
   get isMobileDevice(): boolean { return Platform.isMobileApp; }
@@ -324,11 +340,18 @@ export default class YunpanSyncPlugin extends Plugin {
       if (previousQid && previousQid !== auth.qid) {
         // The remote root belongs to the account, so never carry the previous
         // account's selected folder into a replacement login.
+        await settleForPause(true, this.engine);
+        if (this.persistence) await discardDownloads(this.app.vault.adapter, this.persistence.database, () => this.persistence!.save());
+        if (!current()) return;
+        this.rememberAccountDirectory();
         this.persistence?.database.resetSyncState();
         this.settings.remoteRoot = DEFAULT_SETTINGS.remoteRoot;
+        this.settings.remoteRootSelected = false;
         await this.saveSettings();
       }
       this.secrets.setAuth(auth);
+      this.restoreAccountDirectory();
+      await this.saveData(this.settings);
       this.mobileLoginPreparation.clear();
       
       this.expiredAuthQid = undefined;
@@ -359,12 +382,15 @@ export default class YunpanSyncPlugin extends Plugin {
 
   async logout(): Promise<void> {
     this.endLoginAttempt();
+    this.directoryModal?.close();
     this.taskPreview?.cancel();
     if (this.engine?.isRunning()) {
       this.engine.cancel();
       await this.engine.waitForIdle();
     }
+    if (this.persistence) await discardDownloads(this.app.vault.adapter, this.persistence.database, () => this.persistence!.save());
     this.unconfirmCurrentBinding();
+    this.rememberAccountDirectory();
     this.secrets.clearAuth();
     this.expiredAuthQid = undefined;
     this.accountProfile = undefined;
@@ -374,6 +400,8 @@ export default class YunpanSyncPlugin extends Plugin {
     // A selected remote folder is account-specific. Restore the safe default
     // on logout so the next login cannot inherit the previous account's path.
     this.settings.remoteRoot = DEFAULT_SETTINGS.remoteRoot;
+    this.settings.remoteRootSelected = false;
+    this.directoryChoiceDismissed = false;
     await this.saveSettings();
     this.persistence?.database.resetSyncState();
     await this.persistence?.save();
@@ -413,6 +441,8 @@ export default class YunpanSyncPlugin extends Plugin {
         waiter.resolve(auth);
       } else {
         this.secrets.setAuth(auth);
+        this.restoreAccountDirectory();
+        await this.saveData(this.settings);
         this.mobileLoginPreparation.clear();
         await this.configureEngine();
         if (!current()) return;
@@ -441,9 +471,14 @@ export default class YunpanSyncPlugin extends Plugin {
 
   async setRemoteRoot(value: string): Promise<void> {
     const root = normalizeRemoteRoot(value);
-    if (root === normalizeRemoteRoot(this.settings.remoteRoot)) return;
+    if (root === normalizeRemoteRoot(this.settings.remoteRoot) && this.settings.remoteRootSelected) return;
+    await settleForPause(true, this.engine);
+    if (this.persistence) await discardDownloads(this.app.vault.adapter, this.persistence.database, () => this.persistence!.save());
     this.persistence?.database.resetSyncState();
     this.settings.remoteRoot = root;
+    this.settings.remoteRootSelected = true;
+    this.directoryChoiceDismissed = false;
+    this.rememberAccountDirectory();
     await this.persistence?.save();
     await this.saveSettings();
     await this.configureEngine();
@@ -451,7 +486,22 @@ export default class YunpanSyncPlugin extends Plugin {
     this.scheduleInitialSync();
   }
 
-  async syncNow(rebuild = false, interactive = true): Promise<void> {
+  async syncNow(rebuild = false, interactive = true, live = false): Promise<void> {
+    if (this.syncStarting) return;
+    const start = {};
+    this.syncStarting = start;
+    this.syncRuns.add(start);
+    try { await this.startSync(rebuild, interactive, start, live); }
+    finally {
+      if (this.syncStarting === start) this.syncStarting = undefined;
+      this.syncRuns.delete(start);
+      if (interactive || live || this.status.phase === "error" || this.status.phase === "paused") this.scheduleUi(true);
+      void this.drainAutomaticResume();
+    }
+  }
+
+  private async startSync(rebuild: boolean, interactive: boolean, start: object, live = false): Promise<void> {
+    const interruptionGeneration = this.interruptionGeneration;
     if (this.unloading || this.isMobileBackgrounded || this.engine?.isRunning()) return;
     if (this.removingFailure) {
       if (interactive) new Notice("正在保存失败记录，请稍后同步");
@@ -468,34 +518,84 @@ export default class YunpanSyncPlugin extends Plugin {
       if (interactive) new Notice("同步已暂停，请先恢复同步");
       return;
     }
-    if (interactive && !this.engine.isRunning()) {
-      this.syncUiHidden = false;
-      this.updateStatus({ ...this.status, phase: "prepare", message: "准备同步", lastError: undefined });
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      this.updateStatus({ ...this.status, phase: "paused", message: "网络已断开，同步已暂停", lastError: undefined });
+      return;
+    }
+    if (!this.settings.remoteRootSelected) {
+      if (!interactive && this.directoryChoiceDismissed) return;
+      this.directoryChoice ??= this.chooseInitialDirectory().finally(() => { this.directoryChoice = undefined; });
+      if (!await this.directoryChoice || this.settings.paused || this.unloading || this.isMobileBackgrounded ||
+        interruptionGeneration !== this.interruptionGeneration) return;
+      // Another caller may have started while the chooser was open.
+      if (this.engine?.isRunning()) return;
+    }
+    const refreshInterruptedStatus = this.status.phase === "paused";
+    if ((interactive || live || refreshInterruptedStatus) && !this.engine.isRunning()) {
+      if (interactive) this.syncUiHidden = false;
+      this.updateStatus({ ...this.status, phase: "prepare", message: "正在准备同步…", lastError: undefined });
     }
     if (interactive) this.showSyncProgress();
+    this.backgroundSync = !(interactive || live);
+    const engine = this.engine;
+    const api = this.api;
+    const pauseGeneration = this.pauseGeneration;
+    const current = () => !this.unloading && !this.isMobileBackgrounded && !this.settings.paused &&
+      this.engine === engine && this.api === api && pauseGeneration === this.pauseGeneration &&
+      interruptionGeneration === this.interruptionGeneration &&
+      !(typeof navigator !== "undefined" && navigator.onLine === false);
     try {
-      const engine = this.engine;
+      const directoryKey = `${this.auth?.qid}:${this.settings.ownerQid}:${this.settings.remoteRoot}`;
+      if (this.api && this.validatedDirectory !== directoryKey) {
+        try {
+          await this.api.call("File.getList", { path: this.settings.remoteRoot, page: 1, page_size: 1 });
+          if (!current()) return;
+          this.validatedDirectory = directoryKey;
+        } catch (error) {
+          if (!current()) return;
+          if (!(error instanceof OpenApiError) || ![3008, 3009].includes(error.errno ?? 0)) throw error;
+          this.settings.remoteRootSelected = false;
+          const key = `${this.auth?.qid}:${this.settings.ownerQid}`;
+          delete this.settings.accountDirectories?.[key];
+          await this.saveData(this.settings);
+          this.updateStatus({ ...this.status, phase: "paused", message: "原云端目录已不存在，请重新选择同步目录", lastError: undefined });
+          this.directoryChoice ??= this.chooseInitialDirectory().finally(() => { this.directoryChoice = undefined; });
+          if (await this.directoryChoice) this.scheduleInitialSync();
+          return;
+        }
+      }
+      if (!current()) return;
       const initialConfirmation = engine.needsInitialConfirmation();
       if (initialConfirmation && !interactive && this.dismissedInitialConfirmations.has(engine)) {
         this.updateStatus({ ...this.status, phase: "paused", message: "等待首次同步确认" });
         return;
       }
+      // synchronize takes ownership synchronously; a later resume may start as
+      // soon as this engine becomes idle, even while this call saves its UI state.
+      if (this.syncStarting === start) this.syncStarting = undefined;
       await engine.synchronize(rebuild, initialConfirmation
         ? async (tasks) => {
-          if (this.unloading || this.isMobileBackgrounded || this.engine !== engine) return undefined;
+          if (!current()) return undefined;
           const selected = await this.confirmSyncTasks(tasks, true);
+          // Lifecycle interruptions close the preview too; only a user dismissal
+          // should suppress future automatic confirmation prompts.
+          if (!current()) return undefined;
           if (!selected || (tasks.length > 0 && selected.size === 0)) this.dismissedInitialConfirmations.add(engine);
           return selected;
         } : undefined);
+      if (!current()) return;
       await this.persistence?.save();
-      if (this.status.phase === "idle" && isSuccessfulSyncMessage(this.status.message)) {
+      if (refreshInterruptedStatus) this.scheduleUi(true);
+      if (interactive && this.status.phase === "idle" && isSuccessfulSyncMessage(this.status.message)) {
         this.displayedSyncWarnings.clear();
         this.lastRestrictionWarning = undefined;
         new Notice(completionNotice(this.status.message));
         if (this.conflicts.length > 0) new Notice(`检测到 ${this.conflicts.length} 个冲突，已保留双方文件`);
       }
     } catch (error) {
+      if (!current()) return;
       await this.persistence?.save();
+      this.validatedDirectory = undefined;
       if (error instanceof SyncPreflightError) {
         this.updateStatus({ ...this.status, phase: "error", message: error.message, lastError: error.message, restriction: error });
         const warningKey = `${this.auth?.qid ?? ""}:${error.kind}`;
@@ -509,8 +609,11 @@ export default class YunpanSyncPlugin extends Plugin {
       this.updateStatus({ ...this.status, phase: "error", message: guidance.title, lastError: guidance.detail });
       new Notice(`${guidance.title}: ${guidance.detail}`);
     } finally {
-      this.syncModal?.render();
-      this.refreshStatusViews();
+      if (interactive || live || !this.backgroundSync || this.status.phase === "error" || this.status.phase === "paused") {
+        this.syncModal?.render();
+        this.refreshStatusViews();
+      }
+      this.backgroundSync = false;
     }
   }
 
@@ -586,6 +689,9 @@ export default class YunpanSyncPlugin extends Plugin {
     this.removingFailure = true;
     let removed = false;
     try {
+      const state = this.persistence?.database.downloadStates().find(state => state.taskId === id);
+      if (state && this.persistence) await new DownloadCache(this.app.vault.adapter, this.persistence.database,
+        state.binding, id, () => this.persistence!.save()).clear();
       if (!this.engine.removeFailedTask(id)) {
         new Notice("该失败记录已不存在或不可删除");
         return;
@@ -604,6 +710,41 @@ export default class YunpanSyncPlugin extends Plugin {
     }
   }
 
+  async ignoreTask(id: string): Promise<void> {
+    if (this.isSyncing) { new Notice("同步进行中，请结束本轮同步后再忽略文件"); return; }
+    const persistence = this.persistence;
+    const engine = this.engine;
+    const task = persistence?.database.listFailedTasks().find(task => task.id === id && task.state === "failed");
+    if (!persistence || !engine || !task) { new Notice("该失败记录已不存在，请刷新后重试"); return; }
+    this.removingFailure = true;
+    let saved = false;
+    try {
+      const path = normalizeVaultPath(task.path);
+      const pattern = `/${path}`;
+      if (!path || pattern.length > 512) throw new Error("路径过长或无效，请在过滤规则中手动设置排除范围");
+      // Valid sync paths cannot contain glob wildcards. Anchor to the full vault
+      // path and append last so an earlier include rule cannot override this choice.
+      const rules = this.settings.filterRules.filter(rule => !(rule.id.startsWith("ignored-file:") &&
+        rule.pattern.toLocaleLowerCase("en-US") === pattern.toLocaleLowerCase("en-US")));
+      rules.push({ id: `ignored-file:${crypto.randomUUID()}`, enabled: true, action: "exclude", pattern, caseSensitive: false });
+      await this.saveData({ ...this.settings, filterRules: rules });
+      this.settings.filterRules = rules;
+      saved = true;
+      const state = persistence.database.downloadStates().find(state => state.taskId === id);
+      if (state) await new DownloadCache(this.app.vault.adapter, persistence.database,
+        state.binding, id, () => persistence.save()).clear();
+      engine.removeFailedTask(id);
+      await persistence.save();
+      new Notice(`已忽略 ${path}，后续不再上传或下载；可在“过滤规则”中删除或停用对应规则`);
+    } catch (error) {
+      new Notice(saved ? `忽略规则已保存，但清理失败记录失败：${messageOf(error)}` : `忽略文件失败：${messageOf(error)}`);
+    } finally {
+      this.removingFailure = false;
+      this.settingTab?.refresh();
+      this.scheduleUi(true);
+    }
+  }
+
   async resolveConflict(id: number): Promise<void> {
     if (this.persistence?.database.resolveConflict(id)) await this.persistence.save();
     this.refreshStatusViews();
@@ -611,20 +752,53 @@ export default class YunpanSyncPlugin extends Plugin {
   }
 
   async setPaused(paused: boolean): Promise<void> {
-    this.settings.paused = paused;
-    if (paused) this.taskPreview?.cancel();
-    await settleForPause(paused, this.engine);
-    await this.saveSettings();
-    this.updateStatus({ ...this.status, phase: paused ? "paused" : "idle", message: paused ? "同步已暂停" : "同步已恢复" });
+    const generation = ++this.pauseGeneration;
+    const stopping = paused && this.stoppingRequested;
+    if (paused) {
+      this.settings.paused = true;
+      this.syncStarting = undefined;
+      this.directoryModal?.close();
+      this.taskPreview?.cancel();
+      this.engine?.cancel();
+      this.updateStatus({ ...this.status, phase: "stopping", message: "正在停止同步…", lastError: undefined });
+    }
+    const transition = this.pauseTransition.catch(() => undefined).then(async () => {
+      if (paused) await this.saveData(this.settings);
+      await this.engine?.waitForIdle();
+      if (generation !== this.pauseGeneration || this.unloading) return;
+      this.settings.paused = paused;
+      await this.saveData(this.settings);
+      await this.persistence?.save();
+      this.configureSchedule();
+      this.stoppingRequested = false;
+      this.updateStatus({ ...this.status,
+        phase: paused ? "paused" : "prepare",
+        message: paused ? stopping ? "同步已停止" : "同步已暂停" : "正在准备同步…",
+        lastError: undefined });
+      this.settingTab?.refresh();
+    });
+    this.pauseTransition = transition;
+    await transition;
+    if (!paused && generation === this.pauseGeneration && !this.unloading) {
+      this.engine?.resumePendingRetries();
+      await this.syncNow(false, false, true);
+    }
   }
 
   cancelSync(): void {
-    this.taskPreview?.cancel();
-    this.engine?.cancel();
-    new Notice("将在当前文件安全结束后停止同步");
+    this.stoppingRequested = true;
+    void this.setPaused(true);
+    new Notice("正在停止同步…");
+  }
+
+  resumeSync(): void {
+    void this.setPaused(false);
   }
 
   showSyncProgress(): void {
+    // Explicitly opening progress opts the user into live updates for the
+    // current run, including one that started in the background.
+    this.backgroundSync = false;
     this.syncUiHidden = false;
     this.syncModal?.closeForTransition();
     this.syncModal = new SyncProgressModal(this);
@@ -633,8 +807,40 @@ export default class YunpanSyncPlugin extends Plugin {
 
   async chooseRemoteRoot(): Promise<void> {
     if (!this.api) { new Notice("请先登录 360AI 云盘"); return; }
-    const selected = await new RemoteDirectoryModal(this.app, this.api).choose();
-    if (selected) await this.setRemoteRoot(selected);
+    if (this.directoryModal) return;
+    const api = this.api;
+    const generation = this.loginGeneration;
+    const modal = new RemoteDirectoryModal(this.app, api);
+    this.directoryModal = modal;
+    try {
+      const selected = await modal.choose();
+      if (selected && !this.unloading && this.api === api && this.loginGeneration === generation) await this.setRemoteRoot(selected);
+    } finally {
+      if (this.directoryModal === modal) this.directoryModal = undefined;
+      this.scheduleUi(true);
+    }
+  }
+
+  private rememberAccountDirectory(): void {
+    if (!this.auth || !this.settings.remoteRootSelected) return;
+    this.settings.accountDirectories = { ...this.settings.accountDirectories,
+      [`${this.auth.qid}:${this.settings.ownerQid}`]: normalizeRemoteRoot(this.settings.remoteRoot) };
+  }
+
+  private restoreAccountDirectory(): void {
+    this.directoryChoiceDismissed = false;
+    const root = this.auth && this.settings.accountDirectories?.[`${this.auth.qid}:${this.settings.ownerQid}`];
+    if (root) {
+      this.settings.remoteRoot = normalizeRemoteRoot(root);
+      this.settings.remoteRootSelected = true;
+    }
+  }
+
+  private async chooseInitialDirectory(): Promise<boolean> {
+    this.updateStatus({ ...this.status, phase: "paused", message: "请先选择云端同步目录", lastError: undefined });
+    await this.chooseRemoteRoot();
+    this.directoryChoiceDismissed = !this.settings.remoteRootSelected;
+    return Boolean(this.settings.remoteRootSelected);
   }
 
   async setSyncObsidianConfig(enabled: boolean): Promise<void> {
@@ -728,7 +934,9 @@ export default class YunpanSyncPlugin extends Plugin {
   private async configureEngine(): Promise<void> {
     const auth = this.auth;
     if (!auth || !this.persistence) { this.api = undefined; this.engine = undefined; return; }
+    const scheduler = new RequestScheduler();
     const api = new OpenApiClient({
+      scheduler,
       baseUrl: this.settings.openapiBaseUrl,
       accessToken: () => this.secrets.getAuth()?.accessToken ?? "",
       qid: () => this.secrets.getAuth()?.qid ?? "",
@@ -745,15 +953,17 @@ export default class YunpanSyncPlugin extends Plugin {
       },
     });
     this.api = api;
-    const syncApi = api;
-    const makeStore = (url: string) => {
+    const syncApi = { call: <T>(method: import("./net/openapi-client.js").OpenApiMethod,
+      input: Record<string, string | number | boolean | null | undefined>) =>
+      api.call<T>(method, input, () => this.engine?.checkContinuing(), this.engine?.getCancellationSignal()) };
+    const makeStore = (url: string, signal?: AbortSignal) => {
       const current = this.secrets.getAuth();
       if (!current) throw new ReloginRequiredError("登录凭据已失效，请重新登录");
       return new StoreClient(url, { qid: current.qid, token: current.token }, {
         deviceId: this.settings.deviceId,
         deviceName: this.settings.deviceName,
         version: this.manifest.version,
-      });
+      }, scheduler, () => this.engine?.checkContinuing(), signal);
     };
     const ownerQid = () => this.settings.ownerQid;
     const checkpoint = () => this.persistence!.save();
@@ -782,6 +992,11 @@ export default class YunpanSyncPlugin extends Plugin {
           enterpriseTotalBytes: profile.enterpriseTotalBytes,
         };
       });
+    if (!this.settings.remoteRootSelected && !this.engine.needsInitialConfirmation()) {
+      this.settings.remoteRootSelected = true;
+    }
+    this.rememberAccountDirectory();
+    await this.saveData(this.settings);
   }
 
   private handleReloginRequired(error: unknown): boolean {
@@ -817,6 +1032,10 @@ export default class YunpanSyncPlugin extends Plugin {
       openPluginSettings(this.app as App & { setting: { open(): void; openTabById(id: string): void } }, this.manifest.id);
       return;
     }
+    if (this.auth && !this.remoteRootSelected) {
+      void this.chooseRemoteRoot();
+      return;
+    }
     void this.openStatusView();
   }
 
@@ -829,22 +1048,67 @@ export default class YunpanSyncPlugin extends Plugin {
   private scheduleInitialSync(): void {
     const engine = this.engine;
     if (this.unloading || this.isMobileBackgrounded || this.settings.paused || this.settings.mode !== "automatic" ||
-      !engine || engine.isRunning() || !engine.needsInitialConfirmation() || this.dismissedInitialConfirmations.has(engine)) return;
-    // Share the file-event debounce so startup events cannot queue a second
-    // initial scan while the first confirmation is being prepared.
-    this.lifecycle.debounce(DEBOUNCE_MS, () => void this.syncNow(false, false));
+      !engine || engine.isRunning() || this.directoryChoiceDismissed || this.dismissedInitialConfirmations.has(engine) ||
+      (!engine.needsInitialConfirmation() && !(this.persistence?.database.taskCounts().queued))) return;
+    // Keep startup detection responsive; file events use a longer debounce
+    // once the vault is already running.
+    this.lifecycle.debounce(INITIAL_SYNC_DELAY_MS, () => void this.syncNow(false, false));
+  }
+
+  private handleDisconnect(): void {
+    this.interruptionGeneration++;
+    this.recoveryRequest = undefined;
+    this.taskPreview?.cancel();
+    interruptSyncForDisconnect(this.engine);
+    if (!this.settings.paused) this.updateStatus({ ...this.status, phase: "paused",
+      message: "网络已断开，同步已暂停", lastError: undefined });
+  }
+
+  private canAutomaticallyResume(): boolean {
+    return !this.unloading && !this.settings.paused && !this.isMobileBackgrounded &&
+      this.settings.mode !== "manual" && !(typeof navigator !== "undefined" && navigator.onLine === false);
+  }
+
+  private async requestAutomaticResume(): Promise<void> {
+    const engine = this.engine;
+    if (!engine || !this.canAutomaticallyResume()) return;
+    // Keep the request until the entire old plugin call (including preflight
+    // and persistence) exits. Engine idle alone does not cover those stages.
+    if (!this.recoveryRequest || this.recoveryRequest.engine !== engine || this.recoveryRequest.api !== this.api ||
+      this.recoveryRequest.pauseGeneration !== this.pauseGeneration ||
+      this.recoveryRequest.interruptionGeneration !== this.interruptionGeneration) {
+      this.recoveryRequest = { engine, api: this.api, pauseGeneration: this.pauseGeneration,
+        interruptionGeneration: this.interruptionGeneration };
+    }
+    await this.drainAutomaticResume();
+  }
+
+  private async drainAutomaticResume(): Promise<void> {
+    const request = this.recoveryRequest;
+    if (!request || this.recoveryRunning || this.syncRuns.size > 0) return;
+    this.recoveryRunning = true;
+    try {
+      await resumeSyncAfterReconnect(() => this.recoveryRequest !== request || !this.canAutomaticallyResume() ||
+        this.engine !== request.engine || this.api !== request.api || this.pauseGeneration !== request.pauseGeneration ||
+        this.interruptionGeneration !== request.interruptionGeneration,
+      request.engine, () => this.syncNow(false, false));
+    } finally {
+      if (this.recoveryRequest === request) this.recoveryRequest = undefined;
+      this.recoveryRunning = false;
+      if (this.recoveryRequest) void this.drainAutomaticResume();
+    }
   }
 
   private async handleVisibilityChange(): Promise<void> {
     if (!this.isMobileDevice) return;
     this.configureSchedule();
     if (document.visibilityState === "hidden") {
+      this.interruptionGeneration++;
+      this.recoveryRequest = undefined;
       this.taskPreview?.cancel();
       await settleForPause(true, this.engine);
       await this.persistence?.save();
-    } else await resumeSyncAfterReconnect(() => this.unloading || this.settings.paused ||
-      this.isMobileBackgrounded || this.settings.mode === "manual", this.engine,
-      () => this.syncNow(false, false));
+    } else await this.requestAutomaticResume();
   }
 
   private onVaultEvent(path: string): void {
@@ -861,23 +1125,28 @@ export default class YunpanSyncPlugin extends Plugin {
   }
 
   private scheduleDebouncedSync(): void {
-    this.lifecycle.debounce(DEBOUNCE_MS, () => void this.syncNow(false, false));
+    this.lifecycle.debounce(FILE_EVENT_DEBOUNCE_MS, () => void this.syncNow(false, false));
   }
 
   private updateStatus(status: EngineStatus): void {
     this.status = status;
+    const silentBackgroundProgress = this.backgroundSync && status.phase !== "error" && status.phase !== "paused" && status.phase !== "stopping";
+    if (silentBackgroundProgress) {
+      this.displayedSyncWarnings = new Set(status.warnings ?? []);
+      return;
+    }
     for (const warning of status.warnings ?? []) {
       if (!this.displayedSyncWarnings.has(warning)) new Notice(warning);
     }
     this.displayedSyncWarnings = new Set(status.warnings ?? []);
-    this.scheduleUi(["idle", "error", "paused"].includes(status.phase));
+    this.scheduleUi(["idle", "error", "paused", "stopping"].includes(status.phase));
   }
 
   
 
   private updateTransfers(transfers: FileTransferProgress[]): void {
     this.transfers = transfers;
-    this.scheduleUi();
+    if (!this.backgroundSync) this.scheduleUi();
   }
 
   private scheduleUi(immediate = false): void {
@@ -905,9 +1174,10 @@ export default class YunpanSyncPlugin extends Plugin {
       return;
     }
     const queue = this.status.queued ? ` · 队列 ${this.status.queued}` : "";
-    const { percent } = overallTransferProgress(this.transfers, this.status);
+    const { percent, operationTotal, operationCompleted } = overallTransferProgress(this.transfers, this.status);
     const transfer = percent === undefined ? "" : ` · 总进度 ${percent}%`;
-    this.statusBar.setText(`360AI云盘: ${this.status.message}${queue}${transfer}`);
+    const operations = operationTotal > 0 ? ` · 已完成 ${operationCompleted} / ${operationTotal} 项` : "";
+    this.statusBar.setText(`360AI云盘: ${this.status.message}${queue}${transfer}${operations}`);
     this.statusBar.toggleClass("yunpan-sync-error", this.status.phase === "error");
   }
 
@@ -935,6 +1205,7 @@ export default class YunpanSyncPlugin extends Plugin {
 
   private async resetSyncScope(message: string): Promise<void> {
     this.unconfirmCurrentBinding();
+    if (this.persistence) await discardDownloads(this.app.vault.adapter, this.persistence.database, () => this.persistence!.save());
     this.persistence?.database.resetSyncState();
     await this.persistence?.save();
     await this.saveSettings();
@@ -1137,7 +1408,7 @@ class YunpanSyncSettingTab extends PluginSettingTab {
     const status = this.owner.currentStatus;
     const summary = summarizeTransfers(this.owner.transferProgress);
     const last = status.lastSuccess ? new Date(status.lastSuccess).toLocaleString() : "尚未完成同步";
-    const completed = status.completed ?? summary.completedCount;
+    const completed = status.operationCompleted ?? status.completed ?? summary.completedCount;
     const readableError = status.lastError
       ? classifySyncError(status.lastError).detail
       : undefined;

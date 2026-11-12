@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm, open, stat, readFile, writeFile, rename, access } from "node:fs/promises";
+import { mkdtemp, rm, open, stat, readFile, writeFile, rename, access, mkdir, readdir, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Platform } from "obsidian";
 import { hashSource, cloudFileHashes, CloudHashAccumulator, CLOUD_BLOCK_SIZE } from "../src/transfer/hashes.js";
 import { openDesktopSource, openDesktopSink, type BinarySource } from "../src/transfer/file-io.js";
 import { DownloadMachine } from "../src/transfer/download.js";
+import { DownloadCache } from "../src/transfer/download-cache.js";
 import { UploadMachine } from "../src/transfer/upload.js";
 import { SyncEngine } from "../src/sync/engine.js";
 import { SyncDatabase } from "../src/storage/database.js";
@@ -18,7 +19,7 @@ async function fixture() {
   directories.push(root);
   const adapter = {
     getBasePath: () => root,
-    readBinary: vi.fn(async (path: string) => (await readFile(join(root, path))).buffer),
+    readBinary: vi.fn(async (path: string) => new Uint8Array(await readFile(join(root, path))).buffer),
     writeBinary: vi.fn(async (path: string, bytes: ArrayBuffer) => writeFile(join(root, path), new Uint8Array(bytes))),
     exists: async (path: string) => { try { await access(join(root, path)); return true; } catch { return false; } },
     stat: async (path: string) => {
@@ -27,6 +28,13 @@ async function fixture() {
     },
     rename: async (source: string, destination: string) => rename(join(root, source), join(root, destination)),
     remove: async (path: string) => rm(join(root, path)),
+    mkdir: async (path: string) => { await mkdir(join(root, path)); },
+    rmdir: async (path: string) => rmdir(join(root, path)),
+    list: async (path: string) => {
+      const entries = await readdir(join(root, path), { withFileTypes: true });
+      return { files: entries.filter(entry => entry.isFile()).map(entry => `${path}/${entry.name}`),
+        folders: entries.filter(entry => entry.isDirectory()).map(entry => `${path}/${entry.name}`) };
+    },
   };
   return { root, adapter };
 }
@@ -38,6 +46,37 @@ afterEach(async () => {
 });
 
 describe("bounded desktop file IO", () => {
+  it("repairs cache type mismatches on disk and handles EISDIR from nonrecursive directory removal", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { root, adapter } = await fixture();
+    const SQL = await initSqlJs({ locateFile: () => "node_modules/sql.js/dist/sql-wasm.wasm" });
+    const database = new SyncDatabase(new SQL.Database());
+    await writeFile(join(root, ".yunpan-sync"), "stale");
+    const cache = new DownloadCache(adapter as never, database, "account", "task", async () => {});
+    await cache.prepare("identity");
+    await cache.write(0, new Uint8Array([1]));
+    const [name] = await readdir(join(root, ".yunpan-sync/downloads"));
+    const directory = `.yunpan-sync/downloads/${name}`;
+    await rm(join(root, `${directory}/0.part`));
+    await mkdir(join(root, `${directory}/0.part`));
+    await writeFile(join(root, `${directory}/0.part/stale`), "stale");
+    // A fresh cache represents the next download attempt after an interruption.
+    const restarted = new DownloadCache(adapter as never, database, "account", "task", async () => {});
+    await restarted.prepare("identity");
+    expect(await restarted.read(0)).toBeUndefined();
+    await restarted.write(0, new Uint8Array([2]));
+    expect(await restarted.read(0)).toEqual(new Uint8Array([2]));
+    const removeDirectory = adapter.rmdir;
+    vi.spyOn(adapter, "rmdir").mockImplementation(async (path, recursive?: boolean) => {
+      if (!recursive) throw new Error("Path is a directory: rm returned EISDIR (is a directory)");
+      return removeDirectory(path);
+    });
+    await restarted.clear();
+    expect(await readdir(join(root, ".yunpan-sync/downloads"))).toEqual([]);
+    expect(database.downloadStates()).toEqual([]);
+    database.close();
+  });
+
   it("hashes and uploads a sparse file over 500 MiB with reads limited to 512 KiB", async () => {
     const { root, adapter } = await fixture();
     const size = 501 * 1024 * 1024 + 13;
@@ -114,7 +153,7 @@ describe("bounded desktop file IO", () => {
     expect(written).toBe(size);
     expect(requests).toBe(Math.ceil(size / (1024 * 1024)));
     expect(maxRetained).toBeLessThanOrEqual(1024 * 1024);
-    expect(adapter.writeBinary).not.toHaveBeenCalled();
+    expect(adapter.writeBinary.mock.calls.every(([path]) => path.startsWith(".yunpan-sync/downloads/"))).toBe(true);
   }, 60_000);
 
   it("matches the original cloud hash across unaligned network chunks and empty files", async () => {
@@ -197,7 +236,7 @@ describe("bounded desktop file IO", () => {
     expect(await readFile(join(root, "note.md"), "utf8")).toBe("# Downloaded\n");
     expect((await adapter.stat("note.md"))!.mtime).toBe(remote.mtime * 1000);
     expect(database.getBase("note.md")).toMatchObject(remote);
-    expect(adapter.writeBinary).not.toHaveBeenCalled();
+    expect(adapter.writeBinary.mock.calls.every(([path]) => path.startsWith(".yunpan-sync/downloads/") && path.endsWith(".part"))).toBe(true);
     database.close();
   });
 

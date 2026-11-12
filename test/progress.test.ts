@@ -57,6 +57,17 @@ describe("per-file transfer progress", () => {
       failedCount: 0,
     });
   });
+
+  it("reports preparation progress for concurrent transfers", () => {
+    const tracker = new TransferProgressTracker();
+    tracker.queue("one", "upload", "one.bin", 100); tracker.queue("two", "upload", "two.bin", 200);
+    tracker.start("one"); tracker.start("two");
+    tracker.updatePreparing("one", 50, 100); tracker.updatePreparing("two", 80, 200);
+    expect(tracker.snapshot().map(item => [item.completedBytes, item.phase])).toEqual([[50, "preparing"], [80, "preparing"]]);
+    expect(transferPresentation(tracker.snapshot()[1]!)).toMatchObject({ label: "准备中", percent: 40 });
+    tracker.update("two", 100, 200);
+    expect(tracker.snapshot()[1]).toMatchObject({ completedBytes: 100 });
+  });
 });
 
 describe("whole-run progress presentation", () => {
@@ -83,10 +94,24 @@ describe("whole-run progress presentation", () => {
 
   it("uses completed file counts for all-empty files and leaves unknown totals indeterminate", () => {
     expect(overallTransferProgress([], { phase: "local-scan", message: "扫描本地" }).percent).toBeUndefined();
-    expect(overallTransferProgress([], { phase: "idle", message: "已是最新" }).percent).toBe(100);
+    expect(overallTransferProgress([], { phase: "idle", message: "已是最新" }).percent).toBeUndefined();
     const items = [transfer("one", "completed", 0, 0), transfer("two", "queued", 0, 0)];
     expect(overallTransferProgress(items, running).percent).toBe(50);
     expect(overallTransferProgress([items[1]!], running).percent).toBe(0);
+  });
+
+  it("uses synchronization-item counts for structural-only work", () => {
+    expect(overallTransferProgress([], { ...running, operationTotal: 3, operationCompleted: 1 }))
+      .toMatchObject({ percent: 33, operationTotal: 3, operationCompleted: 1 });
+    expect(overallTransferProgress([], { phase: "idle", message: "同步完成", operationTotal: 3, operationCompleted: 3 }))
+      .toMatchObject({ percent: 100, operationTotal: 3, operationCompleted: 3 });
+    expect(overallTransferProgress([], { ...running, operationTotal: 3, operationCompleted: 1 }).summary.totalBytes).toBe(0);
+  });
+
+  it("combines operation and byte progress for mixed work", () => {
+    const item = transfer("upload", "transferring", 50, 100);
+    expect(overallTransferProgress([item], { ...running, operationTotal: 3, operationCompleted: 1 }))
+      .toMatchObject({ percent: 33, operationTotal: 3, operationCompleted: 1, summary: { completedBytes: 50, totalBytes: 100 } });
   });
 
   it("keeps stable state groups and searches completed and unfinished files together", () => {

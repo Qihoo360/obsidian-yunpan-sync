@@ -5,6 +5,18 @@ interface FailedRecordOwner {
   removeFailedTask(id: string): Promise<void>;
 }
 
+export function renderIgnoreFileAction(container: HTMLElement, id: string,
+  owner: { isSyncing: boolean; ignoreTask(id: string): Promise<void> }): void {
+  const ignore = container.createEl("button", { text: "忽略此文件",
+    attr: { title: "以后不再上传或下载此路径，保留两端文件；可在过滤规则中取消忽略" } });
+  ignore.disabled = owner.isSyncing;
+  ignore.addEventListener("click", () => {
+    if (owner.isSyncing || ignore.disabled) return;
+    ignore.disabled = true;
+    void owner.ignoreTask(id).finally(() => { ignore.disabled = owner.isSyncing; });
+  });
+}
+
 /** Capture the displayed records so a status refresh cannot change the targets. */
 export function renderFailedRecordAction(container: HTMLElement, tasks: readonly SyncTask[], owner: FailedRecordOwner): void {
   if (!tasks.length) return;

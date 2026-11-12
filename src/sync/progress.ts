@@ -2,6 +2,7 @@ import { isSuccessfulSyncMessage } from "./outcome.js";
 
 export type TransferDirection = "upload" | "download";
 export type TransferState = "queued" | "transferring" | "completed" | "failed";
+export type TransferPhase = "preparing" | "transferring" | "verifying";
 
 export interface FileTransferProgress {
   id: string;
@@ -10,6 +11,7 @@ export interface FileTransferProgress {
   completedBytes: number;
   totalBytes: number;
   state: TransferState;
+  phase?: TransferPhase;
   error?: string;
 }
 
@@ -45,11 +47,24 @@ export function summarizeTransfers(transfers: readonly FileTransferProgress[]): 
 }
 
 /** One display value for the whole run; byte delivery alone does not finish a sync. */
-export function overallTransferProgress(transfers: readonly FileTransferProgress[], status: { phase: string; message: string }):
-  { summary: TransferSummary; percent: number | undefined } {
+export function overallTransferProgress(transfers: readonly FileTransferProgress[], status: {
+  phase: string; message: string; operationTotal?: number; operationCompleted?: number;
+}): { summary: TransferSummary; percent: number | undefined; operationTotal: number; operationCompleted: number } {
   const summary = summarizeTransfers(transfers);
+  const hasOperationProgress = typeof status.operationTotal === "number";
+  const operationTotal = hasOperationProgress ? Math.max(0, status.operationTotal ?? 0) : transfers.length;
+  const operationCompleted = hasOperationProgress
+    ? Math.min(operationTotal, Math.max(0, status.operationCompleted ?? 0))
+    : summary.completedCount;
+  if (hasOperationProgress) {
+    if (operationTotal === 0) return { summary, percent: undefined, operationTotal, operationCompleted };
+    const completed = status.phase === "idle" && isSuccessfulSyncMessage(status.message) && operationCompleted >= operationTotal;
+    return { summary, percent: completed ? 100 : Math.min(99, Math.round(operationCompleted / operationTotal * 100)), operationTotal, operationCompleted };
+  }
+  if (transfers.length === 0) return { summary, percent: undefined, operationTotal, operationCompleted };
   const completed = status.phase === "idle" && isSuccessfulSyncMessage(status.message) && summary.completedCount === transfers.length;
-  return { summary, percent: completed ? 100 : transfers.length ? Math.min(99, summary.percent) : undefined };
+  return { summary, percent: completed ? 100 : transfers.length ? Math.min(99, summary.percent) : undefined,
+    operationTotal, operationCompleted };
 }
 
 export function transferPresentation(transfer: FileTransferProgress): { percent: number; label: string; icon: string } {
@@ -57,7 +72,9 @@ export function transferPresentation(transfer: FileTransferProgress): { percent:
     : Math.min(99, Math.max(0, Math.round(transfer.completedBytes / transfer.totalBytes * 100)));
   const labels: Record<TransferState, string> = { queued: "等待中", transferring: "同步中", failed: "失败", completed: "已完成" };
   const icons: Record<TransferState, string> = { queued: "clock", transferring: "refresh-cw", failed: "circle-alert", completed: "circle-check" };
-  return { percent, label: labels[transfer.state], icon: icons[transfer.state] };
+  const label = transfer.state === "transferring" && transfer.phase === "preparing" ? "准备中"
+    : transfer.state === "transferring" && transfer.phase === "verifying" ? "校验中" : labels[transfer.state];
+  return { percent, label, icon: icons[transfer.state] };
 }
 
 /** Stable linear partition: active files stay above queued/failed files and finished history. */
@@ -82,10 +99,18 @@ export class TransferProgressTracker {
 
   start(id: string): void { this.change(id, (item) => ({ ...item, state: "transferring", error: undefined })); }
 
+  updatePreparing(id: string, completedBytes: number, totalBytes: number): void {
+    this.change(id, (item) => ({ ...item, completedBytes: Math.min(Math.max(0, completedBytes), Math.max(0, totalBytes)),
+      totalBytes: Math.max(0, totalBytes), state: "transferring", phase: "preparing", error: undefined }));
+  }
+
+  stage(id: string, phase: TransferPhase): void { this.change(id, item => ({ ...item, phase, error: undefined })); }
+
   update(id: string, completedBytes: number, totalBytes: number): void {
     this.change(id, (item) => {
       const total = Math.max(0, totalBytes);
-      return { ...item, completedBytes: Math.min(Math.max(0, completedBytes), total), totalBytes: total,
+      const { phase: _phase, ...withoutPhase } = item;
+      return { ...withoutPhase, completedBytes: Math.min(Math.max(0, completedBytes), total), totalBytes: total,
         state: "transferring", error: undefined };
     });
   }
@@ -95,6 +120,7 @@ export class TransferProgressTracker {
   }
 
   fail(id: string, error: string): void { this.change(id, (item) => ({ ...item, state: "failed", error })); }
+  suspend(id: string): void { this.change(id, item => ({ ...item, state: "queued", error: undefined })); }
   remove(id: string): void { this.items.delete(id); }
   reset(): void { this.items.clear(); }
   snapshot(): FileTransferProgress[] { return [...this.items.values()].map((item) => ({ ...item })); }

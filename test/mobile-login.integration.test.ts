@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { FileTransferProgress } from "../src/sync/progress.js";
 
 class ElementStub {
   className = "";
   src = "";
   type = "";
+  value = "";
   min = "";
   max = "";
   textContent = "";
@@ -82,6 +84,7 @@ const harness = vi.hoisted(() => ({
   vaultOn: vi.fn(),
   secrets: new Map<string, string>(),
   protocolHandler: undefined as ((params: Record<string, string>) => void) | undefined,
+  domEvents: [] as { target: object; type: string; callback: () => unknown }[],
 }));
 const rows: { name: string; nameEl: ElementStub; descEl: ElementStub; settingEl: ElementStub; controlEl: ElementStub; buttons: ControlStub[]; controls: ControlStub[] }[] = [];
 const tabs: { display(): void; refresh(): void; hide(): void; isVisible: boolean; containerEl: ElementStub }[] = [];
@@ -108,6 +111,7 @@ vi.mock("obsidian", async (importOriginal) => ({
     modalEl = new ElementStub();
     contentEl = new ElementStub();
     open() { harness.modalOpen(); (this as unknown as { onOpen(): void }).onOpen(); }
+    close() { (this as unknown as { onClose(): void }).onClose(); }
   },
   PluginSettingTab: class { containerEl = new ElementStub(); },
   Setting: class {
@@ -157,9 +161,10 @@ vi.mock("obsidian", async (importOriginal) => ({
     addRibbonIcon() {}
     addCommand() {}
     registerEvent() {}
-    registerDomEvent() {}
+    registerDomEvent(target: object, type: string, callback: () => unknown) { harness.domEvents.push({ target, type, callback }); }
   },
 }));
+vi.mock("../src/ui/modal-viewport.js", () => ({ trackModalViewport: () => () => {} }));
 
 vi.mock("../src/storage/persistence.js", () => ({
   DatabasePersistence: {
@@ -170,6 +175,8 @@ vi.mock("../src/storage/persistence.js", () => ({
         recoverInterruptedTasks() {}, taskCounts: () => ({ queued: 0, failed: 0 }),
         listFailedTasks: () => [], getLastSuccessfulSync: () => undefined,
         isBindingConfirmed: () => true,
+        downloadStates: () => [],
+        resetSyncState: vi.fn(), unconfirmBinding: vi.fn(),
       },
     }); },
   },
@@ -191,8 +198,11 @@ import YunpanSyncPlugin from "../src/main.js";
 import { DEFAULT_SETTINGS } from "../src/settings.js";
 import { AUTH_SECRET_ID, LEGACY_AUTH_SECRET_ID, MOBILE_PENDING_OAUTH_SECRET_ID } from "../src/auth/secrets.js";
 import { SyncPreflightError } from "../src/sync/quota.js";
-import { SyncEngine } from "../src/sync/engine.js";
+import { SyncEngine, type EngineStatus, type ConfirmSyncTasks } from "../src/sync/engine.js";
+import { SyncTaskPreviewModal } from "../src/ui/sync-modal.js";
 import { normalizeAccountProfile } from "../src/account/profile.js";
+import { RemoteDirectoryModal } from "../src/ui/remote-directory-modal.js";
+import { discardDownloads } from "../src/transfer/download-cache.js";
 
 async function loadPlugin() {
   const plugin = new YunpanSyncPlugin({} as never, {} as never);
@@ -216,6 +226,7 @@ describe("login settings and installation lifecycle", () => {
     harness.persisted = { ...DEFAULT_SETTINGS, mode: "manual" };
     harness.apiVersion = "1.11.4";
     harness.protocolHandler = undefined;
+    harness.domEvents = [];
     vi.stubGlobal("window", { open: harness.open, setInterval: (...args: Parameters<typeof setInterval>) => setInterval(...args),
       clearInterval: (...args: Parameters<typeof clearInterval>) => clearInterval(...args),
       setTimeout: (...args: Parameters<typeof setTimeout>) => setTimeout(...args),
@@ -228,6 +239,381 @@ describe("login settings and installation lifecycle", () => {
   const storedAuth = () => ({ accessToken: "saved-access", qid: "42", token: "saved-token",
     expiresAt: Date.now() + 3_600_000, oauthCode: "saved-code" });
 
+  const settleEvents = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
+  const fireNetwork = (online: boolean) => {
+    Object.assign(navigator, { onLine: online });
+    for (const event of harness.domEvents) if (event.target === window && event.type === (online ? "online" : "offline")) event.callback();
+  };
+  const fireVisibility = (hidden: boolean) => {
+    Object.assign(document, { visibilityState: hidden ? "hidden" : "visible" });
+    for (const event of harness.domEvents) if (event.target === document && event.type === "visibilitychange") event.callback();
+  };
+  const recoveryPlugin = async (mode: "automatic" | "scheduled" | "manual" = "automatic") => {
+    const plugin = await loadPlugin();
+    plugin.settings.mode = mode;
+    plugin.settings.remoteRootSelected = true;
+    const engine = { isRunning: vi.fn(() => false), cancel: vi.fn(), waitForIdle: vi.fn(async () => {}),
+      resumePendingRetries: vi.fn(() => 1), needsInitialConfirmation: vi.fn(() => false),
+      synchronize: vi.fn(async (_rebuild?: boolean, _confirm?: ConfirmSyncTasks) => true), consumeSuppression: vi.fn(() => false) };
+    Object.assign(plugin, { engine });
+    return { plugin, engine };
+  };
+
+  it.each([
+    { mode: "automatic", mobile: false }, { mode: "scheduled", mobile: false },
+    { mode: "automatic", mobile: true }, { mode: "scheduled", mobile: true },
+  ] as const)("resumes $mode after reconnect and keeps later scheduling active (mobile=$mobile)", async ({ mode, mobile }) => {
+    vi.useFakeTimers();
+    harness.platform.isMobileApp = mobile;
+    const { plugin, engine } = await recoveryPlugin(mode);
+    const renderStatus = vi.spyOn(plugin as unknown as { renderStatus(): void }, "renderStatus");
+    engine.synchronize.mockImplementation(async () => {
+      (plugin as unknown as { updateStatus(status: EngineStatus): void }).updateStatus({ phase: "idle", message: "同步完成", queued: 0, failed: 0 });
+      return true;
+    });
+    await plugin.saveSettings();
+    fireNetwork(false);
+    expect(plugin.isPaused).toBe(false);
+    expect(plugin.currentStatus.message).toContain("网络已断开");
+    fireNetwork(true); fireNetwork(true);
+    await settleEvents();
+    expect(engine.resumePendingRetries).toHaveBeenCalledOnce();
+    expect(engine.synchronize).toHaveBeenCalledOnce();
+    expect(plugin.currentStatus).toMatchObject({ phase: "idle", message: "同步完成" });
+    expect((plugin as unknown as { statusBar: ElementStub }).statusBar.textContent).toContain("同步完成");
+    expect(renderStatus).toHaveBeenCalled();
+    expect((harness.persisted as typeof DEFAULT_SETTINGS).paused).toBe(false);
+    const interval = mode === "automatic" ? 180_000 : plugin.settings.intervalMinutes * 60_000;
+    await vi.advanceTimersByTimeAsync(interval);
+    expect(engine.synchronize).toHaveBeenCalledTimes(2);
+    if (mode === "automatic") {
+      const listener = harness.vaultOn.mock.calls.find(([event]) => event === "modify")![1] as (file: { path: string }) => void;
+      listener({ path: "changed.md" });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(engine.synchronize).toHaveBeenCalledTimes(3);
+    }
+    await plugin.onunload();
+  });
+
+  it.each(["manual", "paused"] as const)("does not resume %s synchronization on reconnect", async state => {
+    const { plugin, engine } = await recoveryPlugin(state === "manual" ? "manual" : "automatic");
+    if (state === "paused") await plugin.setPaused(true);
+    fireNetwork(false); fireNetwork(true);
+    await settleEvents();
+    expect(engine.resumePendingRetries).not.toHaveBeenCalled();
+    expect(engine.synchronize).not.toHaveBeenCalled();
+    if (state === "paused") expect(plugin.currentStatus.message).toBe("同步已暂停");
+    await plugin.onunload();
+  });
+
+  it("retains reconnect requests until interrupted directory preflight exits", async () => {
+    const { plugin, engine } = await recoveryPlugin();
+    let release!: () => void;
+    const preflight = new Promise<void>(resolve => { release = resolve; });
+    const api = { call: vi.fn().mockReturnValueOnce(preflight).mockResolvedValue({}) };
+    Object.assign(plugin, { api });
+    const first = plugin.syncNow(false, false);
+    fireNetwork(false); fireNetwork(true); fireNetwork(true);
+    await settleEvents();
+    expect(engine.synchronize).not.toHaveBeenCalled();
+    release(); await first; await settleEvents();
+    expect(api.call).toHaveBeenCalledTimes(2);
+    expect(engine.resumePendingRetries).toHaveBeenCalledOnce();
+    expect(engine.synchronize).toHaveBeenCalledOnce();
+    await plugin.onunload();
+  });
+
+  it("waits for the plugin's old persistence step even after the engine is idle", async () => {
+    const { plugin, engine } = await recoveryPlugin();
+    let saving!: () => void;
+    let release!: () => void;
+    const startedSaving = new Promise<void>(resolve => { saving = resolve; });
+    const saved = new Promise<void>(resolve => { release = resolve; });
+    harness.save.mockImplementationOnce(async () => { saving(); await saved; });
+    const first = plugin.syncNow(false, false);
+    await startedSaving;
+    fireNetwork(false); fireNetwork(true);
+    await settleEvents();
+    expect(engine.resumePendingRetries).not.toHaveBeenCalled();
+    expect(engine.synchronize).toHaveBeenCalledOnce();
+    release(); await first; await settleEvents();
+    expect(engine.resumePendingRetries).toHaveBeenCalledOnce();
+    expect(engine.synchronize).toHaveBeenCalledTimes(2);
+    await plugin.onunload();
+  });
+
+  it.each(["pause", "manual", "account", "unload", "offline"] as const)("invalidates pending recovery after %s", async action => {
+    const { plugin, engine } = await recoveryPlugin();
+    let release!: () => void;
+    const preflight = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(plugin, { api: { call: vi.fn(() => preflight) } });
+    const first = plugin.syncNow(false, false);
+    fireNetwork(false); fireNetwork(true);
+    if (action === "pause") await plugin.setPaused(true);
+    if (action === "manual") { plugin.settings.mode = "manual"; await plugin.saveSettings(); }
+    if (action === "account") Object.assign(plugin, { engine: { ...engine }, api: {} });
+    if (action === "unload") await plugin.onunload();
+    if (action === "offline") fireNetwork(false);
+    release(); await first; await settleEvents();
+    expect(engine.resumePendingRetries).not.toHaveBeenCalled();
+    expect(engine.synchronize).not.toHaveBeenCalled();
+    if (action !== "unload") await plugin.onunload();
+  });
+
+  it("waits for the interrupted engine and merges repeated foreground and online events", async () => {
+    const { plugin, engine } = await recoveryPlugin();
+    let release!: () => void;
+    const idle = new Promise<void>(resolve => { release = resolve; });
+    engine.isRunning.mockReturnValue(true);
+    engine.waitForIdle.mockReturnValue(idle);
+    fireNetwork(false); fireNetwork(true); fireNetwork(true); fireVisibility(false);
+    await settleEvents();
+    expect(engine.cancel).toHaveBeenCalledOnce();
+    expect(engine.synchronize).not.toHaveBeenCalled();
+    engine.isRunning.mockReturnValue(false); release(); await settleEvents();
+    expect(engine.resumePendingRetries).toHaveBeenCalledOnce();
+    expect(engine.synchronize).toHaveBeenCalledOnce();
+    await plugin.onunload();
+  });
+
+  it("handles a second disconnect while recovery is waiting without reviving the old request", async () => {
+    const { plugin, engine } = await recoveryPlugin();
+    let release!: () => void;
+    const idle = new Promise<void>(resolve => { release = resolve; });
+    engine.isRunning.mockReturnValue(true);
+    engine.waitForIdle.mockReturnValue(idle);
+    fireNetwork(false); fireNetwork(true); fireNetwork(false); fireNetwork(true);
+    engine.isRunning.mockReturnValue(false); release(); await settleEvents();
+    expect(engine.resumePendingRetries).toHaveBeenCalledOnce();
+    expect(engine.synchronize).toHaveBeenCalledOnce();
+    await plugin.onunload();
+  });
+
+  it("defers mobile reconnection until the foreground and still checks network availability", async () => {
+    const { plugin, engine } = await recoveryPlugin();
+    fireVisibility(true); fireNetwork(false); fireNetwork(true);
+    await settleEvents();
+    expect(engine.synchronize).not.toHaveBeenCalled();
+    fireNetwork(false); fireVisibility(false); await settleEvents();
+    expect(engine.synchronize).not.toHaveBeenCalled();
+    fireNetwork(true); await settleEvents();
+    expect(engine.synchronize).toHaveBeenCalledOnce();
+    await plugin.onunload();
+  });
+
+  it.each(["offline", "background"] as const)("reopens the initial preview after %s but honors a later user dismissal", async interruption => {
+    const { plugin, engine } = await recoveryPlugin();
+    engine.needsInitialConfirmation.mockReturnValue(true);
+    engine.synchronize.mockImplementation(async (_rebuild, confirm) => { await confirm?.([]); return false; });
+    vi.spyOn(plugin, "showSyncProgress").mockImplementation(() => {});
+    const preview = () => (plugin as unknown as { taskPreview?: SyncTaskPreviewModal }).taskPreview;
+    const first = plugin.syncNow(false, false);
+    await settleEvents();
+    expect(preview()).toBeInstanceOf(SyncTaskPreviewModal);
+    if (interruption === "offline") { fireNetwork(false); fireNetwork(true); }
+    else { fireVisibility(true); fireVisibility(false); }
+    await first; await settleEvents();
+    expect(engine.synchronize).toHaveBeenCalledTimes(2);
+    expect(preview()).toBeInstanceOf(SyncTaskPreviewModal);
+    // Closing the newly opened preview is a real user dismissal.
+    preview()!.close(); await settleEvents();
+    fireNetwork(false); fireNetwork(true); await settleEvents();
+    expect(engine.synchronize).toHaveBeenCalledTimes(2);
+    expect(plugin.currentStatus.message).toBe("等待首次同步确认");
+    await plugin.onunload();
+  });
+
+  it("invalidates recovery when explicitly paused while waiting for engine idle", async () => {
+    const { plugin, engine } = await recoveryPlugin();
+    let release!: () => void;
+    const idle = new Promise<void>(resolve => { release = resolve; });
+    engine.isRunning.mockReturnValue(true);
+    engine.waitForIdle.mockReturnValue(idle);
+    fireNetwork(false); fireNetwork(true);
+    const pause = plugin.setPaused(true);
+    engine.isRunning.mockReturnValue(false); release(); await pause; await settleEvents();
+    expect(engine.resumePendingRetries).not.toHaveBeenCalled();
+    expect(engine.synchronize).not.toHaveBeenCalled();
+    await plugin.onunload();
+  });
+
+  it("persists stop across reloads and resumes pending work only after an explicit action", async () => {
+    const plugin = await loadPlugin();
+    const engine = { isRunning: () => false, cancel: vi.fn(), waitForIdle: vi.fn(async () => {}), resumePendingRetries: vi.fn() };
+    Object.assign(plugin, { engine });
+    const sync = vi.spyOn(plugin, "syncNow").mockResolvedValue();
+    await plugin.setPaused(true);
+    expect((harness.persisted as typeof DEFAULT_SETTINGS).paused).toBe(true);
+    expect(plugin.currentStatus.message).toBe("同步已暂停");
+    expect(sync).not.toHaveBeenCalled();
+    await plugin.setPaused(false);
+    expect(engine.waitForIdle).toHaveBeenCalled();
+    expect(engine.resumePendingRetries).toHaveBeenCalledOnce();
+    expect(sync).toHaveBeenCalledExactlyOnceWith(false, false, true);
+    await plugin.setPaused(true);
+    await plugin.onunload();
+    const restored = await loadPlugin();
+    expect(restored.isPaused).toBe(true);
+    expect(restored.currentStatus.phase).toBe("paused");
+    await restored.onunload();
+  });
+
+  it("serializes rapid pause/resume and waits for the previous run", async () => {
+    const plugin = await loadPlugin();
+    let release!: () => void;
+    const idle = new Promise<void>(resolve => { release = resolve; });
+    let running = true;
+    const engine = { isRunning: () => running, cancel: vi.fn(), waitForIdle: () => idle, resumePendingRetries: vi.fn() };
+    Object.assign(plugin, { engine });
+    const sync = vi.spyOn(plugin, "syncNow").mockResolvedValue();
+    const paused = plugin.setPaused(true);
+    const resumed = plugin.setPaused(false);
+    await Promise.resolve();
+    expect(sync).not.toHaveBeenCalled();
+    expect(plugin.isPaused).toBe(true);
+    running = false; release();
+    await Promise.all([paused, resumed]);
+    expect(plugin.isPaused).toBe(false);
+    expect(engine.cancel).toHaveBeenCalledOnce();
+    expect(sync).toHaveBeenCalledOnce();
+    await plugin.onunload();
+  });
+
+  it("requires a directory before initial scanning and remembers chooser cancellation", async () => {
+    const plugin = await loadPlugin();
+    const synchronize = vi.fn(async () => true);
+    Object.assign(plugin, { engine: { synchronize, isRunning: () => false, needsInitialConfirmation: () => false } });
+    plugin.settings.remoteRootSelected = false;
+    const choose = vi.spyOn(plugin, "chooseRemoteRoot").mockResolvedValue();
+    await plugin.syncNow(false, false);
+    await plugin.syncNow(false, false);
+    expect(choose).toHaveBeenCalledOnce();
+    expect(synchronize).not.toHaveBeenCalled();
+    choose.mockImplementation(async () => { plugin.settings.remoteRootSelected = true; });
+    vi.spyOn(plugin, "showSyncProgress").mockImplementation(() => {});
+    await plugin.syncNow();
+    expect(choose).toHaveBeenCalledTimes(2);
+    expect(synchronize).toHaveBeenCalledOnce();
+    await plugin.onunload();
+  });
+
+  it("guards duplicate starts and prevents a stopped directory check from launching a run", async () => {
+    const plugin = await loadPlugin();
+    plugin.settings.remoteRootSelected = true;
+    let release!: () => void;
+    const checking = new Promise<void>(resolve => { release = resolve; });
+    const api = { call: vi.fn().mockReturnValueOnce(checking).mockResolvedValue({}) };
+    const engine = { synchronize: vi.fn(async () => true), isRunning: () => false,
+      needsInitialConfirmation: () => false, cancel: vi.fn(), waitForIdle: vi.fn(async () => {}), resumePendingRetries: vi.fn() };
+    Object.assign(plugin, { engine, api });
+    const first = plugin.syncNow(false, false);
+    await plugin.syncNow(false, false);
+    expect(api.call).toHaveBeenCalledOnce();
+    expect(plugin.isSyncing).toBe(true);
+    await plugin.setPaused(true);
+    expect(engine.synchronize).not.toHaveBeenCalled();
+    await plugin.setPaused(false);
+    expect(engine.synchronize).toHaveBeenCalledOnce();
+    expect(api.call).toHaveBeenCalledTimes(2);
+    release(); await first;
+    expect(engine.synchronize).toHaveBeenCalledOnce();
+    await plugin.onunload();
+  });
+
+  it("reopens the real directory chooser from the status bar after first-login dismissal", async () => {
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
+    const plugin = await loadPlugin();
+    plugin.settings.remoteRootSelected = false;
+    const api = { call: vi.fn().mockResolvedValue({ node_list: [], has_next_page: false }) };
+    const synchronize = vi.fn();
+    Object.assign(plugin, { api, engine: { isRunning: () => false, synchronize } });
+    const opened: RemoteDirectoryModal[] = [];
+    const choose = RemoteDirectoryModal.prototype.choose;
+    vi.spyOn(RemoteDirectoryModal.prototype, "choose").mockImplementation(function (this: RemoteDirectoryModal) {
+      opened.push(this); return choose.call(this);
+    });
+    const initial = plugin.syncNow(false, false);
+    expect(opened).toHaveLength(1);
+    expect(plugin.isSyncing).toBe(false);
+    opened[0]!.close();
+    await initial;
+    expect(plugin.isSyncing).toBe(false);
+    const clickStatus = () => (plugin as unknown as { handleStatusBarClick(): void }).handleStatusBarClick();
+    clickStatus();
+    expect(opened).toHaveLength(2);
+    // Repeated clicks keep one picker, and closing it releases the next open.
+    clickStatus(); expect(opened).toHaveLength(2);
+    opened[1]!.close();
+    await Promise.resolve();
+    clickStatus(); expect(opened).toHaveLength(3);
+    opened[2]!.close();
+    await Promise.resolve();
+    expect(synchronize).not.toHaveBeenCalled();
+    await plugin.onunload();
+  });
+
+  it("treats choosing the default path as a real selection and caches accounts independently", async () => {
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
+    const plugin = await loadPlugin();
+    plugin.settings.remoteRootSelected = false;
+    await plugin.setRemoteRoot("/Obsidian/");
+    expect(plugin.settings.remoteRootSelected).toBe(true);
+    await plugin.setRemoteRoot("/folderA/");
+    await plugin.logout();
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify({ ...storedAuth(), qid: "43" }));
+    await plugin.setRemoteRoot("/folderB/");
+    await plugin.logout();
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
+    (plugin as unknown as { restoreAccountDirectory(): void }).restoreAccountDirectory();
+    expect(plugin.settings.remoteRoot).toBe("/folderA/");
+    expect(plugin.settings.accountDirectories).toEqual({ "42:0": "/folderA/", "43:0": "/folderB/" });
+    await plugin.onunload();
+  });
+
+  it.each(["stat", "list", "remove", "rmdir"])("keeps logout and directory selection working when cache %s fails", async failure => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
+    const plugin = await loadPlugin();
+    const persistence = (plugin as unknown as { persistence: { database: {
+      downloadStates(): { taskId: string; binding: string; identity: string }[];
+      resetSyncState(): void;
+    } } }).persistence;
+    vi.spyOn(persistence.database, "downloadStates").mockReturnValue([{ taskId: "interrupted", binding: "42:old-root", identity: "old-file" }]);
+    const error = new Error("Path is a directory: rm returned EISDIR /private/.yunpan-sync/downloads/cache");
+    Object.assign(plugin.app.vault.adapter, {
+      stat: vi.fn(async () => { if (failure === "stat") throw error; return { type: "folder" }; }),
+      list: vi.fn(async (path: string) => {
+        if (failure === "list") throw error;
+        return { files: failure === "remove" ? [`${path}/0.part`] : [], folders: [] };
+      }),
+      remove: vi.fn(async () => { throw error; }),
+      rmdir: vi.fn(async () => { throw error; }),
+    });
+    // A generated block is a file; all other generated paths are folders.
+    if (failure === "remove") vi.spyOn(plugin.app.vault.adapter, "stat").mockImplementation(async path =>
+      ({ type: path.endsWith(".part") ? "file" : "folder", size: 0, ctime: 0, mtime: 0 }));
+    const engine = { isRunning: () => true, cancel: vi.fn(), waitForIdle: vi.fn(async () => {}) };
+    Object.assign(plugin, { engine, status: { phase: "error", message: "同步缓存异常", queued: 0, failed: 0 } });
+    harness.notice.mockClear();
+
+    await expect(plugin.setRemoteRoot("/Recovered/")).resolves.toBeUndefined();
+    expect(engine.cancel).toHaveBeenCalledOnce();
+    expect(engine.waitForIdle).toHaveBeenCalledOnce();
+    expect(plugin.settings).toMatchObject({ remoteRoot: "/Recovered/", remoteRootSelected: true });
+    expect(harness.persisted).toMatchObject({ remoteRoot: "/Recovered/", remoteRootSelected: true });
+    expect(plugin.currentStatus.phase).toBe("idle");
+
+    await expect(plugin.logout()).resolves.toBeUndefined();
+    expect(plugin.auth).toBeUndefined();
+    expect(harness.secrets.get(AUTH_SECRET_ID)).toBe("");
+    expect(plugin.settings.remoteRootSelected).toBe(false);
+    expect(plugin.currentStatus).toMatchObject({ phase: "idle", message: "未登录" });
+    expect(persistence.database.resetSyncState).toHaveBeenCalledTimes(2);
+    expect(warning).toHaveBeenCalled();
+    expect(harness.notice).not.toHaveBeenCalled();
+    await plugin.onunload();
+  });
+
   it("deletes the displayed failed task from the settings error summary", async () => {
     harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
     const plugin = await loadPlugin();
@@ -237,7 +623,7 @@ describe("login settings and installation lifecycle", () => {
     const remove = vi.spyOn(plugin, "removeFailedTask").mockResolvedValue(undefined);
     tabs.at(-1)!.refresh();
     const status = rows.filter(row => row.name === "同步状态").at(-1)!;
-    expect(status.descEl.textContent).toContain("具体原因：ENOENT: missing");
+    expect(status.descEl.textContent).toContain("同步请求未成功，请稍后重试。");
     expect(status.descEl.textContent).not.toContain("具体原因：具体原因：");
     const action = status.descEl.all().find(el => el.classes.has("yunpan-sync-status-error-action"))!;
     action.fire("click");
@@ -377,7 +763,8 @@ describe("login settings and installation lifecycle", () => {
   it.each([false, true])("starts initial detection without a click in automatic mode (mobile=%s)", async mobile => {
     vi.useFakeTimers();
     harness.platform.isMobileApp = mobile;
-    harness.persisted = { ...DEFAULT_SETTINGS, mode: "automatic" };
+    harness.persisted = { ...DEFAULT_SETTINGS, mode: "automatic", remoteRootSelected: true };
+    harness.request.mockResolvedValue({ status: 200, json: { errno: 0, data: {} } });
     harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
     vi.spyOn(YunpanSyncPlugin.prototype, "refreshAccountProfile").mockResolvedValue();
     vi.spyOn(SyncEngine.prototype, "needsInitialConfirmation").mockReturnValue(true);
@@ -392,6 +779,7 @@ describe("login settings and installation lifecycle", () => {
 
   it("offers initial confirmation on an automatic trigger, suppresses repeats after cancel, and allows manual retry", async () => {
     const plugin = await loadPlugin();
+    plugin.settings.remoteRootSelected = true;
     const confirm = vi.spyOn(plugin as unknown as { confirmSyncTasks(): Promise<undefined> }, "confirmSyncTasks")
       .mockResolvedValue(undefined);
     vi.spyOn(plugin, "showSyncProgress").mockImplementation(() => {});
@@ -406,6 +794,133 @@ describe("login settings and installation lifecycle", () => {
     expect(plugin.currentStatus.message).toBe("等待首次同步确认");
     await plugin.syncNow();
     expect(confirm).toHaveBeenCalledTimes(2);
+    await plugin.onunload();
+  });
+
+  it("keeps background synchronization quiet while preserving errors", async () => {
+    const plugin = await loadPlugin();
+    plugin.settings.remoteRootSelected = true;
+    const updateStatus = (status: EngineStatus) =>
+      (plugin as unknown as { updateStatus(value: EngineStatus): void }).updateStatus(status);
+    const renderStatus = vi.spyOn(plugin as unknown as { renderStatus(): void }, "renderStatus");
+    const synchronize = vi.fn(async () => {
+      updateStatus({ phase: "remote-index", message: "正在获取云端文件信息…（已读取 87 项）", queued: 0, failed: 0 });
+      updateStatus({ phase: "idle", message: "同步完成", queued: 0, failed: 0 });
+    });
+    Object.assign(plugin, { api: undefined, engine: { synchronize, isRunning: () => false, needsInitialConfirmation: () => false } });
+    harness.notice.mockClear(); renderStatus.mockClear();
+
+    await plugin.syncNow(false, false);
+
+    expect(harness.notice).not.toHaveBeenCalledWith("360AI 云盘同步完成");
+    expect(renderStatus).not.toHaveBeenCalled();
+    expect(plugin.currentStatus).toMatchObject({ phase: "idle", message: "同步完成" });
+
+    synchronize.mockRejectedValueOnce(new Error("network timeout"));
+    await plugin.syncNow(false, false);
+    expect(harness.notice).toHaveBeenCalledWith("网络连接异常: 网络连接异常，请检查网络后重试。");
+    expect(plugin.currentStatus).toMatchObject({ phase: "error", message: "网络连接异常" });
+    await plugin.onunload();
+  });
+
+  it("keeps resumed synchronization visible while it reports status and transfer progress", async () => {
+    vi.useFakeTimers();
+    const plugin = await loadPlugin();
+    plugin.settings.remoteRootSelected = true;
+    const updateStatus = (status: EngineStatus) =>
+      (plugin as unknown as { updateStatus(value: EngineStatus): void }).updateStatus(status);
+    const updateTransfers = (transfers: FileTransferProgress[]) =>
+      (plugin as unknown as { updateTransfers(value: FileTransferProgress[]): void }).updateTransfers(transfers);
+    const renderStatus = vi.spyOn(plugin as unknown as { renderStatus(): void }, "renderStatus");
+    const refreshViews = vi.spyOn(plugin as unknown as { refreshStatusViews(): void }, "refreshStatusViews");
+    const showProgress = vi.spyOn(plugin, "showSyncProgress");
+    const modal = { render: vi.fn() };
+    const statusBar = (plugin as unknown as { statusBar: ElementStub }).statusBar;
+    let running = false;
+    let started!: () => void;
+    let finish!: () => void;
+    const start = new Promise<void>(resolve => { started = resolve; });
+    const done = new Promise<void>(resolve => { finish = resolve; });
+    const transfer = { id: "download", path: "book.mobi", direction: "download" as const,
+      state: "transferring" as const, completedBytes: 50, totalBytes: 100 };
+    const synchronize = vi.fn(async () => {
+      expect(plugin.currentStatus).toMatchObject({ phase: "prepare", message: "正在准备同步…" });
+      running = true;
+      updateStatus({ phase: "remote-index", message: "正在获取云端文件信息…（已读取 10 项）", queued: 1, failed: 0 });
+      started();
+      await done;
+      running = false;
+    });
+    Object.assign(plugin, { api: undefined, engine: {
+      synchronize, isRunning: () => running, needsInitialConfirmation: () => false,
+      cancel: vi.fn(), waitForIdle: vi.fn(async () => {}), resumePendingRetries: vi.fn(),
+    } });
+
+    await plugin.setPaused(true);
+    Object.assign(plugin, { syncModal: modal });
+    const resuming = plugin.setPaused(false);
+    await start;
+    renderStatus.mockClear(); refreshViews.mockClear(); modal.render.mockClear();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(statusBar.textContent).toContain("已读取 10 项");
+
+    updateStatus({ phase: "transfer", message: "正在执行同步任务", queued: 1, failed: 0 });
+    updateTransfers([transfer]);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(statusBar.textContent).toContain("总进度 50%");
+    expect(plugin.isSyncing).toBe(true);
+    expect(modal.render).toHaveBeenCalled();
+    expect(refreshViews).toHaveBeenCalled();
+
+    updateTransfers([{ ...transfer, state: "completed", completedBytes: 100 }]);
+    updateStatus({ phase: "idle", message: "同步完成", queued: 0, failed: 0 });
+    finish();
+    await resuming;
+
+    expect(synchronize).toHaveBeenCalledOnce();
+    expect(renderStatus).toHaveBeenCalled();
+    expect(statusBar.textContent).toContain("总进度 100%");
+    expect(showProgress).not.toHaveBeenCalled();
+    expect(plugin.currentStatus).toMatchObject({ phase: "idle", message: "同步完成", queued: 0 });
+    await plugin.onunload();
+  });
+
+  it("keeps completion feedback for an explicitly requested synchronization", async () => {
+    const plugin = await loadPlugin();
+    plugin.settings.remoteRootSelected = true;
+    const synchronize = vi.fn(async () => {
+      Object.assign(plugin as unknown as { status: object }, { status: { phase: "idle", message: "同步完成", queued: 0, failed: 0 } });
+    });
+    Object.assign(plugin, { api: undefined, engine: { synchronize, isRunning: () => false, needsInitialConfirmation: () => false } });
+    harness.notice.mockClear();
+
+    await plugin.syncNow();
+
+    expect(harness.notice).toHaveBeenCalledWith("360AI 云盘同步完成");
+    await plugin.onunload();
+  });
+
+  it.each([false, true])("does not report deferred cache cleanup as a sync error (interactive=%s)", async interactive => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const plugin = await loadPlugin();
+    plugin.settings.remoteRootSelected = true;
+    vi.spyOn(plugin, "conflicts", "get").mockReturnValue([]);
+    const persistence = (plugin as unknown as { persistence: { database: {
+      downloadStates(): { taskId: string; binding: string; identity: string }[];
+    }; save(): Promise<void> } }).persistence;
+    vi.spyOn(persistence.database, "downloadStates").mockReturnValue([{ taskId: "done", binding: "account", identity: "file" }]);
+    Object.assign(plugin.app.vault.adapter, { stat: async () => { throw new Error("EISDIR /private/.yunpan-sync/downloads/cache"); } });
+    const synchronize = vi.fn(async () => {
+      await discardDownloads(plugin.app.vault.adapter, persistence.database as never, () => persistence.save());
+      (plugin as unknown as { updateStatus(status: EngineStatus): void }).updateStatus({ phase: "idle", message: "同步完成", queued: 0, failed: 0 });
+      return true;
+    });
+    Object.assign(plugin, { api: undefined, engine: { synchronize, isRunning: () => false, needsInitialConfirmation: () => false } });
+    vi.spyOn(plugin, "showSyncProgress").mockImplementation(() => {});
+    harness.notice.mockClear();
+    await plugin.syncNow(false, interactive);
+    expect(plugin.currentStatus).toMatchObject({ phase: "idle", message: "同步完成", failed: 0 });
+    expect(harness.notice.mock.calls.map(call => call[0])).toEqual(interactive ? ["360AI 云盘同步完成"] : []);
     await plugin.onunload();
   });
 
@@ -455,6 +970,7 @@ describe("login settings and installation lifecycle", () => {
   it.each([true, false])("updates repeated automatic restrictions quietly and opens payment only on action (mobile=%s)", async mobile => {
     harness.platform.isMobileApp = mobile;
     const plugin = await loadPlugin();
+    plugin.settings.remoteRootSelected = true;
     const synchronize = vi.fn(async () => { throw new SyncPreflightError("capacity", "套餐容量不足，剩余 1 B，本次同步预计新增占用 2 B。", 1, 2); });
     Object.assign(plugin, { engine: { synchronize, needsInitialConfirmation: () => false, isRunning: () => false } });
     harness.notice.mockClear();
@@ -506,7 +1022,7 @@ describe("login settings and installation lifecycle", () => {
     await plugin.onunload();
   });
 
-  it("keeps local file change debounce at 1.5 seconds and suppresses it in the mobile background", async () => {
+  it("waits 10 seconds after local edits before automatic synchronization and suppresses it in the mobile background", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("window", { open: harness.open, setInterval, clearInterval, setTimeout, clearTimeout });
     const doc = { visibilityState: "visible" };
@@ -518,14 +1034,14 @@ describe("login settings and installation lifecycle", () => {
     onModify({ path: "note.md" });
     await vi.advanceTimersByTimeAsync(1000);
     onModify({ path: "note.md" });
-    await vi.advanceTimersByTimeAsync(1499);
+    await vi.advanceTimersByTimeAsync(9999);
     expect(sync).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(sync).toHaveBeenCalledExactlyOnceWith(false, false);
     sync.mockClear();
     doc.visibilityState = "hidden";
     onModify({ path: "note.md" });
-    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(sync).not.toHaveBeenCalled();
     await plugin.onunload();
     expect(vi.getTimerCount()).toBe(0);

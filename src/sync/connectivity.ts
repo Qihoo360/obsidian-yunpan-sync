@@ -9,12 +9,12 @@ export interface ReconnectableSyncEngine {
 
 export interface InterruptibleSyncEngine {
   isRunning(): boolean;
-  cancel(): void;
+  cancel(message?: string): void;
 }
 
 export function interruptSyncForDisconnect(engine: InterruptibleSyncEngine | undefined): boolean {
   if (!engine?.isRunning()) return false;
-  engine.cancel();
+  engine.cancel("网络已断开，同步已暂停");
   return true;
 }
 

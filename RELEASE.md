@@ -2,6 +2,21 @@
 
 仓库：[Qihoo360/obsidian-yunpan-sync](https://github.com/Qihoo360/obsidian-yunpan-sync)
 
+## 1.0.8 — 同步恢复与结构操作进度修复 / Sync recovery and structural progress fixes
+
+- 自动与低频自动同步在联网恢复后立即继续；合并重复恢复事件，等待旧运行和目录预检退出，避免恢复请求丢失。断网或切后台关闭首次确认不再被当成用户取消；用户主动暂停继续保持有效，移动端回前台后恢复。
+- 失败文件增加“忽略此文件”，持久保存完整路径排除规则，后续不再上传或下载；过滤规则中可取消忽略。“删除记录”仅清理失败记录。
+- 停止会持久暂停，恢复等待旧运行退出后继续；断网、后台和重启保留待处理任务，不再把关机中断当成文件失败。
+- 上传、下载共享 5 个文件槽位，父目录成功后才执行子任务；重试等待可停止，限流使用共享冷却和退避。
+- 下载保留已校验分块，重新获取凭据并补传缺失数据；绑定变化清理对应插件缓存。
+- 首次扫描前明确选择目录，按当前笔记库内的账号及云空间缓存；目录失效时重新选择。
+- 隔离非法名称目录，保留受影响子树索引和基线，避免误删；中文错误保留服务端错误码与追踪编号。
+- 同步准备阶段统一展示正在执行的阶段和已读取数量，准备阶段不再显示估算百分比。
+- 修复停止同步响应慢、恢复同步无进度的问题；停止请求可取消网络读写，恢复后继续使用原有队列和断点。
+- 删除、重命名、移动和新建目录等结构操作纳入统一同步项进度，弹窗、侧边栏和状态栏显示“已完成 X / Y 项”；纯结构操作不再显示 `0B / 0B`。
+
+验证范围及待执行的 Obsidian 实机项目见 [同步恢复验证记录](docs/sync-recovery-verification.md)。历史版本的实机结论不代表本次改动已经完成实机验收。
+
 ## 1.0.7 — 同步性能、文件策略与会员状态修复 / Sync performance, file policy and membership fixes
 
 - 首次同步按绑定目录分页检查，分批让出主线程并细化云端请求、本地扫描、任务生成、传输、校验和保存阶段，减少大量节点导致的 Obsidian 卡顿。
@@ -88,17 +103,17 @@ Desktop、Android 和 iOS 真实设备验收均已通过，记录见本文末尾
 ```bash
 npm ci --ignore-scripts
 npm run verify
-npm run check:release -- --tag=1.0.7
+npm run check:release -- --tag=1.0.8
 ```
 
 `npm run verify` 包含公开内容检查、测试和生产构建，成功后会生成 `main.js`。
 
 完成下方发布检查后，将本版本提交推送至仓库默认分支，再打开 [创建 GitHub Release](https://github.com/Qihoo360/obsidian-yunpan-sync/releases/new)：
 
-1. 选择包含本次版本修改的提交，创建标签 `1.0.7`，不要添加 `v` 前缀。
-2. Release 标题填写 `1.0.7`，说明使用上方版本说明，并保留实际验证状态和已知限制。
+1. 选择包含本次版本修改的提交，创建标签 `1.0.8`，不要添加 `v` 前缀。
+2. Release 标题填写 `1.0.8`，说明使用上方版本说明，并保留实际验证状态和已知限制。
 3. 将构建自同一提交的 `main.js`、`manifest.json`、`styles.css` 作为独立附件上传，同时附上 `LICENSE` 和 `THIRD_PARTY_NOTICES.md`。
-4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.7`，附件齐全后发布 Release。
+4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.8`，附件齐全后发布 Release。
 
 Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安装文件，只有源码或自动生成的源码压缩包不能替代上述附件。
 
@@ -108,7 +123,7 @@ Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安�
 2. 在真实 Obsidian Desktop、Android 和 iOS 上分别验收生产账号授权、首次任务确认、双向增删改、冲突、断网恢复和退出登录。模拟测试只验证受控协议；未验证平台不得宣称通过。
 3. 首次使用前备份 Vault。生产迁移会清除旧环境登录态与同步基线，并要求重新登录和确认目录，不删除笔记。
 4. 确认版本更新记录、已知限制和[隐私说明](PRIVACY.md)与本次行为相符，并检查仓库和服务链接可用。
-5. 构建后执行 `npm run check:release -- --tag=1.0.7`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
+5. 构建后执行 `npm run check:release -- --tag=1.0.8`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
 6. GitHub Release 上传 `main.js`、`manifest.json`、`styles.css`，同时提供 [LICENSE](LICENSE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。不上传用户设置、数据库、Token 或构建缓存。
 
 ## 隐私与许可 / Privacy and licensing

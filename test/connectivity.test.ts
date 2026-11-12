@@ -8,6 +8,7 @@ describe("online synchronization recovery", () => {
     expect(interruptSyncForDisconnect(engine)).toBe(true);
 
     expect(engine.cancel).toHaveBeenCalledOnce();
+    expect(engine.cancel).toHaveBeenCalledWith("网络已断开，同步已暂停");
   });
 
   it("does nothing on disconnect when synchronization is idle", () => {

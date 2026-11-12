@@ -8,6 +8,7 @@ import { cloudFileHashes } from "../src/transfer/hashes.js";
 import type { SyncQuota } from "../src/sync/quota.js";
 import { DownloadMachine } from "../src/transfer/download.js";
 import { OpenApiError } from "../src/net/openapi-client.js";
+import { interruptSyncForDisconnect, resumeSyncAfterReconnect } from "../src/sync/connectivity.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -29,6 +30,7 @@ class MemoryVault {
     writeBinary(path: string, data: ArrayBuffer, options?: { mtime?: number }): Promise<void>;
     rename(source: string, destination: string): Promise<void>;
     remove(path: string): Promise<void>;
+    rmdir(path: string, recursive: boolean): Promise<void>;
     trashLocal(path: string): Promise<void>;
     mkdir(path: string): Promise<void>;
     list(path: string): Promise<{ files: string[]; folders: string[] }>;
@@ -59,6 +61,10 @@ class MemoryVault {
         this.renamePath(source, destination);
       },
       remove: async (path) => { this.removePath(path); },
+      rmdir: async (path, recursive) => {
+        if (!recursive && [...this.entries.keys()].some(entry => entry.startsWith(`${path}/`))) throw new Error("Directory not empty");
+        this.removePath(path);
+      },
       trashLocal: async (path) => { this.removePath(path); },
       mkdir: async (path) => { this.entries.set(path, { kind: "directory" }); },
       list: async (path) => {
@@ -264,7 +270,8 @@ async function harness(paused = false): Promise<{ vault: MemoryVault; cloud: Mem
   const statuses: import("../src/sync/engine.js").EngineStatus[] = [];
   const settings = { ...DEFAULT_SETTINGS, paused, remoteRoot: "/Obsidian/", ownerQid: "42" };
   const engine = new SyncEngine(vault as never, db, cloud.api as never, cloud.uploader as never, cloud.downloader as never,
-    () => settings, "42:vault", (status) => statuses.push(status), undefined, undefined, async () => cloud.quota);
+    () => settings, "42:vault", (status) => statuses.push(status), undefined, undefined, async () => cloud.quota,
+    { maxAttempts: 1, retryDelay: () => 0 });
   return { vault, cloud, engine, db, settings, statuses };
 }
 
@@ -273,6 +280,217 @@ async function synchronize(engine: SyncEngine): Promise<void> {
 }
 
 describe("complete in-memory two-way synchronization", () => {
+  it("reports structural operations as completed synchronization items", async () => {
+    const { vault, cloud, engine, statuses } = await harness();
+    vault.putFile("note.md", "base");
+    await cloud.putFile("/Obsidian/note.md", "base");
+    await synchronize(engine);
+
+    await vault.rename(vault.getFileByPath("note.md")!, "renamed.md");
+    engine.recordRename("note.md", "renamed.md");
+    await synchronize(engine);
+    expect(statuses.at(-1)).toMatchObject({ phase: "idle", operationTotal: 1, operationCompleted: 1 });
+    expect(cloud.text("/Obsidian/renamed.md")).toBe("base");
+
+    vault.delete("renamed.md");
+    await synchronize(engine);
+    expect(statuses.at(-1)).toMatchObject({ phase: "idle", operationTotal: 1, operationCompleted: 1 });
+    expect(cloud.entries.has("/Obsidian/renamed.md")).toBe(false);
+  });
+
+  it.each(["upload", "download"] as const)("preserves interrupted %s tasks without pausing automatic mode", async direction => {
+    const { vault, cloud, engine, db, settings, statuses } = await harness();
+    vault.putFile("done.md", "already synchronized");
+    await synchronize(engine);
+    for (let i = 0; i < 8; i++) {
+      if (direction === "upload") vault.putFile(`pending${i}.md`, `contents ${i}`);
+      else await cloud.putFile(`/Obsidian/pending${i}.md`, `contents ${i}`);
+    }
+    const upload = vi.spyOn(cloud.uploader, "upload");
+    const download = vi.spyOn(cloud.downloader, "download");
+    const disconnect = async () => {
+      interruptSyncForDisconnect(engine);
+      throw new Error("request aborted");
+    };
+    if (direction === "upload") upload.mockImplementationOnce(disconnect);
+    else download.mockImplementationOnce(disconnect);
+    expect(await engine.synchronize()).toBe(false);
+    expect(settings.paused).toBe(false);
+    expect(statuses.at(-1)).toMatchObject({ phase: "paused", message: "网络已断开，同步已暂停", failed: 0 });
+    expect(db.listPendingTasks().length).toBeGreaterThan(0);
+    expect(db.listPendingTasks().every(task => task.state === "queued" && task.attempt === 0)).toBe(true);
+    await resumeSyncAfterReconnect(() => settings.paused, engine, () => synchronize(engine));
+    expect(db.taskCounts()).toEqual({ queued: 0, failed: 0 });
+    for (let i = 0; i < 8; i++) {
+      expect(direction === "upload" ? cloud.text(`/Obsidian/pending${i}.md`) : vault.text(`pending${i}.md`)).toBe(`contents ${i}`);
+    }
+    expect(upload.mock.calls.some(([input]) => input.path.endsWith("/done.md"))).toBe(false);
+    expect(download.mock.calls.some(([input]) => input.path.endsWith("/done.md"))).toBe(false);
+  });
+
+  it("treats an aborted metadata request after disconnect as an interruption rather than a failure", async () => {
+    const { vault, cloud, engine, db, statuses } = await harness();
+    await synchronize(engine);
+    vault.putFile("offline.md", "resume metadata");
+    vi.spyOn(cloud.api, "call").mockImplementationOnce(async () => {
+      interruptSyncForDisconnect(engine);
+      throw new Error("request aborted");
+    });
+    await expect(engine.synchronize()).resolves.toBe(false);
+    expect(statuses.at(-1)).toMatchObject({ phase: "paused", message: "网络已断开，同步已暂停", failed: 0, lastError: undefined });
+    await resumeSyncAfterReconnect(() => false, engine, () => synchronize(engine));
+    expect(cloud.text("/Obsidian/offline.md")).toBe("resume metadata");
+    expect(db.taskCounts()).toEqual({ queued: 0, failed: 0 });
+  });
+
+  it("releases delayed retries on reconnect without spending attempts while disconnected", async () => {
+    const { vault, cloud, db, settings, statuses } = await harness();
+    vault.putFile("retry.md", "pending retry");
+    let interrupt = true;
+    const engine = new SyncEngine(vault as never, db, cloud.api as never, cloud.uploader as never, cloud.downloader as never,
+      () => settings, "42:vault", status => {
+        statuses.push(status);
+        if (interrupt && status.phase === "retry-wait") { interrupt = false; interruptSyncForDisconnect(engine); }
+      }, undefined, undefined, async () => cloud.quota, { retryDelay: () => 60_000 });
+    const upload = vi.spyOn(cloud.uploader, "upload").mockRejectedValueOnce(new Error("network timeout"));
+    await synchronize(engine);
+    expect(upload).toHaveBeenCalledOnce();
+    expect(db.listPendingTasks()[0]).toMatchObject({ state: "retry", attempt: 1 });
+    expect(db.listPendingTasks()[0]!.nextRunAt).toBeGreaterThan(Date.now());
+    expect(db.listFailedTasks().filter(task => task.state === "failed")).toEqual([]);
+    await resumeSyncAfterReconnect(() => false, engine, () => synchronize(engine));
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(cloud.text("/Obsidian/retry.md")).toBe("pending retry");
+    expect(db.taskCounts()).toEqual({ queued: 0, failed: 0 });
+  });
+
+  it.each(["upload", "download"])("continues queued %s tasks on the same engine after stopping", async direction => {
+    const { vault, cloud, engine, db, settings, statuses } = await harness();
+    vault.putFile("already.md", "completed before stopping");
+    await synchronize(engine);
+    for (let i = 0; i < 8; i++) {
+      if (direction === "upload") vault.putFile(`pending${i}.md`, `contents ${i}`);
+      else await cloud.putFile(`/Obsidian/pending${i}.md`, `contents ${i}`);
+    }
+    const upload = vi.spyOn(cloud.uploader, "upload");
+    const download = vi.spyOn(cloud.downloader, "download");
+    const stop = async () => {
+      settings.paused = true;
+      engine.cancel();
+      throw new Error("request aborted");
+    };
+    if (direction === "upload") upload.mockImplementationOnce(stop);
+    else download.mockImplementationOnce(stop);
+    expect(await engine.synchronize()).toBe(false);
+    await engine.waitForIdle();
+    expect(statuses.at(-1)).toMatchObject({ phase: "paused", message: "同步已停止", failed: 0 });
+    const pending = db.listPendingTasks();
+    expect(pending.length).toBeGreaterThan(0);
+    expect(pending.every(task => task.state === "queued" && task.attempt === 0)).toBe(true);
+    expect(vault.text("already.md")).toBe("completed before stopping");
+
+    settings.paused = false;
+    engine.resumePendingRetries();
+    expect(await engine.synchronize()).toBe(true);
+    expect(statuses.at(-1)).toMatchObject({ phase: "idle", message: "同步完成" });
+    expect(db.taskCounts()).toEqual({ queued: 0, failed: 0 });
+    for (let i = 0; i < 8; i++) {
+      expect(direction === "upload" ? cloud.text(`/Obsidian/pending${i}.md`) : vault.text(`pending${i}.md`)).toBe(`contents ${i}`);
+    }
+    expect(upload.mock.calls.some(([input]) => input.path.endsWith("/already.md"))).toBe(false);
+    expect(download.mock.calls.some(([input]) => input.path.endsWith("/already.md"))).toBe(false);
+  });
+
+  it.each(["pause", "disconnect"] as const)("reuses verified download blocks when resuming after %s", async interruption => {
+    const { vault, cloud, db, settings, statuses } = await harness();
+    const contents = "a".repeat(150_000);
+    const nid = await cloud.putFile("/Obsidian/book.mobi", contents);
+    const bytes = encoder.encode(contents);
+    const hash = (await cloudFileHashes(bytes)).fileHash;
+    const reads: number[] = [];
+    let interrupt = true;
+    const api = { call: async <T>(method: string, input: Record<string, unknown>): Promise<T> => {
+      if (method === "Sync.getDownloadInfo") return { https: "https://down1.yunpan.360.cn/intf.php",
+        fhash: hash, fsize: bytes.length, chunk_size: 50_000 } as T;
+      return cloud.api.call<T>(method, input);
+    } };
+    const store = { callJson: vi.fn(), download: async (_method: string, _input: unknown, range?: { start: number; end: number }) => {
+      reads.push(range!.start);
+      if (interrupt && range!.start === 50_000) {
+        interrupt = false;
+        if (interruption === "pause") { settings.paused = true; engine.cancel(); }
+        else interruptSyncForDisconnect(engine);
+        throw new Error("request aborted");
+      }
+      return bytes.slice(range!.start, range!.end + 1);
+    } };
+    const downloader = new DownloadMachine(api as never, () => store);
+    const engine = new SyncEngine(vault as never, db, api as never, cloud.uploader as never, downloader,
+      () => settings, "42:vault", status => statuses.push(status), undefined, undefined, async () => cloud.quota);
+    await synchronize(engine);
+    expect(statuses.at(-1)).toMatchObject({ phase: "paused", failed: 0 });
+    expect(reads).toEqual([0, 50_000]);
+    const task = db.listPendingTasks().find(task => task.nid === nid)!;
+    expect(task).toMatchObject({ state: "queued", attempt: 0 });
+    expect(db.downloadBlock(task.id, 0)).toBeDefined();
+    expect(vault.text("book.mobi")).toBeUndefined();
+
+    reads.length = 0;
+    settings.paused = false;
+    engine.resumePendingRetries();
+    expect(await engine.synchronize()).toBe(true);
+    expect(reads).toEqual([50_000, 100_000]);
+    expect(vault.text("book.mobi")).toBe(contents);
+    expect(db.downloadStates()).toEqual([]);
+    expect(db.taskCounts()).toEqual({ queued: 0, failed: 0 });
+  });
+
+  it.each(["upload", "download"])("keeps an ignored %s out of later runs and resumes after unignore", async direction => {
+    const { vault, cloud, engine, db, settings } = await harness();
+    const path = "note[1].md";
+    if (direction === "upload") {
+      vault.putFile(path, "local"); cloud.failUploadPath = `/Obsidian/${path}`;
+    } else {
+      await cloud.putFile(`/Obsidian/${path}`, "remote");
+      vi.spyOn(cloud.downloader, "download").mockRejectedValue(new Error("network timeout"));
+    }
+    await expect(synchronize(engine)).rejects.toThrow(/sync tasks? failed/);
+    const task = db.listFailedTasks().find(task => task.path === path)!;
+    // The plugin persists this exact rule before clearing the displayed record.
+    settings.filterRules = [...settings.filterRules, { id: "ignored-file:test", pattern: `/${path}`,
+      enabled: true, action: "exclude", caseSensitive: false }];
+    expect(engine.removeFailedTask(task.id)).toBe(true);
+    cloud.failUploadPath = undefined;
+    vi.restoreAllMocks();
+    const upload = vi.spyOn(cloud.uploader, "upload");
+    const download = vi.spyOn(cloud.downloader, "download");
+    vault.mkdir("other"); vault.putFile(`other/${path}`, "sibling");
+    for (let run = 0; run < 2; run++) await synchronize(engine);
+    expect(db.listPendingTasks().some(task => task.path === path)).toBe(false);
+    expect(upload.mock.calls.some(([input]) => input.path === `/Obsidian/${path}`)).toBe(false);
+    expect(download.mock.calls.some(([input]) => input.path === `/Obsidian/${path}`)).toBe(false);
+    expect(cloud.text(`/Obsidian/other/${path}`)).toBe("sibling");
+    if (direction === "upload") { expect(vault.text(path)).toBe("local"); expect(cloud.text(`/Obsidian/${path}`)).toBeUndefined(); }
+    else { expect(vault.text(path)).toBeUndefined(); expect(cloud.text(`/Obsidian/${path}`)).toBe("remote"); }
+    settings.filterRules = settings.filterRules.filter(rule => rule.id !== "ignored-file:test");
+    await synchronize(engine);
+    expect(vault.text(path)).toBe(direction === "upload" ? "local" : "remote");
+    expect(cloud.text(`/Obsidian/${path}`)).toBe(direction === "upload" ? "local" : "remote");
+  });
+
+  it("preserves baseline and both copies of an ignored file across remote deletion", async () => {
+    const { vault, cloud, engine, db, settings } = await harness();
+    vault.putFile("note.md", "base"); await synchronize(engine);
+    const base = db.getBase("note.md");
+    settings.filterRules = [...settings.filterRules, { id: "ignored-file:test", pattern: "/note.md",
+      enabled: true, action: "exclude", caseSensitive: false }];
+    cloud.remove("/Obsidian/note.md");
+    await synchronize(engine);
+    expect(vault.text("note.md")).toBe("base");
+    expect(db.getBase("note.md")).toEqual(base);
+    expect(db.listPendingTasks()).toEqual([]);
+  });
+
   it("ignores 20,000 unrelated account nodes on first and subsequent scoped scans", async () => {
     const { vault, cloud, engine, db } = await harness();
     for (let i = 0; i < 20_000; i++) {
@@ -678,9 +896,10 @@ describe("complete in-memory two-way synchronization", () => {
     engine.recordRename("note.md", "local.md");
     cloud.rename("/Obsidian/note.md", "/Obsidian/remote.md");
     vault.afterRename = (_source, destination) => {
-      if (destination.includes("(conflict-")) { vault.afterRename = undefined; throw new Error("simulated shutdown"); }
+      if (destination.includes("(conflict-")) { vault.afterRename = undefined; engine.cancel(); throw new Error("simulated shutdown"); }
     };
-    await expect(synchronize(engine)).rejects.toThrow("simulated shutdown");
+    await synchronize(engine);
+    expect(db.listPendingTasks().some(task => task.state === "queued" && task.attempt === 0)).toBe(true);
     const SQL = await initSqlJs({ locateFile: () => "node_modules/sql.js/dist/sql-wasm.wasm" });
     const reopened = new SyncDatabase(new SQL.Database(db.export()));
     reopened.recoverInterruptedTasks(); reopened.makeRetryTasksRunnable();
@@ -1137,6 +1356,41 @@ describe("complete in-memory two-way synchronization", () => {
     expect(db.listFailedTasks()).toEqual([expect.objectContaining({ kind: "download", path: "note.md" })]);
   });
 
+  it("finishes verified downloads and releases the engine even when cache cleanup keeps failing", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { vault, cloud, engine, db, statuses } = await harness();
+    const bytes = encoder.encode("downloaded");
+    const hash = (await cloudFileHashes(bytes)).fileHash;
+    await cloud.putFile("/Obsidian/note.md", "downloaded");
+    const downloader = new DownloadMachine({ call: vi.fn(async () => ({ https: "https://down1.yunpan.360.cn/intf.php",
+      fhash: hash, fsize: bytes.length, chunk_size: 4 })) } as never,
+      () => ({ download: vi.fn(async (_method: string, _params: unknown, range: { start: number; end: number }) =>
+        bytes.slice(range.start, range.end + 1)) } as never));
+    vi.spyOn(cloud.downloader, "download").mockImplementation(input => downloader.download(input));
+    const remove = vault.adapter.remove;
+    const cleanup = vi.spyOn(vault.adapter, "remove").mockImplementation(async path => {
+      if (path.startsWith(".yunpan-sync/downloads/")) throw new Error("EISDIR: cache cleanup failed");
+      await remove(path);
+    });
+
+    await expect(engine.synchronize(false, async tasks => new Set(tasks.map(task => task.id)))).resolves.toBe(true);
+    await expect(engine.waitForIdle()).resolves.toBeUndefined();
+    expect(engine.isRunning()).toBe(false);
+    expect(vault.text("note.md")).toBe("downloaded");
+    expect(statuses.at(-1)).toMatchObject({ phase: "idle", failed: 0, completed: 1 });
+    expect(db.getLastSuccessfulSync()).toBeDefined();
+    expect(db.getBase("note.md")?.hash).toBe(hash);
+    expect(db.listFailedTasks()).toEqual([]);
+    expect(db.downloadStates()).toHaveLength(1);
+    expect(warning).toHaveBeenCalled();
+
+    cleanup.mockRestore();
+    await synchronize(engine);
+    expect(db.downloadStates()).toEqual([]);
+    expect(vault.paths().filter(path => path.endsWith(".part"))).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
   it("uploads at most five local files concurrently through the sync engine", async () => {
     const { vault, cloud, engine } = await harness();
     cloud.uploadDelayMs = 5;
@@ -1148,16 +1402,85 @@ describe("complete in-memory two-way synchronization", () => {
     expect(cloud.paths()).toHaveLength(12);
   });
 
+  it.each(["downloads", "mixed"])("fills exactly five shared file slots for %s", async direction => {
+    const { vault, cloud, engine } = await harness();
+    let active = 0, peak = 0, uploads = 0, downloads = 0, overlap = false;
+    const transfer = async <T>(kind: "upload" | "download", run: () => Promise<T>) => {
+      active++; peak = Math.max(peak, active);
+      if (kind === "upload") uploads++; else downloads++;
+      overlap ||= uploads > 0 && downloads > 0;
+      try { await new Promise(resolve => setTimeout(resolve, 5)); return await run(); }
+      finally { active--; if (kind === "upload") uploads--; else downloads--; }
+    };
+    const upload = cloud.uploader.upload.bind(cloud.uploader);
+    const download = cloud.downloader.download.bind(cloud.downloader);
+    vi.spyOn(cloud.uploader, "upload").mockImplementation(input => transfer("upload", () => upload(input)));
+    vi.spyOn(cloud.downloader, "download").mockImplementation(input => transfer("download", () => download(input)));
+    for (let i = 0; i < 12; i++) {
+      if (direction === "mixed" && i % 2) vault.putFile(`${i}.md`, String(i));
+      else await cloud.putFile(`/Obsidian/${i}.md`, String(i));
+    }
+    await synchronize(engine);
+    expect(peak).toBe(5);
+    if (direction === "mixed") expect(overlap).toBe(true);
+    expect(cloud.paths()).toHaveLength(12);
+    expect(vault.paths()).toHaveLength(12);
+  });
+
+  it("blocks a failed directory branch while completing an independent branch", async () => {
+    const { vault, cloud, engine, db } = await harness();
+    vault.mkdir("bad"); vault.mkdir("bad/child"); vault.putFile("bad/child/note.md", "blocked");
+    vault.mkdir("good"); vault.putFile("good/note.md", "safe");
+    const call = cloud.api.call.bind(cloud.api);
+    const directories: string[] = [];
+    vi.spyOn(cloud.api, "call").mockImplementation(async (method, input) => {
+      if (method === "File.mkdir") {
+        directories.push(String(input.fname));
+        if (input.fname === "/Obsidian/bad/") throw new Error("permission denied");
+      }
+      return call(method, input);
+    });
+    await expect(synchronize(engine)).rejects.toThrow(/sync tasks failed/);
+    expect(directories).not.toContain("/Obsidian/bad/child/");
+    expect(cloud.text("/Obsidian/good/note.md")).toBe("safe");
+    expect(db.listFailedTasks().map(task => task.path).sort()).toEqual(["bad", "bad/child", "bad/child/note.md"]);
+    expect(directories.every(path => path.endsWith("/"))).toBe(true);
+  });
+
+  it.each([false, true])("repairs a deleted parent only inside a surviving binding (root deleted: %s)", async deletedRoot => {
+    const { vault, cloud, engine } = await harness();
+    vault.mkdir("parent");
+    await synchronize(engine);
+    vault.mkdir("parent/child"); vault.putFile("parent/child/note.md", "safe");
+    const call = cloud.api.call.bind(cloud.api);
+    let removed = false;
+    vi.spyOn(cloud.api, "call").mockImplementation(async (method, input) => {
+      if (method === "File.mkdir" && input.fname === "/Obsidian/parent/child/" && !removed) {
+        removed = true; cloud.remove(deletedRoot ? "/Obsidian" : "/Obsidian/parent");
+        throw new OpenApiError("父节点不存在", 3009);
+      }
+      return call(method, input);
+    });
+    if (deletedRoot) {
+      await expect(synchronize(engine)).rejects.toThrow(/sync tasks failed/);
+      expect(cloud.entries.has("/Obsidian")).toBe(false);
+      expect(vault.text("parent/child/note.md")).toBe("safe");
+    } else {
+      await synchronize(engine);
+      expect(cloud.text("/Obsidian/parent/child/note.md")).toBe("safe");
+    }
+  });
+
   it("continues uploading later files when one upload fails", async () => {
     const { vault, cloud, engine, db, statuses } = await harness();
     cloud.uploadDelayMs = 2;
     cloud.failUploadPath = "/Obsidian/4.md";
     for (let index = 0; index < 9; index++) vault.putFile(`${index}.md`, String(index));
 
-    await expect(synchronize(engine)).rejects.toThrow(/sync task.*still queued/i);
+    await expect(synchronize(engine)).rejects.toThrow(/sync task.*failed/i);
 
     expect(cloud.paths()).toEqual(["0.md", "1.md", "2.md", "3.md", "5.md", "6.md", "7.md", "8.md"]);
-    expect(db.listFailedTasks()).toEqual([expect.objectContaining({ kind: "upload", path: "4.md", state: "retry" })]);
+    expect(db.listFailedTasks()).toEqual([expect.objectContaining({ kind: "upload", path: "4.md", state: "failed" })]);
     expect(statuses.at(-1)?.failed).toBe(1);
   });
 });

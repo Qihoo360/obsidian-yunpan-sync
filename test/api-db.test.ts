@@ -153,7 +153,7 @@ describe("sync database", () => {
     expect(restored.getRemoteNodes()).toHaveLength(1);
     expect(restored.getBase("a.md")?.hash).toBe("h");
     expect(restored.recoverInterruptedTasks()).toBe(1);
-    expect(restored.nextRunnableTask(10)?.state).toBe("retry");
+    expect(restored.nextRunnableTask(10)).toMatchObject({ state: "queued", attempt: 0, lastError: undefined });
   });
 
   it("ships the sql.js wasm needed by the plugin build", async () => {

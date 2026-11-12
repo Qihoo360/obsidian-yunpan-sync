@@ -17,12 +17,15 @@ import { syncCompletionMessage } from "./outcome.js";
 import { assertSyncQuota, syncRestrictionError, type SyncQuota, type SyncRestriction } from "./quota.js";
 import { normalizeAccountProfile } from "../account/profile.js";
 import { fileSizeExclusion, ProtectedPaths, TaskSkippedError, type SkippedFile, type SkippedFileSource } from "./file-policy.js";
+import { DownloadCache } from "../transfer/download-cache.js";
+import type { TaskRunnerOptions } from "./task-runner.js";
 
 interface Api { call<T>(method: OpenApiMethod, input: Record<string, string | number | boolean | null | undefined>): Promise<T> }
 export interface EngineStatus { phase: string; message: string; queued: number; failed: number; completed?: number;
+  operationTotal?: number; operationCompleted?: number;
   conflicts?: number; lastSuccess?: number; lastError?: string; failedTasks?: SyncTask[]; fileFailures?: SyncFileFailure[];
   warnings?: string[]; restriction?: SyncRestriction; diagnostics?: SyncDiagnostics; skippedFiles?: SkippedFile[] }
-export interface SyncFileFailure { id?: string; source?: "local" | "remote"; nid?: string; path: string; error: WindowsPathError }
+export interface SyncFileFailure { id?: string; source?: "local" | "remote"; nid?: string; path: string; error: Error & { characters?: readonly string[] } }
 export type ConfirmSyncTasks = (tasks: readonly SyncTask[]) => Promise<ReadonlySet<string> | undefined>;
 
 export class SyncCancelledError extends Error {
@@ -87,6 +90,8 @@ export class SyncEngine {
   private stopReason = "同步已停止";
   private idleWaiters: Array<() => void> = [];
   private completed = 0;
+  private operationTotal = 0;
+  private operationCompleted = 0;
   private warnings: string[] = [];
   private renameRefreshUsed = false;
   private restriction?: SyncRestriction;
@@ -100,11 +105,13 @@ export class SyncEngine {
   private lastTransferReport = 0;
   private diagnostic?: SyncDiagnostics;
   private stage = "";
+  private stageMessage = "";
   private stageStarted = 0;
   private protectedPaths = new ProtectedPaths();
   private protectedNids = new Set<string>();
   private refreshForRetry = false;
   private runSettings?: PluginSettings;
+  private cancellation?: AbortController;
 
   constructor(
     private readonly vault: Vault,
@@ -118,12 +125,18 @@ export class SyncEngine {
     private readonly checkpoint: () => Promise<void> = async () => undefined,
     private readonly reportTransfers: (transfers: FileTransferProgress[]) => void = () => undefined,
     private readonly loadQuota?: () => Promise<SyncQuota>,
+    private readonly retryOptions: Pick<TaskRunnerOptions, "maxAttempts" | "retryDelay"> = {},
   ) {
     this.lastSuccess = database.getLastSuccessfulSync();
   }
 
   isRunning(): boolean { return this.running; }
-  cancel(message = "同步已停止"): void { this.cancelled = true; this.stopReason = message; }
+  cancel(message = "同步已停止"): void {
+    this.cancelled = true;
+    this.stopReason = message;
+    this.cancellation?.abort();
+  }
+  getCancellationSignal(): AbortSignal | undefined { return this.cancellation?.signal; }
   checkContinuing(): void { if (this.running) this.throwIfCancelled(); }
   waitForIdle(): Promise<void> {
     if (!this.running) return Promise.resolve();
@@ -140,11 +153,14 @@ export class SyncEngine {
   async synchronize(rebuild = false, confirmTasks?: ConfirmSyncTasks): Promise<boolean> {
     if (this.running || this.settings().paused) return false;
     this.running = true;
+    this.cancellation = new AbortController();
     this.pendingValidationFailures = [...this.fileFailures];
     this.runSettings = { ...this.settings(), filterRules: this.settings().filterRules.map(rule => ({ ...rule })) };
     this.protectedPaths = new ProtectedPaths();
     this.protectedNids.clear();
     this.completed = 0;
+    this.operationTotal = 0;
+    this.operationCompleted = 0;
     this.compiledFilter = undefined;
     this.work = new WorkScheduler(() => this.throwIfCancelled());
     this.diagnostic = { startedAt: Date.now(), durationMs: 0, stages: {}, remoteNodes: 0,
@@ -174,12 +190,12 @@ export class SyncEngine {
       this.throwIfCancelled();
       rebuild ||= this.refreshForRetry;
       if (!rebuild) await this.bindKnownRenameIdentities();
-      this.emit("remote-index", rebuild ? "正在重新检查云端目录" : "正在检查远端变化");
+      this.emit("remote-index", "正在检查云端文件变化…");
       const indexer = new RemoteIndexer(this.api, this.database, this.accountKey, 200, {
         check: () => this.throwIfCancelled(), work: this.work, remoteRoot: this.runSettings.remoteRoot,
         progress: (stage, count) => {
           if (this.diagnostic) this.diagnostic.remoteNodes = count;
-          this.progress(stage, `${stage === "remote-request" ? "正在读取绑定目录" : "正在处理绑定目录"}，已获取 ${count} 项`);
+          this.progress(stage, `正在获取云端文件信息…${count > 0 ? `（已读取 ${count.toLocaleString("en-US")} 项）` : ""}`);
         },
       });
       if (rebuild) {
@@ -190,13 +206,27 @@ export class SyncEngine {
       this.fileFailures = [];
       this.protectedPaths = new ProtectedPaths();
       this.protectedNids.clear();
+      for (const failure of indexer.failures) this.recordFileFailure(failure.path, failure.error, "远端目录暂不可同步", failure.nid);
+      if (indexer.failures.length) {
+        const blocked = new Set(indexer.failures.map(failure => failure.nid));
+        for await (const batch of this.database.baseBatches()) for (const [path, snapshot] of batch) {
+          // Uploads may be newer than the cached index. Protect the old name by
+          // baseline identity too; legacy directories without identity are ambiguous.
+          if (snapshot.kind === "directory" && (!snapshot.nid || blocked.has(snapshot.nid))) {
+            this.protectedPaths.add(path, "对应云端目录无法读取，已保留本地目录与同步基线", "both");
+          }
+        }
+      }
       const structural = new TaskRunner(this.database, {
         "local-rename": (task) => this.executeChecked(task, () => this.renameLocal(task)),
         rename: (task) => this.executeChecked(task, () => this.renameRemote(task)),
         move: (task) => this.executeChecked(task, () => this.moveRemote(task)),
-      }, { kinds: ["local-rename", "rename", "move"], propagateErrors: true, checkpoint: this.checkpoint, shouldCancel: () => this.cancelled });
+      }, { ...this.retryOptions, kinds: ["local-rename", "rename", "move"], waitForRetries: true,
+        onRetryWait: () => this.emit("retry-wait", "正在等待结构任务重试"),
+        checkpoint: this.checkpoint, shouldCancel: () => this.cancelled,
+        onTaskSettled: () => this.reportTaskSettled() });
       let appliedChanges = 0;
-      this.emit("compare", "正在比较本地、远端和同步基线");
+      this.emit("compare", "正在检查需要同步的文件…");
       await this.planTasks();
       this.pendingValidationFailures = [];
       const planned = this.pendingPlanTasks();
@@ -213,6 +243,8 @@ export class SyncEngine {
         });
       }
       await this.checkQuota(quota, selectedTasks);
+      this.operationTotal = selectedTasks.length;
+      this.operationCompleted = 0;
       const selectedIds = new Set(selectedTasks.map(task => task.id));
       this.database.removeTasks([...this.discardAfterPreflight,
         ...planned.filter(task => !selectedIds.has(task.id)).map(task => task.id)]);
@@ -226,25 +258,41 @@ export class SyncEngine {
       appliedChanges += await structural.drain();
       this.throwIfCancelled();
       const blockedStructure = this.database.listPendingTasks().filter(task => ["local-rename", "rename", "move"].includes(task.kind));
-      if (blockedStructure.length) throw new Error(`${blockedStructure.length} sync tasks are still queued`);
+      if (blockedStructure.length) throw new Error(blockedStructure.find(task => task.lastError)?.lastError ?? `${blockedStructure.length} sync tasks failed`);
       appliedChanges += await this.ensureRemoteRoot();
       await this.queueTransferProgress();
       this.emit("transfer", "正在执行同步任务");
+      // Local directories, deletions and directory conflicts are structural work.
+      const localStructure = this.database.listTransferTasks().filter(task => task.kind === "download" &&
+        (this.payload(task).remote?.kind === "directory" || this.payload(task).remoteDeleted ||
+          (this.payload(task).conflict && this.payload(task).local?.kind === "directory"))).map(task => task.id);
+      appliedChanges += await new TaskRunner(this.database, {
+        download: task => this.executeChecked(task, () => this.download(task)),
+      }, { ...this.retryOptions, kinds: ["download"], taskIds: localStructure, dependencies: true, waitForRetries: true,
+        onRetryWait: () => this.emit("retry-wait", "正在等待目录任务重试"),
+        checkpoint: this.checkpoint, shouldCancel: () => this.cancelled,
+        onTaskSettled: () => this.reportTaskSettled() }).drain();
+      this.throwIfCancelled();
       const preparation = new TaskRunner(this.database, {
         mkdir: (task) => this.executeChecked(task, () => this.createRemoteDirectory(task)),
         recycle: (task) => this.executeChecked(task, () => this.recycleRemote(task)),
-      }, { kinds: ["mkdir", "recycle"], checkpoint: this.checkpoint, shouldCancel: () => this.cancelled });
+      }, { ...this.retryOptions, kinds: ["mkdir", "recycle"], dependencies: true, waitForRetries: true,
+        onRetryWait: () => this.emit("retry-wait", "请求暂未成功，正在等待自动重试"),
+        checkpoint: this.checkpoint, shouldCancel: () => this.cancelled,
+        onTaskSettled: () => this.reportTaskSettled() });
       appliedChanges += await preparation.drain();
-      this.throwIfCancelled();
-      appliedChanges += await new TaskRunner(this.database, {
-        download: (task) => this.executeChecked(task, () => this.download(task)),
-      }, { kinds: ["download"], checkpoint: this.checkpoint, shouldCancel: () => this.cancelled }).drain();
       this.throwIfCancelled();
       const runner = new TaskRunner(this.database, {
         upload: (task) => this.executeChecked(task, () => this.upload(task)),
-      }, { kinds: ["upload"], concurrency: 5, checkpoint: this.checkpoint, shouldCancel: () => this.cancelled });
+        download: (task) => this.executeChecked(task, () => this.download(task)),
+      }, { ...this.retryOptions, kinds: ["upload", "download"], dependencies: true, waitForRetries: true,
+        onRetryWait: () => this.emit("retry-wait", "正在等待重试，其他文件将继续同步"),
+        concurrency: 5, checkpoint: this.checkpoint, shouldCancel: () => this.cancelled,
+        onTaskSettled: () => this.reportTaskSettled() });
       appliedChanges += await runner.drain();
       this.throwIfCancelled();
+      this.database.failBlockedTasks();
+      for (const task of this.database.listFailedTasks()) if (task.state === "failed") this.transfers.fail(task.id, task.lastError ?? "同步失败");
       runner.assertSettled();
       this.completed = appliedChanges;
       if (this.fileFailures.length > 0) {
@@ -261,6 +309,7 @@ export class SyncEngine {
     } catch (error) {
       this.fileFailures = this.visibleFileFailures();
       this.pendingValidationFailures = [];
+      if (this.cancelled) error = new SyncCancelledError(this.stopReason);
       if (error instanceof SyncCancelledError) {
         this.emit("paused", error.message);
         
@@ -279,6 +328,11 @@ export class SyncEngine {
       throw restriction ?? error;
     } finally {
       try {
+        const pendingIds = new Set(this.database.listPendingTasks().map(task => task.id));
+        for (const state of this.database.downloadStates()) {
+          if (!pendingIds.has(state.taskId)) await new DownloadCache(this.vault.adapter, this.database,
+            state.binding, state.taskId, this.checkpoint).clear();
+        }
         const pendingTransferIds = new Set(this.database.listTransferTasks().map(task => task.id));
         for (const transfer of this.transfers.snapshot()) {
           if (transfer.state !== "completed" && !pendingTransferIds.has(transfer.id)) this.transfers.remove(transfer.id);
@@ -293,6 +347,7 @@ export class SyncEngine {
         await this.checkpoint();
       } finally {
         this.running = false;
+        this.cancellation = undefined;
         this.runSettings = undefined;
         for (const resolve of this.idleWaiters.splice(0)) resolve();
       }
@@ -462,15 +517,22 @@ export class SyncEngine {
     if (["idle", "paused", "error"].includes(phase)) this.publishTransfers(true);
     if (phase !== this.stage) { this.finishStage(); this.stage = phase; this.stageStarted = performance.now(); }
     const counts = this.database.taskCounts();
-    const failedTasks = this.database.listFailedTasks();
+    const failedTasks = this.database.listFailedTasks().filter(task => task.state === "failed");
     const failureCount = this.failureCount(failedTasks);
     const displayMessage = phase === "error" && failureCount > 0 && !this.restriction ? "部分文件同步失败" : message;
+    this.stageMessage = displayMessage;
     
     this.report({ phase, message: displayMessage, queued: counts.queued, failed: failureCount, completed: this.completed,
+      operationTotal: this.operationTotal, operationCompleted: this.operationCompleted,
       conflicts: this.database.unresolvedConflictCount(), lastSuccess: this.lastSuccess, lastError: this.lastError,
       failedTasks, fileFailures: this.visibleFileFailures(), warnings: [...this.warnings], restriction: this.restriction,
       skippedFiles: this.protectedPaths.entries(),
       diagnostics: this.diagnostic });
+  }
+
+  private reportTaskSettled(): void {
+    this.operationCompleted++;
+    this.emit(this.stage || "transfer", this.stageMessage || "正在执行同步任务");
   }
 
   private finishStage(): void {
@@ -486,7 +548,7 @@ export class SyncEngine {
     this.emit(phase, message);
   }
 
-  private failureCount(failedTasks = this.database.listFailedTasks()): number {
+  private failureCount(failedTasks = this.database.listFailedTasks().filter(task => task.state === "failed")): number {
     return new Set([...failedTasks.map((task) => pathKey(task.path)), ...this.visibleFileFailures().map((failure) => pathKey(failure.path))]).size;
   }
 
@@ -514,8 +576,8 @@ export class SyncEngine {
       ?? memorySource(new Uint8Array(await this.work.waitFor(read)));
     try {
       if (this.excludeSize(path, source.size, "local")) throw new TaskSkippedError("本地文件大小不在同步范围内");
-      const hashed = await hashSource(source, () => this.throwIfCancelled(), bytes => {
-        this.progress("local-scan", `正在扫描本地：${path}（${bytes}/${source.size} 字节）`);
+      const hashed = await hashSource(source, () => this.throwIfCancelled(), () => {
+        this.progress("local-scan", `正在检查本地文件：${path}`);
       }, this.work);
       const after = await this.work.waitFor(() => this.vault.adapter.stat(path));
       if (!after || after.type !== "file" || after.size !== before.size || after.mtime !== before.mtime || source.size !== before.size) {
@@ -527,13 +589,14 @@ export class SyncEngine {
   }
 
   private async scanLocal(): Promise<Map<string, PathSnapshot>> {
+    this.progress("local-scan", "正在检查本地文件…");
     const result = new Map<string, PathSnapshot>();
     const filter = this.pathFilter();
     const entries = await cooperativeSort(this.vault.getAllLoadedFiles().filter((entry) => Boolean(entry.path)),
       (left, right) => left.path.localeCompare(right.path), this.work);
     for (const entry of entries) {
       await this.work.step();
-      this.progress("local-scan", `正在扫描本地：${entry.path}`);
+      this.progress("local-scan", `正在检查本地文件：${entry.path}`);
       try {
         if (entry.path.includes("\\")) {
           throw new WindowsPathError("invalid-character", "\\", "文件名包含 Windows 不支持的字符", ["\\"]);
@@ -564,9 +627,10 @@ export class SyncEngine {
     return result;
   }
 
-  private recordFileFailure(path: string, error: WindowsPathError, prefix?: string, nid?: string): void {
-    const wrapped = new WindowsPathError(error.issue, error.segment,
-      prefix ? `${prefix}：${path}。${error.message}` : error.message, error.characters);
+  private recordFileFailure(path: string, error: Error, prefix?: string, nid?: string): void {
+    const message = prefix ? `${prefix}：${path}。${error.message}` : error.message;
+    const wrapped = error instanceof WindowsPathError
+      ? new WindowsPathError(error.issue, error.segment, message, error.characters) : new Error(message);
     if (!this.fileFailures.some((failure) => pathKey(failure.path) === pathKey(path))) {
       this.fileFailures.push({ id: `scan:${nid ? `remote:${nid}` : `local:${path}`}`, source: nid ? "remote" : "local", nid, path, error: wrapped });
     }
@@ -642,7 +706,7 @@ export class SyncEngine {
         await this.work.step();
         if (node.path.toLowerCase().startsWith(this.settings().remoteRoot.toLowerCase())) matched++;
         if (this.diagnostic) { this.diagnostic.remoteNodes = total; this.diagnostic.matchedNodes = matched; }
-        this.progress("remote-map", `正在比较绑定目录：已处理 ${total} 项`);
+        this.progress("remote-map", `正在检查需要同步的文件…（已检查 ${total.toLocaleString("en-US")} 项）`);
         let path: string | undefined;
         try {
           const root = this.settings().remoteRoot.toLowerCase();
@@ -673,23 +737,23 @@ export class SyncEngine {
     return result;
   }
 
-  private async ensureRemoteRoot(): Promise<number> {
+  private async ensureRemoteRoot(force = false): Promise<number> {
     const cursor = this.database.getCursor(this.accountKey);
-    if (cursor?.bgsp === directorySnapshotScope(this.settings().remoteRoot) && cursor.gsp?.startsWith("exists:")) return 0;
+    if (!force && cursor?.bgsp === directorySnapshotScope(this.settings().remoteRoot) && cursor.gsp?.startsWith("exists:")) return 0;
     const segments = this.settings().remoteRoot.split("/").filter(Boolean);
     let current = "";
     let created = 0;
     for (const segment of segments) {
       this.throwIfCancelled();
       current += `/${segment}`;
-      if (this.database.hasRemoteDirectory(current)) continue;
+      if (!force && this.database.hasRemoteDirectory(current)) continue;
       try {
         await this.api.call("File.mkdir", { fname: `${current}/` });
         this.throwIfCancelled();
         created++;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (!/exist|already|已存在|重复|同名/i.test(message)) throw error;
+        if (!isAlreadyExistingRemoteNodeError(error)) throw error;
       }
     }
     return created;
@@ -838,7 +902,7 @@ export class SyncEngine {
           }
         }
       });
-      this.progress("plan", `正在生成同步任务：${offset}/${ordered.length}`);
+      this.progress("plan", "正在准备同步…");
       await this.work.step(true);
     }
     for (const { task, destination } of conflictUploads) await this.planConflictUploads(task, local, destination);
@@ -1149,12 +1213,23 @@ export class SyncEngine {
   }
 
   private async createRemoteDirectory(task: SyncTask): Promise<void> {
+    const path = `${joinRemotePath(this.settings().remoteRoot, task.path).replace(/\/+$/, "")}/`;
+    let response: Record<string, unknown> | undefined;
     try {
-      await this.api.call("File.mkdir", { fname: joinRemotePath(this.settings().remoteRoot, task.path) });
+      response = await this.api.call("File.mkdir", { fname: path });
     } catch (error) {
-      if (!isAlreadyExistingRemoteNodeError(error)) throw error;
+      if (!isAlreadyExistingRemoteNodeError(error)) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/父节点不存在|parent.*(?:not exist|not found)/i.test(message)) {
+          // Repair only children of an existing binding, never recreate a deleted root.
+          await this.api.call("File.getList", { path: this.settings().remoteRoot, page: 1, page_size: 1 });
+          await this.ensureRemoteMoveDestination(task.path, true);
+          response = await this.api.call("File.mkdir", { fname: path });
+        } else throw error;
+      }
     }
-    this.database.putBase(task.path, this.payload(task).local!);
+    const nid = String(response?.nid ?? response?.id ?? "") || this.database.getBase(task.path)?.nid;
+    this.database.putBase(task.path, { ...this.payload(task).local!, ...(nid ? { nid } : {}) });
   }
 
   private async recycleRemote(task: SyncTask): Promise<void> {
@@ -1238,7 +1313,7 @@ export class SyncEngine {
     }
   }
 
-  private async ensureRemoteMoveDestination(destination: string): Promise<string> {
+  private async ensureRemoteMoveDestination(destination: string, force = false): Promise<string> {
     const parent = parentVaultPath(destination);
     const root = this.settings().remoteRoot;
     if (!parent) return joinRemotePath(root, "");
@@ -1249,7 +1324,7 @@ export class SyncEngine {
       this.throwIfCancelled();
       current = current ? `${current}/${segment}` : segment;
       const remotePath = joinRemotePath(root, current).replace(/\/+$/, "");
-      if (this.database.hasRemoteDirectory(remotePath)) continue;
+      if (!force && this.database.hasRemoteDirectory(remotePath)) continue;
       try {
         await this.api.call("File.mkdir", { fname: `${remotePath}/` });
         this.throwIfCancelled();
@@ -1267,6 +1342,9 @@ export class SyncEngine {
     if (!stat || (!file && adapterStat?.type !== "file")) throw new Error(`Local file disappeared: ${task.path}`);
     if (this.excludeSize(task.path, stat.size, "local")) throw new TaskSkippedError("上传文件大小不在同步范围内");
     const before = { size: stat.size, mtime: stat.mtime };
+    this.transfers.queue(task.id, "upload", task.path, stat.size);
+    this.transfers.start(task.id);
+    this.publishTransfers();
     const source = await openDesktopSource(this.vault.adapter, task.path);
     if (source && this.excludeSize(task.path, source.size, "local")) {
       await source.close();
@@ -1274,15 +1352,18 @@ export class SyncEngine {
       throw new TaskSkippedError("上传文件大小已变化，不在同步范围内");
     }
     const bytes = source ? undefined : new Uint8Array(file ? await this.vault.readBinary(file) : await this.vault.adapter.readBinary(task.path));
-    this.transfers.queue(task.id, "upload", task.path, source?.size ?? bytes!.byteLength);
-    this.transfers.start(task.id);
-    this.publishTransfers();
+    if (source && source.size !== stat.size) this.transfers.updatePreparing(task.id, 0, source.size);
     try {
       const response = await this.uploader.upload({ path: joinRemotePath(this.settings().remoteRoot, task.path), data: bytes, source,
         ctime: stat.ctime, mtime: stat.mtime, transferId: task.id,
         expectedHash: this.payload(task).local?.hash,
         check: () => this.throwIfCancelled(),
-        onHashProgress: completed => this.progress("hash", `正在校验上传文件：${task.path}（${completed}/${stat.size} 字节）`),
+        signal: this.cancellation?.signal,
+        onHashProgress: completed => {
+          this.transfers.updatePreparing(task.id, completed, source?.size ?? bytes!.byteLength);
+          this.publishTransfers();
+          this.progress("hash", `正在校验上传文件：${task.path}（${completed}/${stat.size} 字节）`);
+        },
         onProgress: (completed, total) => this.updateTransfer(task.id, completed, total) });
       const currentFile = this.vault.getFileByPath(task.path);
       const currentAdapterStat = currentFile ? undefined : await this.vault.adapter.stat(task.path);
@@ -1349,20 +1430,28 @@ export class SyncEngine {
       if (await this.vault.adapter.exists(task.path, false)) throw new Error(`Local file appeared during conflict download: ${task.path}`);
     };
     let temporary: string | undefined;
+    let downloadedHash = payload.remote?.hash;
+    const cache = new DownloadCache(this.vault.adapter, this.database, this.accountKey, task.id, this.checkpoint);
     let sink: Awaited<ReturnType<typeof openDesktopSink>>;
     try {
       await this.ensureFolder(task.path);
       temporary = `${task.path}.yunpan-sync-${crypto.randomUUID()}.part`;
       sink = await openDesktopSink(this.vault.adapter, temporary);
       const input = { path: joinRemotePath(this.settings().remoteRoot, task.path), nid: task.nid,
+        resume: cache,
+        onMetadata: (metadata: { hash: string; size: number }) => { downloadedHash = metadata.hash; },
         check: () => this.throwIfCancelled(),
         validateSize: (size: number) => {
           if (this.excludeSize(task.path, size, "remote")) throw new TaskSkippedError("云端文件大小不在同步范围内");
           if (payload.remote && size !== payload.remote.size) throw new Error("云端文件在检测后已变化，请重新检测");
         },
-        onStage: (stage: "download" | "verify") => this.progress(stage,
-          `${stage === "verify" ? "正在校验下载文件" : "正在下载"}：${task.path}`),
-        onProgress: (completed: number, total: number) => this.updateTransfer(task.id, completed, total) };
+        onStage: (stage: "download" | "verify") => {
+          this.transfers.stage(task.id, stage === "verify" ? "verifying" : "transferring");
+          this.publishTransfers();
+          this.progress(stage, `${stage === "verify" ? "正在校验下载文件" : "正在下载"}：${task.path}`);
+        },
+        onProgress: (completed: number, total: number) => this.updateTransfer(task.id, completed, total),
+        signal: this.cancellation?.signal };
       if (sink) {
         await this.downloader.downloadTo(input, sink);
         const normalizedMtime = payload.remote?.mtime === undefined ? undefined : payload.remote.mtime < 1_000_000_000_000
@@ -1376,7 +1465,8 @@ export class SyncEngine {
         await prepareTarget();
         await this.atomicWrite(task.path, bytes, payload.remote?.mtime, checkCommit);
       }
-      if (payload.remote) this.database.putBase(task.path, payload.remote);
+      if (payload.remote) this.database.putBase(task.path, { ...payload.remote, hash: downloadedHash });
+      await cache.clear();
       this.transfers.complete(task.id);
       this.publishTransfers();
     } catch (error) {
@@ -1411,7 +1501,8 @@ export class SyncEngine {
   }
 
   private failTransfer(id: string, error: unknown): void {
-    this.transfers.fail(id, error instanceof Error ? error.message : String(error));
+    // The runner decides whether an error is terminal. Interruption/retry is waiting work.
+    this.transfers.suspend(id);
     this.publishTransfers();
   }
 

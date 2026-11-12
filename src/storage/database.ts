@@ -52,6 +52,8 @@ export interface SyncConflict {
   createdAt: number;
 }
 
+export interface DownloadState { taskId: string; binding: string; identity: string }
+
 function rowObject<T>(db: Database, sql: string, params: BindParams): T | undefined {
   const statement = db.prepare(sql);
   try {
@@ -115,6 +117,9 @@ export class SyncDatabase {
         account_key TEXT PRIMARY KEY, confirmed_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS download_state (task_id TEXT PRIMARY KEY,binding TEXT NOT NULL,identity TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS download_blocks (task_id TEXT NOT NULL,block_index INTEGER NOT NULL,hash TEXT NOT NULL,size INTEGER NOT NULL,
+        PRIMARY KEY(task_id,block_index));
     `);
     this.db.run("DROP TABLE IF EXISTS remote_nodes_staging");
     const schemaVersion = Number(this.db.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0);
@@ -186,10 +191,38 @@ export class SyncDatabase {
 
   resetSyncState(): void {
     this.transaction(() => {
-      for (const table of ["cursors", "remote_nodes", "sync_base", "tasks", "suppressions", "transfer_blocks", "transfer_state"]) {
+      for (const table of ["cursors", "remote_nodes", "sync_base", "tasks", "suppressions", "transfer_blocks", "transfer_state", "download_blocks", "download_state"]) {
         this.db.run(`DELETE FROM ${table}`);
       }
     });
+  }
+
+  downloadStates(): DownloadState[] {
+    const result = this.db.exec("SELECT task_id,binding,identity FROM download_state")[0];
+    return result?.values.map(row => ({ taskId: String(row[0]), binding: String(row[1]), identity: String(row[2]) })) ?? [];
+  }
+
+  setDownloadState(state: DownloadState): void {
+    this.db.run("INSERT OR REPLACE INTO download_state VALUES($id,$binding,$identity)",
+      { $id: state.taskId, $binding: state.binding, $identity: state.identity });
+  }
+
+  downloadBlock(taskId: string, index: number): { hash: string; size: number } | undefined {
+    return rowObject(this.db, "SELECT hash,size FROM download_blocks WHERE task_id=$id AND block_index=$index", { $id: taskId, $index: index });
+  }
+
+  saveDownloadBlock(taskId: string, index: number, hash: string, size: number): void {
+    this.db.run("INSERT OR REPLACE INTO download_blocks VALUES($id,$index,$hash,$size)",
+      { $id: taskId, $index: index, $hash: hash, $size: size });
+  }
+
+  clearDownload(taskId: string): void {
+    this.db.run("DELETE FROM download_blocks WHERE task_id=$id", { $id: taskId });
+    this.db.run("DELETE FROM download_state WHERE task_id=$id", { $id: taskId });
+  }
+
+  removeDownloadBlock(taskId: string, index: number): void {
+    this.db.run("DELETE FROM download_blocks WHERE task_id=$id AND block_index=$index", { $id: taskId, $index: index });
   }
 
   isBindingConfirmed(accountKey: string): boolean {
@@ -660,13 +693,16 @@ export class SyncDatabase {
     this.db.run("UPDATE tasks SET state='running' WHERE id=$id AND state IN ('queued','retry')", { $id: id });
   }
 
-  claimNextRunnableTask(now = Date.now(), kinds?: TaskKind[]): SyncTask | undefined {
+  claimNextRunnableTask(now = Date.now(), kinds?: TaskKind[], dependencies = false, ids?: readonly string[]): SyncTask | undefined {
+    if (ids?.length === 0) return undefined;
     const kindClause = kinds?.length ? ` AND kind IN (${kinds.map((_, index) => `$kind${index}`).join(",")})` : "";
     const params: Record<string, string | number> = { $now: now };
     kinds?.forEach((kind, index) => { params[`$kind${index}`] = kind; });
+    ids?.forEach((id, index) => { params[`$id${index}`] = id; });
+    const idClause = ids ? ` AND id IN (${ids.map((_, index) => `$id${index}`).join(",")})` : "";
     return this.transaction(() => {
       const row = rowObject<Record<string, unknown>>(this.db,
-        `SELECT id FROM tasks WHERE state IN ('queued','retry') AND next_run_at<=$now${kindClause}
+        `SELECT id FROM tasks WHERE state IN ('queued','retry') AND next_run_at<=$now${kindClause}${idClause}${dependencies ? this.dependencyClause() : ""}
          ORDER BY next_run_at,rowid LIMIT 1`, params);
       if (!row) return undefined;
       this.db.run("UPDATE tasks SET state='running' WHERE id=$id AND state IN ('queued','retry')", { $id: String(row.id) });
@@ -676,11 +712,38 @@ export class SyncDatabase {
     });
   }
 
+  private dependencyClause(): string {
+    return ` AND NOT EXISTS (SELECT 1 FROM tasks parent WHERE parent.id<>tasks.id
+      AND parent.state IN ('queued','running','retry','failed') AND
+      ((((parent.kind='mkdir' AND tasks.kind IN ('mkdir','upload')) OR
+        (parent.kind='download' AND tasks.kind='download' AND json_extract(parent.payload,'$.remote.kind')='directory'))
+        AND lower(substr(tasks.path,1,length(parent.path)+1))=lower(parent.path||'/'))
+        OR parent.id=json_extract(tasks.payload,'$.derivedFrom')))`;
+  }
+
+  nextTaskTime(kinds?: TaskKind[], dependencies = false, ids?: readonly string[]): number | undefined {
+    if (ids?.length === 0) return undefined;
+    const clause = kinds?.length ? ` AND kind IN (${kinds.map((_, index) => `$kind${index}`).join(",")})` : "";
+    const params: Record<string, string> = {};
+    kinds?.forEach((kind, index) => { params[`$kind${index}`] = kind; });
+    ids?.forEach((id, index) => { params[`$id${index}`] = id; });
+    const idClause = ids ? ` AND id IN (${ids.map((_, index) => `$id${index}`).join(",")})` : "";
+    const row = rowObject<{ at: number | null }>(this.db,
+      `SELECT MIN(next_run_at) AS at FROM tasks WHERE state IN ('queued','retry')${clause}${idClause}${dependencies ? this.dependencyClause() : ""}`, params);
+    return row?.at == null ? undefined : Number(row.at);
+  }
+
+  failBlockedTasks(): void {
+    // A terminal parent failure must not generate a cascade of server requests.
+    this.db.run(`UPDATE tasks SET state='failed',last_error='父目录或前置任务同步失败，请先重试前置任务'
+      WHERE state IN ('queued','retry') AND NOT (1=1${this.dependencyClause()})`);
+  }
+
   completeTask(id: string): void { this.db.run("UPDATE tasks SET state='done',last_error=NULL WHERE id=$id", { $id: id }); }
 
-  deferTask(id: string, message: string): void {
+  deferTask(id: string, message?: string): void {
     this.db.run("UPDATE tasks SET state='queued',next_run_at=0,last_error=$error WHERE id=$id AND state='running'",
-      { $id: id, $error: message });
+      { $id: id, $error: message ?? null });
   }
 
   requeueStaleCompletedRecycleTasks(
@@ -722,7 +785,7 @@ export class SyncDatabase {
   }
 
   recoverInterruptedTasks(): number {
-    this.db.run("UPDATE tasks SET state='retry',attempt=attempt+1,next_run_at=0,last_error='Interrupted by shutdown' WHERE state='running'");
+    this.db.run("UPDATE tasks SET state='queued',next_run_at=0,last_error=NULL WHERE state='running' OR (state='retry' AND last_error IN ('Interrupted by shutdown','同步已停止'))");
     return this.db.getRowsModified();
   }
 

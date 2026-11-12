@@ -2,6 +2,8 @@ import { assertStoreUrl } from "../net/store-url.js";
 import { md5 } from "../net/signing.js";
 import { requestUrl } from "obsidian";
 import { OpenApiError } from "../net/openapi-client.js";
+import { RequestScheduler, isRateLimitError } from "../net/request-scheduler.js";
+import { cancellable } from "../net/cancellation.js";
 
 
 export interface StoreRange { start: number; end: number }
@@ -65,19 +67,39 @@ export class StoreClient implements StoreClientLike {
   private readonly endpoint: URL;
 
   constructor(endpoint: string, private readonly credentials: StoreCredentials,
-    private readonly metadata: StoreClientMetadata) {
+    private readonly metadata: StoreClientMetadata,
+    private readonly scheduler = new RequestScheduler(), private readonly check: () => void = () => undefined,
+    private readonly signal?: AbortSignal) {
     this.endpoint = assertStoreUrl(endpoint);
   }
 
   async callJson(method: string, params: Record<string, unknown>, file?: Uint8Array): Promise<Record<string, unknown>> {
+    return this.retry(() => this.callJsonOnce(method, params, file));
+  }
+
+  private async retry<T>(operation: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      await this.scheduler.wait(this.check);
+      try { return await operation(); }
+      catch (error) {
+        this.check();
+        if (!isRateLimitError(error)) throw error;
+        this.scheduler.coolDown(attempt);
+        if (attempt >= 2) throw error;
+      }
+    }
+  }
+
+  private async callJsonOnce(method: string, params: Record<string, unknown>, file?: Uint8Array): Promise<Record<string, unknown>> {
     const startedAt = Date.now();
     const common = storeProtocolFields(method, this.credentials.qid, this.metadata);
     const values = { ...params, ...common, token: this.credentials.token, ofmt: "json" };
     const encoded = multipart(values, file);
     let status: number | undefined;
     try {
-      const response = await requestUrl({ url: this.endpoint.toString(), method: "POST",
-        headers: { "Content-Type": encoded.contentType, Accept: "application/json" }, body: encoded.body, throw: false });
+      const response = await cancellable(requestUrl({ url: this.endpoint.toString(), method: "POST",
+        headers: { "Content-Type": encoded.contentType, Accept: "application/json" }, body: encoded.body, throw: false }),
+        this.signal, this.check);
       status = response.status;
       const text = response.text;
       if (response.status < 200 || response.status >= 300) throw new Error(`Store ${method} failed: HTTP ${response.status}`);
@@ -93,6 +115,10 @@ export class StoreClient implements StoreClientLike {
   }
 
   async download(method: string, params: Record<string, unknown>, range?: StoreRange): Promise<Uint8Array> {
+    return this.retry(() => this.downloadOnce(method, params, range));
+  }
+
+  private async downloadOnce(method: string, params: Record<string, unknown>, range?: StoreRange): Promise<Uint8Array> {
     const startedAt = Date.now();
     const url = new URL(this.endpoint);
     const common = storeProtocolFields(method, this.credentials.qid, this.metadata);
@@ -102,7 +128,7 @@ export class StoreClient implements StoreClientLike {
     if (range) headers.Range = `bytes=${range.start}-${range.end}`;
     let status: number | undefined;
     try {
-      const response = await requestUrl({ url: url.toString(), method: "GET", headers, throw: false });
+      const response = await cancellable(requestUrl({ url: url.toString(), method: "GET", headers, throw: false }), this.signal, this.check);
       status = response.status;
       if ((response.status < 200 || response.status >= 300) && response.status !== 206) throw new Error(`Store ${method} failed: HTTP ${response.status}`);
       const bytes = new Uint8Array(response.arrayBuffer);

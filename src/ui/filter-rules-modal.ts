@@ -31,7 +31,7 @@ export class FilterRulesModal extends Modal {
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: "过滤规则" });
     this.contentEl.createEl("p", {
-      text: "选择参与或不参与同步的文件或文件夹。规则按列表从上到下匹配，最后命中的规则生效；Aa 控制是否区分大小写。",
+      text: "选择参与或不参与同步的文件或文件夹。规则按列表从上到下匹配，最后命中的规则生效；Aa 控制是否区分大小写。通过“忽略此文件”添加的路径排除规则也在这里，删除或停用后保存即可取消忽略。",
       cls: "setting-item-description",
     });
     const actions = this.contentEl.createDiv({ cls: "yunpan-sync-filter-actions" });

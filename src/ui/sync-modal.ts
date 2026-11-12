@@ -9,6 +9,7 @@ import { failedTaskPresentation, taskOperationLabel } from "./task-presentation.
 import { pageItems, renderPager } from "./list-page.js";
 import { TransferList } from "./transfer-list.js";
 import { SkippedFilesList } from "./skipped-files.js";
+import { renderIgnoreFileAction } from "./failed-record-action.js";
 
 export interface SyncModalOwner {
   app: App;
@@ -17,9 +18,11 @@ export interface SyncModalOwner {
   failedTasks: readonly SyncTask[];
   isSyncing: boolean;
   cancelSync(): void;
+  resumeSync(): void;
   hideSyncProgress(modal: SyncProgressModal): void;
   retryTask(id: string): Promise<void>;
   removeFailedTask(id: string): Promise<void>;
+  ignoreTask(id: string): Promise<void>;
   resolveSyncRestriction?(): Promise<void>;
 }
 
@@ -27,7 +30,15 @@ export class SyncProgressModal extends Modal {
   private headingTitleEl?: HTMLElement;
   private iconEl?: HTMLElement;
   private bodyEl?: HTMLElement;
+  private summaryEl?: HTMLElement;
+  private pendingEl?: HTMLElement;
+  private recordsEl?: HTMLElement;
+  private historyEl?: HTMLElement;
   private footerEl?: HTMLElement;
+  private stopButton?: HTMLButtonElement;
+  private resumeButton?: HTMLButtonElement;
+  private hideButton?: HTMLButtonElement;
+  private restrictionButton?: HTMLButtonElement;
   private transitioning = false;
   private readonly transferList = new TransferList();
   private readonly skippedList = new SkippedFilesList();
@@ -53,7 +64,26 @@ export class SyncProgressModal extends Modal {
       this.searchTimer = setTimeout(() => { this.query = search.value.trim().toLowerCase(); this.transferList.resetPages(); this.render(); }, 150);
     });
     this.bodyEl = this.contentEl.createDiv({ cls: "yunpan-sync-modal-body" });
+    this.summaryEl = this.bodyEl.createDiv();
+    this.pendingEl = this.bodyEl.createDiv();
+    this.recordsEl = this.bodyEl.createDiv();
+    this.historyEl = this.bodyEl.createDiv();
     this.footerEl = this.contentEl.createDiv({ cls: "yunpan-sync-modal-footer" });
+    this.restrictionButton = this.footerEl.createEl("button", { cls: "mod-cta yunpan-sync-restriction-action" });
+    this.restrictionButton.addEventListener("click", () => void this.owner.resolveSyncRestriction?.());
+    this.resumeButton = this.footerEl.createEl("button", { text: "恢复同步", cls: "mod-cta" });
+    this.resumeButton.addEventListener("click", () => {
+      if (!this.resumeButton!.disabled && !this.resumeButton!.hidden) this.owner.resumeSync();
+    });
+    this.stopButton = this.footerEl.createEl("button", { text: "停止同步", cls: "mod-warning" });
+    this.stopButton.addEventListener("click", () => {
+      if (this.stopButton!.disabled || this.stopButton!.hidden) return;
+      this.stopButton!.disabled = true;
+      this.stopButton!.setText("正在停止…");
+      this.owner.cancelSync();
+    });
+    this.hideButton = this.footerEl.createEl("button", { text: "隐藏" });
+    this.hideButton.addEventListener("click", () => this.hide());
     this.render();
   }
 
@@ -72,12 +102,8 @@ export class SyncProgressModal extends Modal {
     this.iconEl.toggleClass("is-success", completed);
     this.iconEl.toggleClass("is-error", failed);
     const scrollTop = this.bodyEl.scrollTop;
-    this.renderProgress(unchanged, failed, stopped);
-    if (cleared) {
-      this.bodyEl.empty();
-      this.bodyEl.createDiv({ text: status.message, cls: "yunpan-sync-modal-message" });
-    }
-    this.renderFooter(completed || failed || stopped || cleared);
+    this.renderProgress(unchanged, failed, stopped, cleared);
+    this.renderFooter(completed || failed || cleared, stopped);
     this.bodyEl.scrollTop = scrollTop;
   }
 
@@ -89,45 +115,52 @@ export class SyncProgressModal extends Modal {
     if (!this.transitioning) this.owner.hideSyncProgress(this);
   }
 
-  private renderProgress(unchanged: boolean, failed: boolean, stopped: boolean): void {
-    const body = this.bodyEl!;
+  private renderProgress(unchanged: boolean, failed: boolean, stopped: boolean, cleared: boolean): void {
+    // Keep transfer containers mounted across every progress refresh so native
+    // pointer and keyboard clicks retain their original pagination targets.
+    const body = this.summaryEl!;
     body.empty();
+    this.recordsEl!.empty();
+    this.pendingEl!.hidden = unchanged || cleared;
+    this.historyEl!.hidden = unchanged || cleared;
+    if (cleared) {
+      body.createDiv({ text: this.owner.currentStatus.message, cls: "yunpan-sync-modal-message" });
+      return;
+    }
     this.skippedList.render(body, this.owner.currentStatus.skippedFiles, this.query, () => this.render());
     if (unchanged) {
       body.createDiv({ text: "本地与云端内容一致，无需同步", cls: "yunpan-sync-modal-message is-unchanged" });
       return;
     }
     const transfers = this.owner.transferProgress;
-    const { summary, percent } = overallTransferProgress(transfers, this.owner.currentStatus);
+    const { summary, percent, operationTotal, operationCompleted } = overallTransferProgress(transfers, this.owner.currentStatus);
     const groups = groupTransfers(transfers, this.query);
-    if (this.owner.currentStatus.diagnostics) {
-      const d = this.owner.currentStatus.diagnostics;
-      body.createDiv({ text: `绑定目录已读取 ${d.remoteNodes} 项 · 已比较 ${d.matchedNodes} 项 · 本地已扫描 ${d.localFiles} 个文件`,
-        cls: "setting-item-description" });
-    }
     if (summary.activePath) body.createDiv({ text: summary.activePath, cls: "yunpan-sync-modal-current" });
-    const panel = body.createDiv({ cls: "yunpan-sync-modal-progress-panel" });
-    const label = panel.createDiv({ cls: "yunpan-sync-total-heading" });
-    label.createSpan({ text: "总进度", cls: "yunpan-sync-modal-label" });
-    if (percent !== undefined) {
-      label.createSpan({ text: `${percent}%`, cls: "yunpan-sync-total-percent" });
-      const bar = panel.createDiv({ cls: "yunpan-sync-modal-progress-track", attr: { role: "progressbar",
-        "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(percent), "aria-label": "同步总进度" } });
-      bar.createDiv({ cls: "yunpan-sync-modal-progress-fill" }).style.width = `${percent}%`;
-      panel.createDiv({ text: `已完成 ${summary.completedCount} / ${transfers.length} 个文件 · ${formatBytes(summary.completedBytes)} / ${formatBytes(summary.totalBytes)}`,
-        cls: "yunpan-sync-total-detail" });
-    } else panel.createDiv({ text: this.owner.currentStatus.message, cls: "yunpan-sync-total-detail" });
+    if (operationTotal > 0) {
+      const panel = body.createDiv({ cls: "yunpan-sync-modal-progress-panel" });
+      const label = panel.createDiv({ cls: "yunpan-sync-total-heading" });
+      label.createSpan({ text: "总进度", cls: "yunpan-sync-modal-label" });
+      if (percent !== undefined) label.createSpan({ text: `${percent}%`, cls: "yunpan-sync-total-percent" });
+      if (percent !== undefined) {
+        const bar = panel.createDiv({ cls: "yunpan-sync-modal-progress-track", attr: { role: "progressbar",
+          "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(percent), "aria-label": "同步总进度" } });
+        bar.createDiv({ cls: "yunpan-sync-modal-progress-fill" }).style.width = `${percent}%`;
+      }
+      const quantity = `已完成 ${operationCompleted} / ${operationTotal} 项`;
+      const bytes = summary.totalBytes > 0 ? ` · ${formatBytes(summary.completedBytes)} / ${formatBytes(summary.totalBytes)}` : "";
+      panel.createDiv({ text: `${quantity}${bytes}`, cls: "yunpan-sync-total-detail" });
+    } else body.createDiv({ text: this.owner.currentStatus.message, cls: "yunpan-sync-total-detail" });
     if (failed || stopped) {
       const guidance = classifySyncError(this.owner.currentStatus.lastError ?? this.owner.currentStatus.message);
       const message = body.createDiv({ cls: "yunpan-sync-modal-message is-error" });
       message.createEl("strong", { text: guidance.title });
       message.createDiv({ text: guidance.detail });
     }
-    this.transferList.render(body, groups.pending, false, this.owner, () => this.render(), "modal");
+    this.transferList.render(this.pendingEl!, groups.pending, false, this.owner, () => this.render(), "modal");
     const transferIds = new Set(transfers.map(item => item.id));
     const otherFailures = this.owner.failedTasks.filter(task => !transferIds.has(task.id));
     if (otherFailures.length > 0) {
-      const list = body.createDiv({ cls: "yunpan-sync-modal-failure-list" });
+      const list = this.recordsEl!.createDiv({ cls: "yunpan-sync-modal-failure-list" });
       list.createEl("h4", { text: "失败文件" });
       const page = pageItems(otherFailures, this.failurePage);
       this.failurePage = page.page;
@@ -144,13 +177,15 @@ export class SyncProgressModal extends Modal {
         const retry = actions.createEl("button", { text: "重试此文件", cls: "yunpan-sync-modal-transfer-action-button" });
         retry.disabled = this.owner.isSyncing;
         retry.addEventListener("click", () => void this.owner.retryTask(presentation.retryTaskId));
-        const remove = actions.createEl("button", { text: "删除记录", cls: "yunpan-sync-modal-transfer-action-button" });
+        const remove = actions.createEl("button", { text: "删除记录", cls: "yunpan-sync-modal-transfer-action-button",
+          attr: { title: "仅清除失败记录，下次同步仍会重新检测此文件" } });
         remove.disabled = this.owner.isSyncing;
         remove.addEventListener("click", () => void this.owner.removeFailedTask(presentation.retryTaskId));
+        renderIgnoreFileAction(actions, presentation.retryTaskId, this.owner);
       }
     }
     if (this.owner.currentStatus.fileFailures?.length) {
-      const list = body.createDiv({ cls: "yunpan-sync-modal-failure-list" });
+      const list = this.recordsEl!.createDiv({ cls: "yunpan-sync-modal-failure-list" });
       if (otherFailures.length === 0) list.createEl("h4", { text: "失败文件" });
       const page = pageItems(this.owner.currentStatus.fileFailures, this.scanPage);
       this.scanPage = page.page;
@@ -168,20 +203,23 @@ export class SyncProgressModal extends Modal {
         }
       }
     }
-    this.transferList.render(body, groups.completed, true, this.owner, () => this.render(), "modal");
+    this.transferList.render(this.historyEl!, groups.completed, true, this.owner, () => this.render(), "modal");
   }
 
-  private renderFooter(finished: boolean): void {
-    const footer = this.footerEl!;
-    footer.empty();
+  private renderFooter(finished: boolean, stopped: boolean): void {
+    // Keep the same native click targets while progress updates. Replacing a
+    // button between mouse-down and mouse-up prevents the browser's click event.
     const restriction = this.owner.currentStatus.restriction;
-    if (restriction) footer.createEl("button", { cls: "mod-cta",
-      text: restriction.kind === "membership" ? "去续费" : restriction.kind === "capacity" ? "去扩容" : "刷新后重试" })
-      .addEventListener("click", () => void this.owner.resolveSyncRestriction?.());
-    if (!finished) footer.createEl("button", { text: "停止同步", cls: "mod-warning" })
-      .addEventListener("click", () => this.owner.cancelSync());
-    footer.createEl("button", { text: finished ? "关闭" : "隐藏" })
-      .addEventListener("click", () => this.hide());
+    this.restrictionButton!.hidden = !restriction;
+    if (restriction) this.restrictionButton!.setText(
+      restriction.kind === "membership" ? "去续费" : restriction.kind === "capacity" ? "去扩容" : "刷新后重试");
+    const stopping = this.owner.currentStatus.phase === "stopping";
+    this.resumeButton!.hidden = !stopped;
+    this.resumeButton!.disabled = !stopped;
+    this.stopButton!.hidden = finished || stopped;
+    this.stopButton!.disabled = stopping || finished;
+    this.stopButton!.setText(stopping ? "正在停止…" : "停止同步");
+    this.hideButton!.setText(finished || stopped ? "关闭" : "隐藏");
   }
 }
 
