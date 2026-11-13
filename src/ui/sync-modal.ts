@@ -10,6 +10,7 @@ import { pageItems, renderPager } from "./list-page.js";
 import { TransferList } from "./transfer-list.js";
 import { SkippedFilesList } from "./skipped-files.js";
 import { renderIgnoreFileAction } from "./failed-record-action.js";
+import { formatDisplayPath, pathDisplayAttributes } from "./path-display.js";
 
 export interface SyncModalOwner {
   app: App;
@@ -57,7 +58,7 @@ export class SyncProgressModal extends Modal {
     this.iconEl = heading.createDiv({ cls: "yunpan-sync-modal-icon" });
     this.iconName = undefined;
     this.headingTitleEl = heading.createEl("h2");
-    const search = this.contentEl.createEl("input", { type: "search", placeholder: "按传输路径搜索...",
+    const search = this.contentEl.createEl("input", { type: "search", cls: "yunpan-sync-progress-search", placeholder: "按传输路径搜索...",
       attr: { "aria-label": "搜索传输文件" } });
     search.addEventListener("input", () => {
       if (this.searchTimer) clearTimeout(this.searchTimer);
@@ -135,7 +136,8 @@ export class SyncProgressModal extends Modal {
     const transfers = this.owner.transferProgress;
     const { summary, percent, operationTotal, operationCompleted } = overallTransferProgress(transfers, this.owner.currentStatus);
     const groups = groupTransfers(transfers, this.query);
-    if (summary.activePath) body.createDiv({ text: summary.activePath, cls: "yunpan-sync-modal-current" });
+    if (summary.activePath) body.createDiv({ text: formatDisplayPath(summary.activePath), cls: "yunpan-sync-modal-current",
+      attr: pathDisplayAttributes(summary.activePath) });
     if (operationTotal > 0) {
       const panel = body.createDiv({ cls: "yunpan-sync-modal-progress-panel" });
       const label = panel.createDiv({ cls: "yunpan-sync-total-heading" });
@@ -170,7 +172,8 @@ export class SyncProgressModal extends Modal {
         const row = list.createDiv({ cls: `yunpan-sync-modal-failure is-${task.state}` });
         row.createSpan({ text: presentation.action, cls: "yunpan-sync-modal-transfer-action" });
         const detail = row.createDiv({ cls: "yunpan-sync-modal-transfer-detail" });
-        detail.createSpan({ text: presentation.path, cls: "yunpan-sync-modal-transfer-path" });
+        detail.createSpan({ text: formatDisplayPath(presentation.path), cls: "yunpan-sync-modal-transfer-path",
+          attr: pathDisplayAttributes(presentation.path) });
         detail.createDiv({ text: presentation.detail,
           cls: "setting-item-description" });
         const actions = row.createDiv({ cls: "yunpan-sync-modal-failure-actions" });
@@ -194,7 +197,8 @@ export class SyncProgressModal extends Modal {
         const row = list.createDiv({ cls: "yunpan-sync-modal-failure is-failed" });
         row.createSpan({ text: "扫描", cls: "yunpan-sync-modal-transfer-action" });
         const detail = row.createDiv({ cls: "yunpan-sync-modal-transfer-detail" });
-        detail.createSpan({ text: failure.path, cls: "yunpan-sync-modal-transfer-path" });
+        detail.createSpan({ text: formatDisplayPath(failure.path), cls: "yunpan-sync-modal-transfer-path",
+          attr: pathDisplayAttributes(failure.path) });
         detail.createDiv({ text: classifySyncError(failure.error).detail, cls: "setting-item-description" });
         if (failure.id) {
           const retry = row.createEl("button", { text: "重新检测" });
@@ -296,8 +300,9 @@ export class SyncTaskPreviewModal extends Modal {
         const destination = (task.payload as { destination?: unknown }).destination;
         const remotePath = task.kind === "local-rename" && typeof destination === "string" ? destination : task.path;
         row.createSpan({ text: conflict ? "保留冲突副本" : taskOperationLabel(task.kind), cls: "yunpan-sync-task-action" });
-        row.createSpan({ text: task.path, cls: "yunpan-sync-task-path" });
-        row.createSpan({ text: `${this.remoteRoot.replace(/\/$/, "")}/${remotePath}`, cls: "yunpan-sync-task-remote" });
+        const remoteFullPath = `${this.remoteRoot.replace(/\/$/, "")}/${remotePath}`;
+        row.createSpan({ text: formatDisplayPath(task.path), cls: "yunpan-sync-task-path", attr: pathDisplayAttributes(task.path) });
+        row.createSpan({ text: formatDisplayPath(remoteFullPath), cls: "yunpan-sync-task-remote", attr: pathDisplayAttributes(remoteFullPath) });
       }
     };
     search.addEventListener("input", () => {

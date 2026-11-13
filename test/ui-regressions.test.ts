@@ -608,6 +608,16 @@ describe("whole-run sync progress UI", () => {
     expect(statusBar.text).not.toContain("下载");
   });
 
+  it("adds a dedicated search class before the modal progress content", () => {
+    const { modal, root } = progressHarness([file("one", "transferring", 1)]);
+    const search = root.all().find(el => el.tag === "input");
+    const panel = find(root, "yunpan-sync-modal-progress-panel");
+    expect(search?.classes.has("yunpan-sync-progress-search")).toBe(true);
+    expect(root.children.indexOf(search!)).toBeLessThan(root.children.indexOf(find(root, "yunpan-sync-modal-body")));
+    expect(panel.classes.has("yunpan-sync-modal-progress-panel")).toBe(true);
+    modal.onClose();
+  });
+
   it("uses transfer files for the completed count and hides local scan diagnostics", () => {
     const { owner, modal, root } = progressHarness([
       file("done", "completed", 100), file("waiting", "queued"), file("failed", "failed"),
@@ -778,6 +788,7 @@ describe("whole-run sync progress UI", () => {
     expect(rows(root)).toHaveLength(2);
     expect(find(rows(root)[0]!, "yunpan-sync-transfer-path").text).toBe("active.md");
     const search = root.all().find(el => el.tag === "input")!;
+    expect(search.classes.has("yunpan-sync-progress-search")).toBe(true);
     find(root, "yunpan-sync-completed-toggle").listeners.get("click")!();
     root.scrollTop = 100; view.render();
     expect(root.scrollTop).toBe(100);

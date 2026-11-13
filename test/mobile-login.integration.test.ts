@@ -295,6 +295,37 @@ describe("login settings and installation lifecycle", () => {
     await plugin.onunload();
   });
 
+  it("keeps an open progress modal live during network recovery", async () => {
+    vi.useFakeTimers();
+    const { plugin, engine } = await recoveryPlugin();
+    const modal = { render: vi.fn() };
+    Object.assign(plugin, { syncModal: modal });
+    const updateStatus = (status: EngineStatus) =>
+      (plugin as unknown as { updateStatus(value: EngineStatus): void }).updateStatus(status);
+    let started!: () => void;
+    let finish!: () => void;
+    const running = new Promise<void>(resolve => { started = resolve; });
+    const done = new Promise<void>(resolve => { finish = resolve; });
+    engine.synchronize.mockImplementation(async () => {
+      updateStatus({ phase: "remote-index", message: "正在获取云端文件信息…", queued: 1, failed: 0 });
+      started();
+      await done;
+      updateStatus({ phase: "idle", message: "同步完成", queued: 0, failed: 0 });
+      return true;
+    });
+
+    fireNetwork(false); fireNetwork(true);
+    await running;
+    modal.render.mockClear();
+    updateStatus({ phase: "transfer", message: "正在执行同步任务", queued: 1, failed: 0 });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(modal.render).toHaveBeenCalled();
+
+    finish();
+    await settleEvents();
+    await plugin.onunload();
+  });
+
   it.each(["manual", "paused"] as const)("does not resume %s synchronization on reconnect", async state => {
     const { plugin, engine } = await recoveryPlugin(state === "manual" ? "manual" : "automatic");
     if (state === "paused") await plugin.setPaused(true);
@@ -717,6 +748,24 @@ describe("login settings and installation lifecycle", () => {
     await plugin.onunload();
   });
 
+  it("shows activation guidance and refresh for transfer-package accounts", async () => {
+    const plugin = await loadPlugin();
+    harness.secrets.set(AUTH_SECRET_ID, JSON.stringify(storedAuth()));
+    const api = { call: vi.fn() };
+    const engine = { isRunning: () => false, clearMembershipRestriction: vi.fn() };
+    Object.assign(plugin, { api, engine, accountProfile: normalizeAccountProfile({
+      package_id: 8, is_vip: 0, name: "transfer-account", used_size: 10, total_size: 100,
+    }, "42"), status: { phase: "idle", queued: 0, failed: 0, message: "已登录" } });
+    const tab = tabs.at(-1)!;
+    tab.refresh();
+    const accountRow = rows.filter(row => row.settingEl.parent?.attributes["aria-label"] === "账号设置").at(-1)!;
+    const label = accountRow.nameEl.all().find(el => el.className.split(" ").includes("yunpan-sync-membership-label"));
+    expect(label?.textContent).toBe("您还不是会员");
+    expect(accountRow.nameEl.all().some(el => el.textContent === "去开通")).toBe(true);
+    expect(accountRow.buttons.find(button => button.tooltip === "刷新会员状态")).toBeDefined();
+    await plugin.onunload();
+  });
+
   it("does not reopen hidden settings after a request completes", async () => {
     const { plugin, api, tab } = await expiredProfileFixture();
     let complete!: (data: unknown) => void;
@@ -820,6 +869,90 @@ describe("login settings and installation lifecycle", () => {
     await plugin.syncNow(false, false);
     expect(harness.notice).toHaveBeenCalledWith("网络连接异常: 网络连接异常，请检查网络后重试。");
     expect(plugin.currentStatus).toMatchObject({ phase: "error", message: "网络连接异常" });
+    await plugin.onunload();
+  });
+
+  it.each([
+    ["automatic", true, "manual"], ["scheduled", true, "manual"],
+    ["automatic", false, "auto"], ["scheduled", false, "lowAuto"],
+  ] as const)("reports %s synchronization with interactive=%s as %s", async (mode, interactive, expected) => {
+    const { plugin, engine } = await recoveryPlugin(mode);
+    const track = vi.spyOn(plugin, "trackAnalytics");
+    vi.spyOn(plugin, "showSyncProgress").mockImplementation(() => {});
+    Object.assign(engine, { getLastRunSummary: () => ({ files: [{ path: "note.md", size: 1536 }], failures: [], cancelled: false }) });
+    await plugin.syncNow(false, interactive);
+    expect(track).toHaveBeenCalledExactlyOnceWith("obPlugin_sync_result", expect.objectContaining({
+      syncType: expected, fileName: '["note.md 1.5KB"]',
+    }));
+    await plugin.onunload();
+  });
+
+  it.each(["preflight", "running"] as const)("promotes an automatic run during %s when a manual sync joins it", async stage => {
+    const { plugin, engine } = await recoveryPlugin();
+    const track = vi.spyOn(plugin, "trackAnalytics");
+    vi.spyOn(plugin, "showSyncProgress").mockImplementation(() => {});
+    Object.assign(engine, { getLastRunSummary: () => ({ files: [], failures: [], cancelled: false }) });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    if (stage === "preflight") Object.assign(plugin, { api: { call: vi.fn(() => held) } });
+    else engine.synchronize.mockImplementation(async () => {
+      engine.isRunning.mockReturnValue(true);
+      await held;
+      engine.isRunning.mockReturnValue(false);
+      return true;
+    });
+    const first = plugin.syncNow(false, false);
+    await settleEvents();
+    await plugin.syncNow();
+    await plugin.syncNow(false, false);
+    release();
+    await first;
+    expect(engine.synchronize).toHaveBeenCalledOnce();
+    expect(track).toHaveBeenCalledExactlyOnceWith("obPlugin_sync_result", expect.objectContaining({ syncType: "manual" }));
+
+    track.mockClear();
+    await plugin.syncNow(false, false);
+    expect(track).toHaveBeenCalledExactlyOnceWith("obPlugin_sync_result", expect.objectContaining({ syncType: "auto" }));
+    await plugin.onunload();
+  });
+
+  it("reports each run before a later run can replace its summary during persistence", async () => {
+    const { plugin, engine } = await recoveryPlugin();
+    const track = vi.spyOn(plugin, "trackAnalytics");
+    vi.spyOn(plugin, "showSyncProgress").mockImplementation(() => {});
+    let summary = { files: [{ path: "first.md", size: 1024 }], failures: [], cancelled: false };
+    Object.assign(engine, { getLastRunSummary: () => summary });
+    let saving!: () => void;
+    let release!: () => void;
+    const startedSaving = new Promise<void>(resolve => { saving = resolve; });
+    const saved = new Promise<void>(resolve => { release = resolve; });
+    harness.save.mockImplementationOnce(async () => { saving(); await saved; });
+    const first = plugin.syncNow(false, false);
+    await startedSaving;
+    summary = { ...summary, files: [{ path: "second.md", size: 2048 }] };
+    await plugin.syncNow();
+    release();
+    await first;
+    expect(engine.synchronize).toHaveBeenCalledTimes(2);
+    expect(track.mock.calls).toEqual([
+      ["obPlugin_sync_result", expect.objectContaining({ syncType: "auto", fileName: '["first.md 1KB"]' })],
+      ["obPlugin_sync_result", expect.objectContaining({ syncType: "manual", fileName: '["second.md 2KB"]' })],
+    ]);
+    await plugin.onunload();
+  });
+
+  it.each(["partial", "error", "cancelled"] as const)("reports %s runs without losing their manual source", async outcome => {
+    const { plugin, engine } = await recoveryPlugin();
+    const track = vi.spyOn(plugin, "trackAnalytics");
+    vi.spyOn(plugin, "showSyncProgress").mockImplementation(() => {});
+    Object.assign(engine, { getLastRunSummary: () => ({
+      files: [{ path: "bad.md", size: 1024 }], failures: [{ path: "bad.md", reason: "HTTP 500" }],
+      cancelled: outcome === "cancelled",
+    }) });
+    if (outcome === "error") engine.synchronize.mockRejectedValueOnce(new Error("HTTP 500"));
+    await plugin.syncNow();
+    if (outcome === "cancelled") expect(track).not.toHaveBeenCalled();
+    else expect(track).toHaveBeenCalledExactlyOnceWith("obPlugin_sync_result", expect.objectContaining({ syncType: "manual", failFileNum: "1" }));
     await plugin.onunload();
   });
 

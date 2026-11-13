@@ -2,6 +2,17 @@
 
 仓库：[Qihoo360/obsidian-yunpan-sync](https://github.com/Qihoo360/obsidian-yunpan-sync)
 
+## 1.0.9 — 同步打点与界面修复 / Sync analytics and interface fixes
+
+- 增加安装后首次加载、启动、登录、同步结果及相关操作的雷达上报，渠道统一为 `obsidian`；不写入本地 `radar.log`。
+- 手动同步统一记录为 `manual`；后台同步中点击立即同步会将当前轮次记为手动，不重复启动任务。自动及低频自动同步分别记录为 `auto`、`lowAuto`，生命周期恢复保持后台类型。
+- 同步结果明细覆盖上传、下载、编辑、删除、重命名、移动及冲突派生任务；重命名和移动包含源、目标路径，文件大小使用 KB、最多两位小数，每次最多 10 条。
+- 修复网络恢复后已打开的同步进度弹窗停留在旧阶段的问题。
+- 统一移动端欢迎文案的字号、行高和居中方式，保留品牌强调；改善同步搜索框间距和长路径展示，完整路径保留在提示与无障碍标签中。
+- 修正传输套餐账号的非会员提示及开通、刷新入口。
+
+验证：721 项自动化测试（43 个文件）、TypeScript 检查、生产构建、公开内容及发布附件检查通过。本版未新增 Desktop、Android、iOS 真机验收记录，也未以自动化测试代替真实雷达后台收点验收。
+
 ## 1.0.8 — 同步恢复与结构操作进度修复 / Sync recovery and structural progress fixes
 
 - 自动与低频自动同步在联网恢复后立即继续；合并重复恢复事件，等待旧运行和目录预检退出，避免恢复请求丢失。断网或切后台关闭首次确认不再被当成用户取消；用户主动暂停继续保持有效，移动端回前台后恢复。
@@ -103,17 +114,17 @@ Desktop、Android 和 iOS 真实设备验收均已通过，记录见本文末尾
 ```bash
 npm ci --ignore-scripts
 npm run verify
-npm run check:release -- --tag=1.0.8
+npm run check:release -- --tag=1.0.9
 ```
 
 `npm run verify` 包含公开内容检查、测试和生产构建，成功后会生成 `main.js`。
 
 完成下方发布检查后，将本版本提交推送至仓库默认分支，再打开 [创建 GitHub Release](https://github.com/Qihoo360/obsidian-yunpan-sync/releases/new)：
 
-1. 选择包含本次版本修改的提交，创建标签 `1.0.8`，不要添加 `v` 前缀。
-2. Release 标题填写 `1.0.8`，说明使用上方版本说明，并保留实际验证状态和已知限制。
+1. 选择包含本次版本修改的提交，创建标签 `1.0.9`，不要添加 `v` 前缀。
+2. Release 标题填写 `1.0.9`，说明使用上方版本说明，并保留实际验证状态和已知限制。
 3. 将构建自同一提交的 `main.js`、`manifest.json`、`styles.css` 作为独立附件上传，同时附上 `LICENSE` 和 `THIRD_PARTY_NOTICES.md`。
-4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.8`，附件齐全后发布 Release。
+4. 确认标签、默认分支及附件中的 `manifest.json` 版本均为 `1.0.9`，附件齐全后发布 Release。
 
 Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安装文件，只有源码或自动生成的源码压缩包不能替代上述附件。
 
@@ -123,12 +134,12 @@ Obsidian 按 `manifest.json` 的版本号下载同名 GitHub Release 中的安�
 2. 在真实 Obsidian Desktop、Android 和 iOS 上分别验收生产账号授权、首次任务确认、双向增删改、冲突、断网恢复和退出登录。模拟测试只验证受控协议；未验证平台不得宣称通过。
 3. 首次使用前备份 Vault。生产迁移会清除旧环境登录态与同步基线，并要求重新登录和确认目录，不删除笔记。
 4. 确认版本更新记录、已知限制和[隐私说明](PRIVACY.md)与本次行为相符，并检查仓库和服务链接可用。
-5. 构建后执行 `npm run check:release -- --tag=1.0.8`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
+5. 构建后执行 `npm run check:release -- --tag=1.0.9`。版本标签必须与 manifest 完全一致，不加 `v` 前缀。
 6. GitHub Release 上传 `main.js`、`manifest.json`、`styles.css`，同时提供 [LICENSE](LICENSE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。不上传用户设置、数据库、Token 或构建缓存。
 
 ## 隐私与许可 / Privacy and licensing
 
-双向同步会向用户选择的云盘目录发送文件内容及必要元数据，删除会双向传播。数据范围、生产服务、凭据与本地状态存储详见[隐私说明](PRIVACY.md)。插件不发送独立客户端遥测；云盘容量和会员可能收费，本插件不是 Obsidian 官方 Sync 服务。
+双向同步会向用户选择的云盘目录发送文件内容及必要元数据，删除会双向传播。插件向雷达服务发送使用事件、账号与设备信息及有限的同步文件明细。数据范围、生产服务、凭据与本地状态存储详见[隐私说明](PRIVACY.md)。云盘容量和会员可能收费，本插件不是 Obsidian 官方 Sync 服务。
 
 The MIT license covers this code. Cloud services, membership, trademarks, and service terms remain separate. The two protocol signing constants are intentionally public client parameters; user OAuth credentials must remain in Obsidian Secret Storage.
 

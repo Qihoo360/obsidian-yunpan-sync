@@ -51,14 +51,20 @@ export function membershipIcon(profile: AccountProfile, active = hasActiveMember
 }
 
 export function hasActiveMembership(profile: AccountProfile, now = Date.now()): boolean {
-  return profile.isVip && (profile.expiresAt === undefined || profile.expiresAt > now);
+  return !isTransferPackage(profile) && profile.isVip && (profile.expiresAt === undefined || profile.expiresAt > now);
 }
 
 export function hasExpiredMembership(profile: AccountProfile, now = Date.now()): boolean {
   return profile.expiresAt !== undefined && profile.expiresAt <= now;
 }
 
+/** Package 8 is a transfer-only account and does not include membership access. */
+export function isTransferPackage(profile: AccountProfile): boolean {
+  return profile.packageId === "8";
+}
+
 export function membershipLabel(profile: AccountProfile, now = Date.now()): string {
+  if (isTransferPackage(profile)) return "您还不是会员";
   if (hasActiveMembership(profile, now)) return profile.vipLabel;
   if (hasExpiredMembership(profile, now)) return "会员已过期";
   return "普通用户";

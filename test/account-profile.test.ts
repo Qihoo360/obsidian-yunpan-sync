@@ -9,6 +9,7 @@ import {
 import {
   hasActiveMembership,
   hasExpiredMembership,
+  isTransferPackage,
   membershipLabel,
   membershipDisplay,
   membershipIcon,
@@ -53,6 +54,14 @@ describe("account profile", () => {
       username: "fallback-name",
       isVip: false,
       vipLabel: "普通用户",
+    });
+  });
+
+  it("preserves Radar common account properties when returned by the API", () => {
+    expect(normalizeAccountProfile({ eid: "e1", package_id: 210, register_src: "src",
+      channel: "channel", sub_channel: "sub", channel_type: "type" }, "q1")).toMatchObject({
+      eid: "e1", packageId: "210", registerSrc: "src", channel: "channel",
+      subchannel: "sub", channelType: "type",
     });
   });
 
@@ -144,6 +153,12 @@ describe("account profile", () => {
     expect(normalizeAccountProfile({ used_size: 10, total_size: 100, available_size: "90", e_used_size: 50,
       e_total_size: 80, e_available_size: "25" }, "42")).toMatchObject({ usedBytes: 10, totalBytes: 100,
       availableBytes: 90, enterpriseUsedBytes: 50, enterpriseTotalBytes: 80, enterpriseAvailableBytes: 25 });
+  });
+
+  it("identifies transfer packages as non-members who can be guided to activate membership", () => {
+    const profile = normalizeAccountProfile({ package_id: 8, is_vip: 0, used_size: 1, total_size: 2 }, "42");
+    expect(isTransferPackage(profile)).toBe(true);
+    expect(membershipLabel(profile)).toBe("您还不是会员");
   });
 
   it("uses the membership icon selected by the backend for the account type", () => {

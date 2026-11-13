@@ -4,6 +4,7 @@ import { normalizeRemoteRoot, validateWindowsPathSegment } from "../domain/paths
 import type { OpenApiMethod } from "../net/openapi-client.js";
 import { loadRemoteDirectories, type RemoteDirectory } from "./remote-directory.js";
 import { trackModalViewport } from "./modal-viewport.js";
+import { formatDisplayPath } from "./path-display.js";
 
 interface DirectoryApi {
   call<T>(method: OpenApiMethod, input: Record<string, string | number | boolean | null | undefined>): Promise<T>;
@@ -143,8 +144,8 @@ export class RemoteDirectoryModal extends Modal {
       }
     }
 
-    contentEl.createDiv({ text: `当前路径：${this.currentPath}`, cls: "yunpan-sync-directory-path",
-      attr: { "aria-live": "polite" } });
+    contentEl.createDiv({ text: `当前路径：${formatDisplayPath(this.currentPath)}`, cls: "yunpan-sync-directory-path",
+      attr: { "aria-live": "polite", title: `当前路径：${this.currentPath}`, "aria-label": `当前路径：${this.currentPath}` } });
     const footer = contentEl.createDiv({ cls: "yunpan-sync-modal-footer yunpan-sync-directory-footer" });
     const navigation = footer.createDiv({ cls: "yunpan-sync-directory-navigation" });
     const up = navigation.createEl("button", { text: "返回上一层" });

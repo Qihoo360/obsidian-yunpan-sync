@@ -254,6 +254,39 @@
   font-size: var(--font-ui-large);
 }
 
+.yunpan-sync-welcome-line {
+  display: inline;
+  overflow-wrap: anywhere;
+}
+
+.yunpan-sync-progress-search {
+  margin-bottom: 12px;
+}
+
+.yunpan-sync-mobile-settings .yunpan-sync-welcome-line {
+  display: block;
+  width: 100%;
+  text-align: center;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.yunpan-sync-mobile-settings .yunpan-sync-welcome {
+  font-size: var(--font-ui-large);
+  font-weight: var(--font-normal);
+  line-height: 1.4;
+}
+
+.yunpan-sync-mobile-settings .yunpan-sync-welcome-line strong {
+  font-size: inherit;
+  line-height: inherit;
+  font-weight: var(--font-semibold);
+}
+
+.yunpan-sync-mobile-settings .yunpan-sync-welcome-line + .yunpan-sync-welcome-line {
+  margin-top: 4px;
+}
+
 .yunpan-sync-filter-modal {
   width: min(880px, calc(100vw - 32px));
   height: min(720px, calc(var(--yunpan-visible-height, 100dvh) - 24px));
@@ -371,6 +404,10 @@
 }
 
 @media (max-width: 680px) {
+  .yunpan-sync-progress-search {
+    margin-bottom: 16px;
+  }
+
   .yunpan-sync-settings-group > .setting-item {
     align-items: stretch;
     flex-direction: column;

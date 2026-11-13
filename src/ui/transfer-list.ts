@@ -4,6 +4,7 @@ import { transferPresentation, type FileTransferProgress } from "../sync/progres
 import { classifySyncError } from "../sync/error-guidance.js";
 import { pageItems } from "./list-page.js";
 import { renderIgnoreFileAction } from "./failed-record-action.js";
+import { formatDisplayPath, pathDisplayAttributes } from "./path-display.js";
 
 export interface TransferListOwner {
   isSyncing: boolean;
@@ -65,7 +66,8 @@ export class TransferList {
       const icon = heading.createSpan({ cls: "yunpan-sync-file-state-icon" });
       setIcon(icon, presentation.icon);
       heading.createSpan({ text: transfer.direction === "upload" ? "上传" : "下载", cls: "yunpan-sync-file-direction" });
-      heading.createSpan({ text: transfer.path, cls: "yunpan-sync-transfer-path" });
+      heading.createSpan({ text: formatDisplayPath(transfer.path), cls: "yunpan-sync-transfer-path",
+        attr: pathDisplayAttributes(transfer.path) });
       const detail = row.createDiv({ cls: "yunpan-sync-file-detail" });
       detail.createSpan({ text: `${presentation.label} ${presentation.percent}%`, cls: "yunpan-sync-file-state" });
       detail.createSpan({ text: `${formatBytes(transfer.completedBytes)} / ${formatBytes(transfer.totalBytes)}` });

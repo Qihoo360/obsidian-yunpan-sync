@@ -51,6 +51,25 @@ describe("product requirement helpers", () => {
     expect(manifest).not.toContain("360 Cloud");
   });
 
+  it("splits the mobile welcome copy into two lines and spaces progress search", () => {
+    const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    const modalSource = readFileSync(new URL("../src/ui/sync-modal.ts", import.meta.url), "utf8");
+    const sideSource = readFileSync(new URL("../src/ui/status-view.ts", import.meta.url), "utf8");
+    const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+    const mobileStyles = styles.slice(styles.indexOf("@media (max-width: 680px)"));
+
+    expect(source).toContain('cls: "yunpan-sync-welcome-line"');
+    expect(source).toContain('text: "让您的笔记永远随身！"');
+    expect(styles).toMatch(/\.yunpan-sync-mobile-settings \.yunpan-sync-welcome-line\s*\{[^}]*display:\s*block/);
+    expect(styles).toMatch(/\.yunpan-sync-mobile-settings \.yunpan-sync-welcome\s*\{[^}]*font-size:\s*var\(--font-ui-large\)[^}]*line-height:\s*1\.4/);
+    expect(styles).toMatch(/\.yunpan-sync-mobile-settings \.yunpan-sync-welcome-line\s*\{[^}]*width:\s*100%[^}]*text-align:\s*center/);
+    expect(styles).toMatch(/\.yunpan-sync-mobile-settings \.yunpan-sync-welcome-line strong\s*\{[^}]*font-size:\s*inherit[^}]*font-weight:\s*var\(--font-semibold\)/);
+    expect(modalSource).toContain('cls: "yunpan-sync-progress-search"');
+    expect(sideSource).toContain('cls: "yunpan-sync-progress-search"');
+    expect(styles).toMatch(/\.yunpan-sync-progress-search\s*\{[^}]*margin-bottom:\s*12px/);
+    expect(mobileStyles).toMatch(/\.yunpan-sync-progress-search\s*\{[^}]*margin-bottom:\s*16px/);
+  });
+
   it("presents index rebuild as user-facing automatic repair", () => {
     const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
     const engineSource = readFileSync(new URL("../src/sync/engine.ts", import.meta.url), "utf8");

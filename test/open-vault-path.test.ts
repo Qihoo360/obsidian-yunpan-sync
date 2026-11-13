@@ -41,6 +41,7 @@ vi.mock("obsidian", () => ({
 }));
 
 import { openVaultPath } from "../src/ui/open-vault-path.js";
+import { formatDisplayPath } from "../src/ui/path-display.js";
 
 function harness(text = '{ "original": true }\n') {
   const bytes = new TextEncoder().encode(text).buffer;
@@ -86,7 +87,8 @@ describe("openVaultPath", () => {
     const { app, adapter, open, openLinkText, find } = harness(text);
     await open(path);
     const normalized = path.replaceAll("\\", "/");
-    expect(find("yunpan-sync-file-preview-path")?.text).toBe(normalized);
+    expect(find("yunpan-sync-file-preview-path")?.text).toBe(formatDisplayPath(normalized));
+    expect(find("yunpan-sync-file-preview-path")?.attributes.title).toBe(normalized);
     expect(find("yunpan-sync-file-preview-text")?.text).toBe(text);
     expect(find("yunpan-sync-file-preview-text")?.tag).toBe("pre");
     expect(find("yunpan-sync-file-preview-text")?.children).toEqual([]);

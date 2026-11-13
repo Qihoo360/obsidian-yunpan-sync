@@ -1,6 +1,7 @@
 import type { SkippedFile, SkippedFileSource } from "../sync/file-policy.js";
 import { formatBytes } from "../account/profile.js";
 import { pageItems, renderPager } from "./list-page.js";
+import { formatDisplayPath, pathDisplayAttributes } from "./path-display.js";
 
 export class SkippedFilesList {
   private page = 0;
@@ -24,7 +25,7 @@ export class SkippedFilesList {
       const row = section.createDiv({ cls: "yunpan-sync-skipped-file" });
       row.createDiv({ text: `来源：${this.sourceLabel(file.source)}`, cls: "setting-item-description" });
       const path = row.createDiv({ cls: "yunpan-sync-skipped-file-path" });
-      path.createSpan({ text: file.path });
+      path.createSpan({ text: formatDisplayPath(file.path), attr: pathDisplayAttributes(file.path) });
       if (file.size !== undefined && Number.isSafeInteger(file.size) && file.size >= 0) {
         path.createSpan({ text: ` (${formatBytes(file.size)})`, cls: "yunpan-sync-skipped-file-size" });
       }

@@ -1,4 +1,5 @@
 import { Modal, Notice, type App } from "obsidian";
+import { formatDisplayPath, pathDisplayAttributes } from "./path-display.js";
 
 const MAX_PREVIEW_BYTES = 2 * 1024 * 1024;
 
@@ -35,7 +36,8 @@ class ReadonlyFilePreviewModal extends Modal {
     this.modalEl.addClass("yunpan-sync-file-preview");
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: "文件只读预览" });
-    this.contentEl.createDiv({ text: this.path, cls: "yunpan-sync-file-preview-path" });
+    this.contentEl.createDiv({ text: formatDisplayPath(this.path), cls: "yunpan-sync-file-preview-path",
+      attr: pathDisplayAttributes(this.path) });
     const status = this.contentEl.createDiv({ text: "正在读取文件…", cls: "yunpan-sync-file-preview-status",
       attr: { role: "status", "aria-live": "polite" } });
     const content = this.contentEl.createEl("pre", { cls: "yunpan-sync-file-preview-text",

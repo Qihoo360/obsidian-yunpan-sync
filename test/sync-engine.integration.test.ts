@@ -291,11 +291,64 @@ describe("complete in-memory two-way synchronization", () => {
     await synchronize(engine);
     expect(statuses.at(-1)).toMatchObject({ phase: "idle", operationTotal: 1, operationCompleted: 1 });
     expect(cloud.text("/Obsidian/renamed.md")).toBe("base");
+    expect(engine.getLastRunSummary()?.files).toEqual([{ path: "note.md", destination: "renamed.md", size: 4 }]);
 
     vault.delete("renamed.md");
     await synchronize(engine);
     expect(statuses.at(-1)).toMatchObject({ phase: "idle", operationTotal: 1, operationCompleted: 1 });
     expect(cloud.entries.has("/Obsidian/renamed.md")).toBe(false);
+    expect(engine.getLastRunSummary()?.files).toEqual([{ path: "renamed.md", size: 4 }]);
+  });
+
+  it("summarizes uploads, local and remote edits, downloads and local deletions with their correct sizes", async () => {
+    const { vault, cloud, engine } = await harness();
+    vault.putFile("upload.md", "upload");
+    await cloud.putFile("/Obsidian/download.md", "download");
+    await synchronize(engine);
+    expect(engine.getLastRunSummary()?.files).toEqual(expect.arrayContaining([
+      { path: "upload.md", size: 6 }, { path: "download.md", size: 8 },
+    ]));
+
+    vault.putFile("upload.md", "updated local");
+    await cloud.putFile("/Obsidian/download.md", "updated remote content");
+    await synchronize(engine);
+    expect(engine.getLastRunSummary()?.files).toEqual(expect.arrayContaining([
+      { path: "upload.md", size: 13 }, { path: "download.md", size: 22 },
+    ]));
+
+    cloud.remove("/Obsidian/download.md");
+    await synchronize(engine);
+    expect(engine.getLastRunSummary()?.files).toEqual([{ path: "download.md", size: 22 }]);
+    expect(vault.text("download.md")).toBeUndefined();
+  });
+
+  it("summarizes moves and remote renames with both paths and the baseline size", async () => {
+    const { vault, cloud, engine } = await harness();
+    vault.putFile("old.md", "contents");
+    await synchronize(engine);
+    vault.mkdir("archive");
+    await vault.rename(vault.getFileByPath("old.md")!, "archive/moved.md");
+    engine.recordRename("old.md", "archive/moved.md");
+    await synchronize(engine);
+    expect(engine.getLastRunSummary()?.files).toContainEqual({ path: "old.md", destination: "archive/moved.md", size: 8 });
+
+    cloud.rename("/Obsidian/archive/moved.md", "/Obsidian/archive/new.md");
+    await synchronize(engine);
+    expect(engine.getLastRunSummary()?.files).toContainEqual({ path: "archive/moved.md", destination: "archive/new.md", size: 8 });
+  });
+
+  it("includes conflict copies in the run file summary", async () => {
+    const { vault, cloud, engine } = await harness();
+    vault.putFile("conflict.md", "base");
+    await synchronize(engine);
+    vault.putFile("conflict.md", "local edit");
+    await cloud.putFile("/Obsidian/conflict.md", "remote edit");
+    await synchronize(engine);
+    const copy = vault.paths().find(path => path.startsWith("conflict (conflict-"));
+    expect(copy).toBeDefined();
+    expect(engine.getLastRunSummary()?.files).toEqual(expect.arrayContaining([
+      { path: "conflict.md", size: 11 }, { path: copy, size: 10 },
+    ]));
   });
 
   it.each(["upload", "download"] as const)("preserves interrupted %s tasks without pausing automatic mode", async direction => {

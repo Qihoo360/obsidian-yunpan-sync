@@ -9,6 +9,11 @@ export interface AccountProfile {
   vipLabel: string;
   membershipIconUrl?: string;
   packageId?: string;
+  eid?: string;
+  registerSrc?: string;
+  channel?: string;
+  subchannel?: string;
+  channelType?: string;
   expiresAt?: number;
   usedBytes?: number;
   totalBytes?: number;
@@ -75,6 +80,11 @@ export function normalizeAccountProfile(data: Record<string, unknown>, qid: stri
     expiresAt: epochMilliseconds(data.expire),
     usedBytes,
     totalBytes,
+    ...(text(data.eid) === undefined ? {} : { eid: text(data.eid) }),
+    ...((text(data.registerSrc) ?? text(data.register_src)) === undefined ? {} : { registerSrc: text(data.registerSrc) ?? text(data.register_src) }),
+    ...(text(data.channel) === undefined ? {} : { channel: text(data.channel) }),
+    ...((text(data.subchannel) ?? text(data.sub_channel)) === undefined ? {} : { subchannel: text(data.subchannel) ?? text(data.sub_channel) }),
+    ...((text(data.channelType) ?? text(data.channel_type)) === undefined ? {} : { channelType: text(data.channelType) ?? text(data.channel_type) }),
     ...(availableBytes === undefined ? {} : { availableBytes }),
     ...(enterpriseUsedBytes === undefined ? {} : { enterpriseUsedBytes }),
     ...(enterpriseTotalBytes === undefined ? {} : { enterpriseTotalBytes }),

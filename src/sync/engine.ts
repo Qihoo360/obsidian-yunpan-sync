@@ -19,6 +19,7 @@ import { normalizeAccountProfile } from "../account/profile.js";
 import { fileSizeExclusion, ProtectedPaths, TaskSkippedError, type SkippedFile, type SkippedFileSource } from "./file-policy.js";
 import { DownloadCache } from "../transfer/download-cache.js";
 import type { TaskRunnerOptions } from "./task-runner.js";
+import { formatDisplayPath } from "../ui/path-display.js";
 
 interface Api { call<T>(method: OpenApiMethod, input: Record<string, string | number | boolean | null | undefined>): Promise<T> }
 export interface EngineStatus { phase: string; message: string; queued: number; failed: number; completed?: number;
@@ -26,6 +27,11 @@ export interface EngineStatus { phase: string; message: string; queued: number; 
   conflicts?: number; lastSuccess?: number; lastError?: string; failedTasks?: SyncTask[]; fileFailures?: SyncFileFailure[];
   warnings?: string[]; restriction?: SyncRestriction; diagnostics?: SyncDiagnostics; skippedFiles?: SkippedFile[] }
 export interface SyncFileFailure { id?: string; source?: "local" | "remote"; nid?: string; path: string; error: Error & { characters?: readonly string[] } }
+export interface SyncRunSummary {
+  files: Array<{ path: string; size: number; destination?: string }>;
+  failures: Array<{ path: string; reason: string }>;
+  cancelled: boolean;
+}
 export type ConfirmSyncTasks = (tasks: readonly SyncTask[]) => Promise<ReadonlySet<string> | undefined>;
 
 export class SyncCancelledError extends Error {
@@ -112,6 +118,10 @@ export class SyncEngine {
   private refreshForRetry = false;
   private runSettings?: PluginSettings;
   private cancellation?: AbortController;
+  private runFiles: SyncRunSummary["files"] = [];
+  private runTaskIds = new Set<string>();
+  private runFailures: Array<{ path: string; reason: string }> = [];
+  private lastRunSummary?: SyncRunSummary;
 
   constructor(
     private readonly vault: Vault,
@@ -137,6 +147,13 @@ export class SyncEngine {
     this.cancellation?.abort();
   }
   getCancellationSignal(): AbortSignal | undefined { return this.cancellation?.signal; }
+  getLastRunSummary(): SyncRunSummary | undefined {
+    return this.lastRunSummary ? {
+      files: this.lastRunSummary.files.map(file => ({ ...file })),
+      failures: this.lastRunSummary.failures.map(failure => ({ ...failure })),
+      cancelled: this.lastRunSummary.cancelled,
+    } : undefined;
+  }
   checkContinuing(): void { if (this.running) this.throwIfCancelled(); }
   waitForIdle(): Promise<void> {
     if (!this.running) return Promise.resolve();
@@ -156,6 +173,10 @@ export class SyncEngine {
     this.cancellation = new AbortController();
     this.pendingValidationFailures = [...this.fileFailures];
     this.runSettings = { ...this.settings(), filterRules: this.settings().filterRules.map(rule => ({ ...rule })) };
+    this.runFiles = [];
+    this.runTaskIds.clear();
+    this.runFailures = [];
+    this.lastRunSummary = undefined;
     this.protectedPaths = new ProtectedPaths();
     this.protectedNids.clear();
     this.completed = 0;
@@ -245,6 +266,8 @@ export class SyncEngine {
       await this.checkQuota(quota, selectedTasks);
       this.operationTotal = selectedTasks.length;
       this.operationCompleted = 0;
+      this.runTaskIds = new Set(selectedTasks.map(task => task.id));
+      this.runFiles = selectedTasks.map(task => this.summarizeTaskFile(task));
       const selectedIds = new Set(selectedTasks.map(task => task.id));
       this.database.removeTasks([...this.discardAfterPreflight,
         ...planned.filter(task => !selectedIds.has(task.id)).map(task => task.id)]);
@@ -311,6 +334,10 @@ export class SyncEngine {
       this.pendingValidationFailures = [];
       if (this.cancelled) error = new SyncCancelledError(this.stopReason);
       if (error instanceof SyncCancelledError) {
+        // A task-selection dismissal is also a user cancellation even though
+        // it happens before the engine's explicit cancel() method is called.
+        // Keep the run summary from being reported as a completed result.
+        this.cancelled = true;
         this.emit("paused", error.message);
         
         return false;
@@ -328,6 +355,15 @@ export class SyncEngine {
       throw restriction ?? error;
     } finally {
       try {
+        const failedTasks = this.database.listFailedTasks().filter(task => task.state === "failed" && this.runTaskIds.has(task.id));
+        const failures = [...failedTasks.map(task => ({ path: task.path, reason: task.lastError ?? "同步失败" })),
+          ...this.fileFailures.map(failure => ({ path: failure.path, reason: failure.error.message }))];
+        this.runFailures = [...new Map(failures.map(failure => [pathKey(failure.path), failure])).values()];
+        this.lastRunSummary = {
+          files: this.runFiles.map(file => ({ ...file })),
+          failures: this.runFailures.map(failure => ({ ...failure })),
+          cancelled: this.cancelled,
+        };
         const pendingIds = new Set(this.database.listPendingTasks().map(task => task.id));
         for (const state of this.database.downloadStates()) {
           if (!pendingIds.has(state.taskId)) await new DownloadCache(this.vault.adapter, this.database,
@@ -577,7 +613,7 @@ export class SyncEngine {
     try {
       if (this.excludeSize(path, source.size, "local")) throw new TaskSkippedError("本地文件大小不在同步范围内");
       const hashed = await hashSource(source, () => this.throwIfCancelled(), () => {
-        this.progress("local-scan", `正在检查本地文件：${path}`);
+        this.progress("local-scan", `正在检查本地文件：${formatDisplayPath(path)}`);
       }, this.work);
       const after = await this.work.waitFor(() => this.vault.adapter.stat(path));
       if (!after || after.type !== "file" || after.size !== before.size || after.mtime !== before.mtime || source.size !== before.size) {
@@ -596,7 +632,7 @@ export class SyncEngine {
       (left, right) => left.path.localeCompare(right.path), this.work);
     for (const entry of entries) {
       await this.work.step();
-      this.progress("local-scan", `正在检查本地文件：${entry.path}`);
+      this.progress("local-scan", `正在检查本地文件：${formatDisplayPath(entry.path)}`);
       try {
         if (entry.path.includes("\\")) {
           throw new WindowsPathError("invalid-character", "\\", "文件名包含 Windows 不支持的字符", ["\\"]);
@@ -997,8 +1033,26 @@ export class SyncEngine {
         this.excludeSize(task.path, snapshot.size, snapshot.nid ? "remote" : "local"));
   }
 
+  private summarizeTaskFile(task: SyncTask): SyncRunSummary["files"][number] {
+    const payload = task.payload as LocalRenamePayload & { remoteDeleted?: boolean };
+    const snapshots = task.kind === "download" && !payload.remoteDeleted
+      ? [payload.remote, payload.local, payload.base] : [payload.local, payload.remote, payload.base];
+    const snapshot = snapshots.find(value => value !== undefined);
+    const size = Number(snapshot?.size ?? 0);
+    const destination = ["rename", "move", "local-rename"].includes(task.kind)
+      ? payload.conflictPath ?? payload.destination : undefined;
+    return { path: task.path, size: Number.isFinite(size) ? Math.max(0, size) : 0,
+      ...(destination ? { destination } : {}) };
+  }
+
   private async executeChecked(task: SyncTask, execute: () => Promise<void>): Promise<void> {
     this.throwIfCancelled();
+    // Conflict recovery can enqueue derived work after task selection. Include
+    // it once, even if the executor is retried in this run.
+    if (!this.runTaskIds.has(task.id)) {
+      this.runTaskIds.add(task.id);
+      this.runFiles.push(this.summarizeTaskFile(task));
+    }
     validateTaskPath(task.path);
     const payload = task.payload as LocalRenamePayload & { sourcePath?: string };
     if (payload.destination) validateTaskPath(payload.destination);
@@ -1362,7 +1416,7 @@ export class SyncEngine {
         onHashProgress: completed => {
           this.transfers.updatePreparing(task.id, completed, source?.size ?? bytes!.byteLength);
           this.publishTransfers();
-          this.progress("hash", `正在校验上传文件：${task.path}（${completed}/${stat.size} 字节）`);
+          this.progress("hash", `正在校验上传文件：${formatDisplayPath(task.path)}（${completed}/${stat.size} 字节）`);
         },
         onProgress: (completed, total) => this.updateTransfer(task.id, completed, total) });
       const currentFile = this.vault.getFileByPath(task.path);
@@ -1448,7 +1502,7 @@ export class SyncEngine {
         onStage: (stage: "download" | "verify") => {
           this.transfers.stage(task.id, stage === "verify" ? "verifying" : "transferring");
           this.publishTransfers();
-          this.progress(stage, `${stage === "verify" ? "正在校验下载文件" : "正在下载"}：${task.path}`);
+          this.progress(stage, `${stage === "verify" ? "正在校验下载文件" : "正在下载"}：${formatDisplayPath(task.path)}`);
         },
         onProgress: (completed: number, total: number) => this.updateTransfer(task.id, completed, total),
         signal: this.cancellation?.signal };
@@ -1458,7 +1512,7 @@ export class SyncEngine {
           ? payload.remote.mtime * 1000 : payload.remote.mtime;
         await sink.close(normalizedMtime);
         await prepareTarget();
-        this.progress("save", `正在保存文件：${task.path}`);
+        this.progress("save", `正在保存文件：${formatDisplayPath(task.path)}`);
         await this.commitTemporary(task.path, temporary, checkCommit);
       } else {
         const bytes = await this.downloader.download(input);

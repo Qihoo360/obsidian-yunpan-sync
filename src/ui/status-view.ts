@@ -10,6 +10,7 @@ import { TransferList } from "./transfer-list.js";
 import { SkippedFilesList } from "./skipped-files.js";
 import { renderFailedRecordAction, renderIgnoreFileAction } from "./failed-record-action.js";
 import { formatBytes } from "../account/profile.js";
+import { formatDisplayPath, pathDisplayAttributes } from "./path-display.js";
 
 export const YUNPAN_STATUS_VIEW = "yunpan-sync-status-view";
 
@@ -97,7 +98,7 @@ export class YunpanStatusView extends ItemView {
       this.contentEl.addClass("yunpan-sync-side-view");
       this.summaryEl = this.contentEl.createDiv();
       this.controlsEl = this.contentEl.createDiv();
-      this.searchEl = this.contentEl.createEl("input", { type: "search", placeholder: "按传输路径搜索...",
+      this.searchEl = this.contentEl.createEl("input", { type: "search", cls: "yunpan-sync-progress-search", placeholder: "按传输路径搜索...",
         attr: { "aria-label": "搜索传输文件" } });
       this.searchEl.addEventListener("input", () => {
         if (this.searchTimer) clearTimeout(this.searchTimer);
@@ -161,7 +162,7 @@ export class YunpanStatusView extends ItemView {
         const presentation = failedTaskPresentation(task);
         const row = container.createDiv({ cls: `yunpan-sync-side-failure is-${task.state}` });
         row.createDiv({ text: presentation.action, cls: "yunpan-sync-transfer-path" });
-        row.createDiv({ text: presentation.path });
+        row.createDiv({ text: formatDisplayPath(presentation.path), attr: pathDisplayAttributes(presentation.path) });
         row.createDiv({ text: presentation.detail, cls: "yunpan-sync-profile-error" });
         const actions = row.createDiv({ cls: "yunpan-sync-side-failure-actions" });
         const retry = actions.createEl("button", { text: "重试此文件" });
@@ -179,7 +180,7 @@ export class YunpanStatusView extends ItemView {
       for (const failure of this.paged(container, "scan", status.fileFailures)) {
         const row = container.createDiv({ cls: "yunpan-sync-side-failure is-failed" });
         row.createDiv({ text: "扫描", cls: "yunpan-sync-transfer-path" });
-        row.createDiv({ text: failure.path });
+        row.createDiv({ text: formatDisplayPath(failure.path), attr: pathDisplayAttributes(failure.path) });
         row.createDiv({ text: classifySyncError(failure.error).detail, cls: "yunpan-sync-profile-error" });
         if (failure.id) {
           const retry = row.createEl("button", { text: "重新检测" });
@@ -194,8 +195,9 @@ export class YunpanStatusView extends ItemView {
       container.createEl("h4", { text: "待处理冲突" });
       for (const conflict of this.paged(container, "conflicts", this.owner.conflicts)) {
         const row = container.createDiv({ cls: "yunpan-sync-conflict" });
-        row.createDiv({ text: conflict.originalPath });
-        row.createDiv({ text: `已保留副本：${conflict.conflictPath}`, cls: "setting-item-description" });
+        row.createDiv({ text: formatDisplayPath(conflict.originalPath), attr: pathDisplayAttributes(conflict.originalPath) });
+        row.createDiv({ text: `已保留副本：${formatDisplayPath(conflict.conflictPath)}`, cls: "setting-item-description",
+          attr: { title: `已保留副本：${conflict.conflictPath}`, "aria-label": `已保留副本：${conflict.conflictPath}` } });
         const actions = row.createDiv({ cls: "yunpan-sync-conflict-actions" });
         void this.renderOriginalAction(actions, conflict.originalPath, version);
         actions.createEl("button", { text: "打开冲突副本" })
