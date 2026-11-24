@@ -4,3 +4,4 @@ main.js
 coverage/
 .DS_Store
 .public-sync.json
+/docs/changes/

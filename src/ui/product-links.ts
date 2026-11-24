@@ -47,6 +47,7 @@ export function openProductLink(
 export function feedbackUrl(qid: string): string {
   const url = new URL(FEEDBACK_URL);
   url.searchParams.set("qid", qid);
+  url.searchParams.set("src", "obsidian");
   return url.toString();
 }
 

@@ -24,6 +24,7 @@ describe("desktop HTTPS OAuth", () => {
     expect(url.searchParams.has("completion_redirect_uri")).toBe(false);
     expect(url.searchParams.get("code_challenge_method")).toBe("S256");
     expect(url.searchParams.get("login_surface")).toBe("desktop");
+    expect(url.searchParams.get("src")).toBe("obsidian");
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(prepared.pending.verifier));
     expect(url.searchParams.get("code_challenge")).toBe(Buffer.from(digest).toString("base64url"));
     expect(prepared.pending.flow).toBe("desktop");

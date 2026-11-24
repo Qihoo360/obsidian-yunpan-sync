@@ -78,6 +78,7 @@ describe("mobile OAuth", () => {
     const authorization = new URL(authorizationUrl);
     expect(authorization.origin).toBe("https://mcp.yunpan.com");
     expect(authorization.pathname).toBe("/authorize");
+    expect(authorization.searchParams.get("src")).toBe("obsidian");
     expect(authorization.searchParams.get("login_surface")).toBe("mobile");
     expect(authorization.searchParams.get("redirect_uri")).toBe(MOBILE_REDIRECT_URI);
     expect(authorization.searchParams.get("code_challenge_method")).toBe("S256");
@@ -101,6 +102,7 @@ describe("mobile OAuth", () => {
     const { pending, authorizationUrl } = await oauth.prepare();
     expect(new URL(authorizationUrl).origin).toBe("https://mcp.yunpan.com");
     expect(new URL(authorizationUrl).searchParams.get("login_surface")).toBe("mobile");
+    expect(new URL(authorizationUrl).searchParams.get("src")).toBe("obsidian");
     const auth = await oauth.complete({ action: "yunpan-sync", code: "mcp-code", state: pending.state }, pending);
 
     expect(auth).toMatchObject({ accessToken: "access", qid: "42", token: "cloud-token", oauthCode: "cloud-oauth-code" });

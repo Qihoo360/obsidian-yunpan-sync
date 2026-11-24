@@ -28,6 +28,30 @@ describe("OpenAPI client", () => {
     expect(new URL(request!.url).searchParams.get("sign")).toMatch(/^[a-f0-9]{32}$/);
   });
 
+  it("falls back to the response text when mobile JSON decoding is unavailable", async () => {
+    const client = new OpenApiClient({
+      baseUrl: "https://openapi.eyun.360.cn/intf.php",
+      accessToken: () => "access",
+      qid: () => "42",
+      signingSecret: () => "secret",
+      transport: async () => ({ status: 200, json: undefined, text: '{"errno":0,"data":{"bgsp":"11"}}' }),
+    });
+
+    await expect(client.call("Incr.getBgsp", {})).resolves.toEqual({ bgsp: "11" });
+  });
+
+  it("accepts numeric errno values returned as strings", async () => {
+    const client = new OpenApiClient({
+      baseUrl: "https://openapi.eyun.360.cn/intf.php",
+      accessToken: () => "access",
+      qid: () => "42",
+      signingSecret: () => "secret",
+      transport: async () => ({ status: 200, json: { errno: "0", data: { bgsp: "12" } } }),
+    });
+
+    await expect(client.call("Incr.getBgsp", {})).resolves.toEqual({ bgsp: "12" });
+  });
+
   it("passes the folder-only filter without changing the File.getList signature", async () => {
     const transport = vi.fn(async (_request: HttpRequest): Promise<HttpResponse> => ({
       status: 200,

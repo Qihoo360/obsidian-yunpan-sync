@@ -499,9 +499,9 @@ describe("product requirement helpers", () => {
   });
 
   it("builds the production feedback URL with the current qid", () => {
-    expect(feedbackUrl("3475")).toBe("https://www.yunpan.com/resource/html/feedback.html?qid=3475");
+    expect(feedbackUrl("3475")).toBe("https://www.yunpan.com/resource/html/feedback.html?qid=3475&src=obsidian");
     expect(feedbackUrl("qid with/slash")).toBe(
-      "https://www.yunpan.com/resource/html/feedback.html?qid=qid+with%2Fslash",
+      "https://www.yunpan.com/resource/html/feedback.html?qid=qid+with%2Fslash&src=obsidian",
     );
   });
 
@@ -510,7 +510,7 @@ describe("product requirement helpers", () => {
 
     expect(openFeedbackLink("42", open)).toBe(true);
     expect(open).toHaveBeenCalledWith(
-      "https://www.yunpan.com/resource/html/feedback.html?qid=42",
+      "https://www.yunpan.com/resource/html/feedback.html?qid=42&src=obsidian",
       "_blank",
       "noopener,noreferrer",
     );

@@ -68,6 +68,24 @@ interface OpenApiEnvelope<T> {
   trace_id?: string;
 }
 
+function parseOpenApiEnvelope<T>(response: HttpResponse): OpenApiEnvelope<T> | undefined {
+  let value: unknown = response.json;
+  // Obsidian's mobile requestUrl can expose a valid JSON body through text
+  // while response.json is unavailable or throws during response decoding.
+  if (value === undefined && response.text) {
+    try { value = JSON.parse(response.text); } catch { return undefined; }
+  }
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch { return undefined; }
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const errno = typeof raw.errno === "number" ? raw.errno
+    : typeof raw.errno === "string" && /^-?\d+$/u.test(raw.errno.trim()) ? Number(raw.errno) : undefined;
+  if (errno === undefined || !Number.isSafeInteger(errno)) return undefined;
+  return { ...raw, errno } as OpenApiEnvelope<T>;
+}
+
 export interface OpenApiClientOptions {
   baseUrl: string;
   accessToken: () => string;
@@ -115,7 +133,7 @@ export class OpenApiClient {
             method: "GET",
             headers: { "Access-Token": request.accessToken, Accept: "application/json" },
           }), signal, check);
-          const envelope = result.json as OpenApiEnvelope<T> | undefined;
+          const envelope = parseOpenApiEnvelope<T>(result);
           if (result.status === 429 || (envelope?.errno && isRateLimitError(envelope.errmsg ?? ""))) {
             // Publish cooldown before releasing the metadata queue to another request.
             this.scheduler.coolDown(transientAttempt);
@@ -135,8 +153,8 @@ export class OpenApiClient {
         if (response.status < 200 || response.status >= 300) {
           throw new OpenApiError(`OpenAPI HTTP error ${response.status}`, undefined, undefined, response.status);
         }
-        const envelope = response.json as OpenApiEnvelope<T>;
-        if (!envelope || typeof envelope.errno !== "number") throw new OpenApiError("Invalid OpenAPI response");
+        const envelope = parseOpenApiEnvelope<T>(response);
+        if (!envelope) throw new OpenApiError("Invalid OpenAPI response");
         if (envelope.errno !== 0) {
           throw new OpenApiError(envelope.errmsg || `OpenAPI error ${envelope.errno}`, envelope.errno, envelope.trace_id);
         }

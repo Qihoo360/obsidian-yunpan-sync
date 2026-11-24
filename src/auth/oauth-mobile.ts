@@ -135,6 +135,7 @@ export class MobileOAuth {
     authorization.searchParams.set("redirect_uri", MOBILE_REDIRECT_URI);
     authorization.searchParams.set("response_type", "code");
     authorization.searchParams.set("login_surface", surface);
+    authorization.searchParams.set("src", "obsidian");
     if (surface === "desktop") authorization.searchParams.set("completion_mode", "page");
     authorization.searchParams.set("state", state);
     authorization.searchParams.set("code_challenge", await this.step("准备安全授权", () => challenge(verifier)));
